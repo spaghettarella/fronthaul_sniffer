@@ -1,6 +1,6 @@
 # Fronthaul Sniffer
 
-Standalone C++ sniffer scaffold for O-RAN fronthaul traffic. The design keeps packet capture backends separate from packet processing, so Stage 1 (loopback simulation) can evolve into Stage 2/3 without changing processing logic.
+Standalone mixed C/C++ sniffer scaffold for O-RAN fronthaul traffic. Capture and queue pipeline are implemented in C for a low-overhead fast path, while higher-level processing remains in C++.
 
 ## Current Status
 
@@ -71,15 +71,15 @@ printf 'test' | nc 127.0.0.1 9000
 
 ## Architecture
 
-- `capture/*`: backend-specific packet ingestion
-- `pipeline/packet_queue.hpp`: bounded queue with packet and byte limits
-- `pipeline/packet_processor.*`: processing stage
-- `main.cpp`: wiring and threading
+- `capture/c_capture.*` (C): backend-specific packet ingestion (`pcap`, `socket`)
+- `pipeline/c_packet_queue.*` (C): bounded queue with packet and byte limits
+- `pipeline/packet_processor.*` (C++): higher-level processing stage
+- `main.cpp` (C++): wiring, threading, and orchestration
 
 Capture path:
 
 ```text
-[pcap/socket backend] -> RawPacket -> bounded queue -> processor
+[C capture backend] -> C packet queue -> C++ processor
 ```
 
 This keeps your sniffer standalone and avoids any simulator source changes.

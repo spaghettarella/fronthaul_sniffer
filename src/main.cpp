@@ -1,20 +1,20 @@
-#include "fronthaul_sniffer/capture/capture_factory.hpp"
+#include "fronthaul_sniffer/capture/c_capture.h"
 #include "fronthaul_sniffer/pipeline/packet_processor.hpp"
-#include "fronthaul_sniffer/pipeline/packet_queue.hpp"
+#include "fronthaul_sniffer/pipeline/c_packet_queue.h"
 
-#include <atomic>
 #include <csignal>
 #include <cstdlib>
 #include <exception>
 #include <iostream>
+#include <stdexcept>
 #include <string>
 #include <thread>
 
 namespace {
-std::atomic<bool> g_stop{false};
+volatile sig_atomic_t g_stop = 0;
 
 void on_signal(int) {
-    g_stop.store(true);
+    g_stop = 1;
 }
 
 void print_usage(const char* argv0) {
@@ -32,7 +32,18 @@ void print_usage(const char* argv0) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    fronthaul::CaptureOptions capture_options;
+    fh_capture_options_t capture_options{};
+    std::string mode = "pcap";
+    std::string iface = "lo";
+    std::string filter;
+
+    capture_options.mode = mode.c_str();
+    capture_options.interface_name = iface.c_str();
+    capture_options.bpf_filter = filter.c_str();
+    capture_options.snaplen = 65535;
+    capture_options.promiscuous = 0;
+    capture_options.timeout_ms = 100;
+
     std::size_t queue_packets = 4096;
     std::size_t queue_bytes = 32 * 1024 * 1024;
 
@@ -46,15 +57,15 @@ int main(int argc, char** argv) {
         };
 
         if (arg == "--mode") {
-            capture_options.mode = next_arg("--mode");
+            mode = next_arg("--mode");
         } else if (arg == "--iface") {
-            capture_options.interface_name = next_arg("--iface");
+            iface = next_arg("--iface");
         } else if (arg == "--filter") {
-            capture_options.bpf_filter = next_arg("--filter");
+            filter = next_arg("--filter");
         } else if (arg == "--snaplen") {
             capture_options.snaplen = std::stoi(next_arg("--snaplen"));
         } else if (arg == "--promisc") {
-            capture_options.promiscuous = (std::stoi(next_arg("--promisc")) != 0);
+            capture_options.promiscuous = std::stoi(next_arg("--promisc")) != 0 ? 1 : 0;
         } else if (arg == "--timeout-ms") {
             capture_options.timeout_ms = std::stoi(next_arg("--timeout-ms"));
         } else if (arg == "--queue-packets") {
@@ -73,36 +84,61 @@ int main(int argc, char** argv) {
     std::signal(SIGTERM, on_signal);
 
     try {
-        auto backend = fronthaul::make_capture_backend(capture_options);
-        fronthaul::PacketQueue queue(queue_packets, queue_bytes);
+        capture_options.mode = mode.c_str();
+        capture_options.interface_name = iface.c_str();
+        capture_options.bpf_filter = filter.c_str();
+
+        fh_packet_queue_t* queue = fh_packet_queue_create(queue_packets, queue_bytes);
+        if (queue == nullptr) {
+            throw std::runtime_error("failed to create packet queue");
+        }
+
         fronthaul::PacketProcessor processor;
 
         std::thread capture_thread([&] {
-            backend->run(
-                [&](fronthaul::RawPacket&& pkt) {
-                    queue.push(std::move(pkt));
-                },
-                g_stop);
-            g_stop.store(true);
-            queue.notify_all();
+            char errbuf[256] = {0};
+            auto on_packet = [](const fh_packet_t* pkt, void* user_ctx) -> int {
+                auto* q = static_cast<fh_packet_queue_t*>(user_ctx);
+                const int rc = fh_packet_queue_push_copy(q, pkt);
+                return (rc < 0) ? -1 : 0;
+            };
+
+            const int rc = fh_capture_run(&capture_options, on_packet, queue, &g_stop, errbuf, sizeof(errbuf));
+            if (rc != 0) {
+                std::cerr << "capture error: " << errbuf << '\n';
+            }
+            g_stop = 1;
+            fh_packet_queue_notify_all(queue);
         });
 
-        while (!g_stop.load()) {
-            fronthaul::RawPacket pkt;
-            if (queue.pop(pkt, g_stop)) {
+        while (g_stop == 0) {
+            fh_packet_t pkt{};
+            if (fh_packet_queue_pop(queue, &pkt, &g_stop) > 0) {
                 processor.consume(pkt);
+                fh_packet_release(&pkt);
             }
             processor.maybe_report();
         }
 
-        queue.notify_all();
+        for (;;) {
+            fh_packet_t pkt{};
+            if (fh_packet_queue_pop(queue, &pkt, &g_stop) <= 0) {
+                break;
+            }
+            processor.consume(pkt);
+            fh_packet_release(&pkt);
+        }
+
+        fh_packet_queue_notify_all(queue);
         if (capture_thread.joinable()) {
             capture_thread.join();
         }
 
-        const auto stats = queue.stats();
+        const auto stats = fh_packet_queue_stats(queue);
         std::cout << "[queue] dropped_packets=" << stats.dropped_packets
                   << " dropped_bytes=" << stats.dropped_bytes << '\n';
+
+        fh_packet_queue_destroy(queue);
     } catch (const std::exception& ex) {
         std::cerr << "fatal: " << ex.what() << '\n';
         return 1;

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "fronthaul_sniffer/core/raw_packet.hpp"
+#include "fronthaul_sniffer/core/c_packet.h"
 
 #include <atomic>
 #include <chrono>
@@ -10,7 +10,7 @@ namespace fronthaul {
 
 class PacketProcessor {
 public:
-    void consume(const RawPacket& pkt);
+    void consume(const fh_packet_t& pkt);
     void maybe_report();
 
 private:

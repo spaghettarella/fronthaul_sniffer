@@ -1,18 +1,20 @@
 cmake_minimum_required(VERSION 3.16)
-project(fronthaul_sniffer VERSION 0.1.0 LANGUAGES CXX)
+project(fronthaul_sniffer VERSION 0.1.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_C_EXTENSIONS OFF)
 
 option(FRONTHAUL_ENABLE_PCAP "Enable libpcap backend" ON)
 option(FRONTHAUL_ENABLE_SOCKET "Enable raw socket backend" ON)
 
 add_executable(fronthaul_sniffer
     src/main.cpp
-    src/capture/capture_factory.cpp
-    src/capture/pcap_live_capture.cpp
-    src/capture/socket_capture.cpp
+    src/capture/c_capture.c
+    src/pipeline/c_packet_queue.c
     src/pipeline/packet_processor.cpp
 )
 
@@ -21,6 +23,8 @@ target_include_directories(fronthaul_sniffer PRIVATE include)
 target_compile_options(fronthaul_sniffer PRIVATE -Wall -Wextra -Wpedantic)
 
 target_compile_definitions(fronthaul_sniffer PRIVATE
+    _DEFAULT_SOURCE
+    _POSIX_C_SOURCE=200809L
     $<$<BOOL:${FRONTHAUL_ENABLE_PCAP}>:FRONTHAUL_ENABLE_PCAP=1>
     $<$<BOOL:${FRONTHAUL_ENABLE_SOCKET}>:FRONTHAUL_ENABLE_SOCKET=1>
 )
@@ -44,6 +48,4 @@ if(FRONTHAUL_ENABLE_PCAP)
     endif()
 endif()
 
-if(FRONTHAUL_ENABLE_SOCKET)
-    target_link_libraries(fronthaul_sniffer PRIVATE pthread)
-endif()
+target_link_libraries(fronthaul_sniffer PRIVATE pthread)

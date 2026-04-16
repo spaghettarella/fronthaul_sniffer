@@ -5,9 +5,9 @@
 
 namespace fronthaul {
 
-void PacketProcessor::consume(const RawPacket& pkt) {
+void PacketProcessor::consume(const fh_packet_t& pkt) {
     ++packets_;
-    bytes_ += pkt.bytes.size();
+    bytes_ += pkt.caplen;
 }
 
 void PacketProcessor::maybe_report() {
