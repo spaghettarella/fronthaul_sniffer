@@ -1,6 +1,6 @@
 #pragma once
 
-#include "fronthaul_sniffer/core/c_packet.h"
+#include "core/c_fronthaul_decoder.h"
 
 #include <signal.h>
 #include <stddef.h>

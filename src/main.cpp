@@ -1,10 +1,12 @@
-#include "fronthaul_sniffer/capture/c_capture.h"
-#include "fronthaul_sniffer/pipeline/packet_processor.hpp"
-#include "fronthaul_sniffer/pipeline/c_packet_queue.h"
+#include "capture/c_capture_socket_mode.h"
+#include "core/c_fronthaul_decoder.h"
+#include "core/c_oran_memory.h"
+#include "pipeline/c_packet_queue.h"
 
 #include <csignal>
+#include <cstddef>
 #include <cstdlib>
-#include <exception>
+#include <cstring>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -20,33 +22,31 @@ void on_signal(int) {
 void print_usage(const char* argv0) {
     std::cout
         << "Usage: " << argv0 << " [options]\n"
-        << "  --mode <pcap|socket>        Capture backend (default: pcap)\n"
         << "  --iface <name>              Interface name (default: lo)\n"
-        << "  --filter <bpf>              BPF filter for pcap mode\n"
-        << "  --snaplen <bytes>           Max captured bytes per packet\n"
-        << "  --promisc <0|1>             Promiscuous mode for pcap\n"
-        << "  --timeout-ms <ms>           Read timeout\n"
-        << "  --queue-packets <count>     Max packets buffered before processing\n"
-        << "  --queue-bytes <bytes>       Max bytes buffered before processing\n";
+        << "  --snaplen <bytes>           Max captured bytes per packet (default: 65535)\n"
+        << "  --timeout-ms <ms>           Read timeout in milliseconds (default: 100)\n"
+        << "  --queue-packets <count>     Max packets buffered before processing (default: 4096)\n"
+        << "  --queue-bytes <bytes>       Max bytes buffered before processing (default: 32MiB)\n";
+}
+
+int queue_callback(const fh_packet_t* pkt, void* user_ctx) {
+    auto* queue = static_cast<fh_packet_queue_t*>(user_ctx);
+    const int rc = fh_packet_queue_push_copy(queue, pkt);
+    return (rc < 0) ? -1 : 0;
 }
 }  // namespace
 
 int main(int argc, char** argv) {
-    fh_capture_options_t capture_options{};
-    std::string mode = "pcap";
+    fh_capture_socket_options_t capture_options{};
     std::string iface = "lo";
-    std::string filter;
-
-    capture_options.mode = mode.c_str();
     capture_options.interface_name = iface.c_str();
-    capture_options.bpf_filter = filter.c_str();
     capture_options.snaplen = 65535;
-    capture_options.promiscuous = 0;
     capture_options.timeout_ms = 100;
 
     std::size_t queue_packets = 4096;
-    std::size_t queue_bytes = 32 * 1024 * 1024;
+    std::size_t queue_bytes = 32u * 1024u * 1024u;
 
+    // Parse CLI options so the capture backend and queue can be tuned without recompiling.
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         auto next_arg = [&](const char* opt_name) -> std::string {
@@ -56,16 +56,10 @@ int main(int argc, char** argv) {
             return argv[++i];
         };
 
-        if (arg == "--mode") {
-            mode = next_arg("--mode");
-        } else if (arg == "--iface") {
+        if (arg == "--iface") {
             iface = next_arg("--iface");
-        } else if (arg == "--filter") {
-            filter = next_arg("--filter");
         } else if (arg == "--snaplen") {
             capture_options.snaplen = std::stoi(next_arg("--snaplen"));
-        } else if (arg == "--promisc") {
-            capture_options.promiscuous = std::stoi(next_arg("--promisc")) != 0 ? 1 : 0;
         } else if (arg == "--timeout-ms") {
             capture_options.timeout_ms = std::stoi(next_arg("--timeout-ms"));
         } else if (arg == "--queue-packets") {
@@ -76,34 +70,42 @@ int main(int argc, char** argv) {
             print_usage(argv[0]);
             return 0;
         } else {
-            throw std::invalid_argument("unknown argument: " + arg);
+            std::cerr << "Unknown argument: " << arg << '\n';
+            print_usage(argv[0]);
+            return 1;
         }
     }
 
+    // Register simple shutdown handlers; the worker loops watch this shared flag.
     std::signal(SIGINT, on_signal);
     std::signal(SIGTERM, on_signal);
 
     try {
-        capture_options.mode = mode.c_str();
+        // Rebind the interface string after parsing so the capture options keep a valid pointer.
         capture_options.interface_name = iface.c_str();
-        capture_options.bpf_filter = filter.c_str();
 
+        // Build the bounded packet queue and decoded-packet storage used by the pipeline.
         fh_packet_queue_t* queue = fh_packet_queue_create(queue_packets, queue_bytes);
         if (queue == nullptr) {
             throw std::runtime_error("failed to create packet queue");
         }
 
-        fronthaul::PacketProcessor processor;
+        fh_oran_memory_t* memory = fh_oran_memory_create(10000);
+        if (memory == nullptr) {
+            fh_packet_queue_destroy(queue);
+            throw std::runtime_error("failed to create ORAN memory");
+        }
 
+        // Run packet capture on a background thread so the main thread can decode and store.
         std::thread capture_thread([&] {
             char errbuf[256] = {0};
-            auto on_packet = [](const fh_packet_t* pkt, void* user_ctx) -> int {
-                auto* q = static_cast<fh_packet_queue_t*>(user_ctx);
-                const int rc = fh_packet_queue_push_copy(q, pkt);
-                return (rc < 0) ? -1 : 0;
-            };
-
-            const int rc = fh_capture_run(&capture_options, on_packet, queue, &g_stop, errbuf, sizeof(errbuf));
+            const int rc = fh_capture_socket_run(
+                &capture_options,
+                queue_callback,
+                queue,
+                &g_stop,
+                errbuf,
+                sizeof(errbuf));
             if (rc != 0) {
                 std::cerr << "capture error: " << errbuf << '\n';
             }
@@ -111,33 +113,48 @@ int main(int argc, char** argv) {
             fh_packet_queue_notify_all(queue);
         });
 
+        // Consume packets from the queue until shutdown is requested.
         while (g_stop == 0) {
             fh_packet_t pkt{};
             if (fh_packet_queue_pop(queue, &pkt, &g_stop) > 0) {
-                processor.consume(pkt);
+                fh_decoded_packet_t decoded{};
+                if (fh_decode_packet(&pkt, &decoded) == 0) {
+                    fh_oran_memory_save(memory, &decoded);
+                }
                 fh_packet_release(&pkt);
             }
-            processor.maybe_report();
         }
 
+        // Drain any packets left in the queue after the capture thread stops.
         for (;;) {
             fh_packet_t pkt{};
             if (fh_packet_queue_pop(queue, &pkt, &g_stop) <= 0) {
                 break;
             }
-            processor.consume(pkt);
+            fh_decoded_packet_t decoded{};
+            if (fh_decode_packet(&pkt, &decoded) == 0) {
+                fh_oran_memory_save(memory, &decoded);
+            }
             fh_packet_release(&pkt);
         }
 
+        // Wake any waiters, then join the capture thread before reading final stats.
         fh_packet_queue_notify_all(queue);
         if (capture_thread.joinable()) {
             capture_thread.join();
         }
 
-        const auto stats = fh_packet_queue_stats(queue);
+        // Print the queue and memory counters so the run can be inspected from the terminal.
+        const fh_queue_stats_t stats = fh_packet_queue_stats(queue);
         std::cout << "[queue] dropped_packets=" << stats.dropped_packets
                   << " dropped_bytes=" << stats.dropped_bytes << '\n';
 
+        const fh_oran_memory_stats_t mem_stats = fh_oran_memory_stats(memory);
+        std::cout << "[memory] stored_packets=" << mem_stats.stored_packets
+                  << " max_packets=" << mem_stats.max_packets << '\n';
+
+        // Release resources in reverse order of creation.
+        fh_oran_memory_destroy(memory);
         fh_packet_queue_destroy(queue);
     } catch (const std::exception& ex) {
         std::cerr << "fatal: " << ex.what() << '\n';

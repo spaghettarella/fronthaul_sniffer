@@ -1,4 +1,4 @@
-#include "fronthaul_sniffer/pipeline/c_packet_queue.h"
+#include "pipeline/c_packet_queue.h"
 
 #include <errno.h>
 #include <pthread.h>
@@ -28,10 +28,12 @@ struct fh_packet_queue {
 };
 
 static void packet_zero(fh_packet_t* pkt) {
+    // Reset a packet structure after its payload has been released.
     memset(pkt, 0, sizeof(*pkt));
 }
 
 void fh_packet_release(fh_packet_t* pkt) {
+    // Free the packet payload and clear the struct so it cannot be reused accidentally.
     if (pkt == NULL) {
         return;
     }
@@ -40,6 +42,7 @@ void fh_packet_release(fh_packet_t* pkt) {
 }
 
 static void drop_head_locked(fh_packet_queue_t* q) {
+    // Remove the oldest queued packet while holding the queue mutex.
     fh_packet_node_t* old = q->head;
     if (old == NULL) {
         return;
@@ -60,6 +63,7 @@ static void drop_head_locked(fh_packet_queue_t* q) {
 }
 
 fh_packet_queue_t* fh_packet_queue_create(size_t max_packets, size_t max_bytes) {
+    // Allocate the queue and initialize its synchronization primitives.
     if (max_packets == 0 || max_bytes == 0) {
         return NULL;
     }
@@ -86,6 +90,7 @@ fh_packet_queue_t* fh_packet_queue_create(size_t max_packets, size_t max_bytes) 
 }
 
 void fh_packet_queue_destroy(fh_packet_queue_t* q) {
+    // Drain all pending packets, destroy the mutex/condition variable, and free the queue.
     if (q == NULL) {
         return;
     }
@@ -102,10 +107,12 @@ void fh_packet_queue_destroy(fh_packet_queue_t* q) {
 }
 
 int fh_packet_queue_push_copy(fh_packet_queue_t* q, const fh_packet_t* pkt) {
+    // Copy the incoming packet into queue-owned memory so the capture buffer can be reused.
     if (q == NULL || pkt == NULL || pkt->data == NULL) {
         return -1;
     }
 
+    // If the packet is too large to ever fit, count it as dropped immediately.
     if (pkt->caplen > q->max_bytes) {
         pthread_mutex_lock(&q->mtx);
         q->dropped_packets += 1;
@@ -127,11 +134,13 @@ int fh_packet_queue_push_copy(fh_packet_queue_t* q, const fh_packet_t* pkt) {
     }
     memcpy(node->pkt.data, pkt->data, pkt->caplen);
 
+    // Enforce queue limits by dropping oldest packets until the new one fits.
     pthread_mutex_lock(&q->mtx);
     while (q->head != NULL && (q->queued_packets >= q->max_packets || q->queued_bytes + pkt->caplen > q->max_bytes)) {
         drop_head_locked(q);
     }
 
+    // Link the new node at the tail of the queue.
     if (q->tail == NULL) {
         q->head = node;
         q->tail = node;
@@ -149,12 +158,14 @@ int fh_packet_queue_push_copy(fh_packet_queue_t* q, const fh_packet_t* pkt) {
 }
 
 int fh_packet_queue_pop(fh_packet_queue_t* q, fh_packet_t* out, const volatile sig_atomic_t* stop_flag) {
+    // Wait until a packet arrives or shutdown is requested.
     if (q == NULL || out == NULL || stop_flag == NULL) {
         return -1;
     }
 
     pthread_mutex_lock(&q->mtx);
     while (q->head == NULL && *stop_flag == 0) {
+        // Use a short timed wait so the loop remains responsive to stop_flag.
         struct timespec wait_until;
         (void)timespec_get(&wait_until, TIME_UTC);
         wait_until.tv_nsec += 100L * 1000L * 1000L;
@@ -170,6 +181,7 @@ int fh_packet_queue_pop(fh_packet_queue_t* q, fh_packet_t* out, const volatile s
         return 0;
     }
 
+    // Detach the head node and transfer ownership of its packet to the caller.
     fh_packet_node_t* node = q->head;
     q->head = node->next;
     if (q->head == NULL) {
@@ -187,6 +199,7 @@ int fh_packet_queue_pop(fh_packet_queue_t* q, fh_packet_t* out, const volatile s
 }
 
 void fh_packet_queue_notify_all(fh_packet_queue_t* q) {
+    // Wake all waiting consumers during shutdown.
     if (q == NULL) {
         return;
     }
@@ -197,6 +210,7 @@ void fh_packet_queue_notify_all(fh_packet_queue_t* q) {
 }
 
 fh_queue_stats_t fh_packet_queue_stats(fh_packet_queue_t* q) {
+    // Snapshot queue counters under the mutex.
     fh_queue_stats_t stats;
     memset(&stats, 0, sizeof(stats));
 
