@@ -22,11 +22,16 @@ void on_signal(int) {
 void print_usage(const char* argv0) {
     std::cout
         << "Usage: " << argv0 << " [options]\n"
-        << "  --iface <name>              Interface name (default: lo)\n"
-        << "  --snaplen <bytes>           Max captured bytes per packet (default: 65535)\n"
-        << "  --timeout-ms <ms>           Read timeout in milliseconds (default: 100)\n"
-        << "  --queue-packets <count>     Max packets buffered before processing (default: 4096)\n"
-        << "  --queue-bytes <bytes>       Max bytes buffered before processing (default: 32MiB)\n";
+        << "  --iface <name>                        Interface name (default: lo)\n"
+        << "  --snaplen <bytes>                     Max captured bytes per packet (default: 65535)\n"
+        << "  --timeout-ms <ms>                     Read timeout in milliseconds (default: 100)\n"
+        << "  --queue-packets <count>               Max packets buffered before processing (default: 4096)\n"
+        << "  --queue-bytes <bytes>                 Max bytes buffered before processing (default: 32MiB)\n"
+        << "  --memory-size <symbols>               Max symbols buffered (max: 573440; default: 2800)\n"
+        << "  --ud-comp-hdr-present <bool>          Whether user data compression header is present (default: false)\n"
+        << "  --ud-iq-width <bits>                  Width of user data IQ samples (default: 16)\n"
+        << "  --ud-iq-width-decompressed <bits>     Width of user data IQ samples after decompression (default: 16)\n"
+        << "  --ud-comp-method <method>             Compression method for user data (NONE or BFP; default: NONE)\n";
 }
 
 int queue_callback(const fh_packet_t* pkt, void* user_ctx) {
@@ -51,7 +56,7 @@ int main(int argc, char** argv) {
     int ud_iq_width_decompressed = 16;
     const char *ud_comp_method = "NONE";
 
-    std::size_t memory_symbols = 10000;
+    std::size_t memory_symbols = 2800;
 
     // Parse CLI options so the capture backend and queue can be tuned without recompiling.
     for (int i = 1; i < argc; ++i) {
@@ -73,6 +78,16 @@ int main(int argc, char** argv) {
             queue_packets = static_cast<std::size_t>(std::stoull(next_arg("--queue-packets")));
         } else if (arg == "--queue-bytes") {
             queue_bytes = static_cast<std::size_t>(std::stoull(next_arg("--queue-bytes")));
+        } else if (arg == "--memory-size") {
+            memory_symbols = static_cast<std::size_t>(std::stoull(next_arg("--memory-size")));
+        } else if (arg == "--ud-comp-hdr-present") {
+            ud_comp_hdr_present = (next_arg("--ud-comp-hdr-present") == "true");
+        } else if (arg == "--ud-iq-width") {
+            ud_iq_width = std::stoi(next_arg("--ud-iq-width"));
+        } else if (arg == "--ud-iq-width-decompressed") {
+            ud_iq_width_decompressed = std::stoi(next_arg("--ud-iq-width-decompressed"));
+        } else if (arg == "--ud-comp-method") {
+            ud_comp_method = next_arg("--ud-comp-method").c_str();
         } else if (arg == "--help" || arg == "-h") {
             print_usage(argv[0]);
             return 0;
@@ -83,7 +98,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Register simple shutdown handlers; the worker loops watch this shared flag.
+    // Register shutdown handlers; the worker loops watch this shared flag.
     std::signal(SIGINT, on_signal);
     std::signal(SIGTERM, on_signal);
 
@@ -100,7 +115,7 @@ int main(int argc, char** argv) {
         fh_oran_memory_t* memory = fh_oran_memory_create(memory_symbols);
         if (memory == nullptr) {
             fh_packet_queue_destroy(queue);
-            throw std::runtime_error("failed to create ORAN memory");
+            throw std::runtime_error("failed to create ORAN memory (Not enough physical memory?)");
         }
 
         // Run packet capture on a background thread so the main thread can decode and store.
@@ -159,8 +174,8 @@ int main(int argc, char** argv) {
                   << " dropped_bytes=" << stats.dropped_bytes << '\n';
 
         const fh_oran_memory_stats_t mem_stats = fh_oran_memory_stats(memory);
-        std::cout << "[memory] stored_packets=" << mem_stats.stored_packets
-                  << " max_packets=" << mem_stats.max_packets << '\n';
+        std::cout << "[memory] stored_packets=" << mem_stats.stored_symbols
+                  << " max_packets=" << mem_stats.max_symbols << '\n';
 
         // Release resources in reverse order of creation.
         fh_oran_memory_destroy(memory);

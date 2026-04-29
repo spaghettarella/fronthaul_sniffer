@@ -17,10 +17,7 @@ typedef float complex fh_complex_t;
 extern "C" {
 #endif
 
-typedef struct fh_decoded_packet {
-    struct timespec timestamp;
-    char ingress_if[32];
-    size_t caplen;
+typedef struct fh_section {
     uint16_t eaxc_id;
     uint8_t data_direction;
     uint8_t frame_id;
@@ -30,6 +27,14 @@ typedef struct fh_decoded_packet {
     uint16_t start_prbu;
     uint16_t num_prbu;
     fh_complex_t *iq_data;
+} fh_section_t;
+
+typedef struct fh_decoded_packet {
+    struct timespec timestamp;
+    char ingress_if[32];
+    size_t caplen;
+    int section_count;
+    fh_section_t *sections;
 } fh_decoded_packet_t;
 
 typedef struct fh_packet {

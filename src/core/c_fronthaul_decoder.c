@@ -65,17 +65,11 @@ int fh_decode_packet(const fh_packet_t* raw_pkt, fh_decoded_packet_t* decoded_pk
     }
 
     memset(decoded_pkt, 0, sizeof(*decoded_pkt));
-
-    // Allocate IQ data buffer for max 273 PRBus * 12 samples each
-    decoded_pkt->iq_data = (fh_complex_t *)malloc(3276 * sizeof(*decoded_pkt->iq_data));
-    if (decoded_pkt->iq_data == NULL) {
-        return -1;
-    }
-
     decoded_pkt->timestamp = raw_pkt->timestamp;
     decoded_pkt->caplen = raw_pkt->caplen;
-
     memcpy(decoded_pkt->ingress_if, raw_pkt->ingress_if, sizeof(raw_pkt->ingress_if));
+
+    decoded_pkt->section_count = 0;
 
     if (raw_pkt->data != NULL && raw_pkt->caplen > 0) {
         uint8_t *packet = raw_pkt->data;
@@ -197,6 +191,7 @@ int fh_decode_packet(const fh_packet_t* raw_pkt, fh_decoded_packet_t* decoded_pk
                 // Handle Sections
                 int section_length = 0;
                 int payload_left = ntohs(ecpri->payload_size) - sizeof(struct oran_iq_radio_app_header);
+                int section_count = 0;
                 while (payload_left - section_length > 0) {
 
                     if (ud_comp_hdr_present == false) {
@@ -222,23 +217,30 @@ int fh_decode_packet(const fh_packet_t* raw_pkt, fh_decoded_packet_t* decoded_pk
                         printf("      Section Length: %d bytes\n", section_length);
                         printf("\n");*/
 
-                        decoded_pkt->eaxc_id = ntohs(ecpri->eaxc_id);
-                        decoded_pkt->data_direction = oran->data_direction;
-                        decoded_pkt->frame_id = oran->frame_id;
-                        decoded_pkt->subframe_id = oran->subframe_id;
-                        decoded_pkt->slot_id = slot_id;
-                        decoded_pkt->start_symbol_id = oran->start_symbol_id;
-                        decoded_pkt->start_prbu = start_prbu;
-                        if (section->num_prbu == 0) {
-                            decoded_pkt->num_prbu = 273;
-                            //printf("      Corrected Num PRBu: %d\n", decoded_pkt->num_prbu);
-                        } else {
-                            decoded_pkt->num_prbu = section->num_prbu;
+                        // Allocate IQ data buffer for max 273 PRBus * 12 samples each
+                        decoded_pkt->sections[section_count].iq_data = (fh_complex_t *)malloc(3276 * sizeof(*decoded_pkt->sections[section_count].iq_data));
+                        if (decoded_pkt->sections[section_count].iq_data == NULL) {
+                            return -1;
                         }
-                        int iq_chunk_prb_idx = 0;
 
+                        decoded_pkt->sections[section_count].eaxc_id = ntohs(ecpri->eaxc_id);
+                        decoded_pkt->sections[section_count].data_direction = oran->data_direction;
+                        decoded_pkt->sections[section_count].frame_id = oran->frame_id;
+                        decoded_pkt->sections[section_count].subframe_id = oran->subframe_id;
+                        decoded_pkt->sections[section_count].slot_id = slot_id;
+                        decoded_pkt->sections[section_count].start_symbol_id = oran->start_symbol_id;
+                        decoded_pkt->sections[section_count].start_prbu = start_prbu;
+                        if (section->num_prbu == 0) {
+                            decoded_pkt->sections[section_count].num_prbu = 273;
+                            //printf("      Corrected Num PRBu: %d\n", decoded_pkt->sections[section_count].num_prbu);
+                        } else {
+                            decoded_pkt->sections[section_count].num_prbu = section->num_prbu;
+                        }
+                        decoded_pkt->section_count++;
+
+                        int iq_chunk_prb_idx = 0;
                         // Handle PRBs
-                        for (size_t prb = 0; prb < decoded_pkt->num_prbu; prb++) {
+                        for (size_t prb = 0; prb < decoded_pkt->sections[section_count].num_prbu; prb++) {
                             const uint8_t *ptr_prb = ptr_section + sizeof(struct oran_iq_section_header) + prb * ((ud_iq_width * 2 * 12) / 8 + ud_comp_param_length);
                             /*if (strcmp(ud_comp_method, "BFP") == 0) {
                                 printf("        UD Compression Param: Reserved: %d, Exponent: %d\n", ptr_prb[0] & 0xF0, ptr_prb[0] & 0x0F);
@@ -261,8 +263,8 @@ int fh_decode_packet(const fh_packet_t* raw_pkt, fh_decoded_packet_t* decoded_pk
                                     // Successfully extracted
                                     //printf("        Extracted IQ Samples:\n");
                                     for (int i = 0; i < 12; i++) {
-                                        decoded_pkt->iq_data[iq_chunk_prb_idx * 12 + i] = i_samples[i] + I * q_samples[i];
-                                        //printf("        Sample %d: I = %f, Q = %f\n", i, crealf(decoded_pkt->iq_data[iq_chunk_prb_idx * 12 + i]), cimagf(decoded_pkt->iq_data[iq_chunk_prb_idx * 12 + i]));
+                                        decoded_pkt->sections[section_count].iq_data[iq_chunk_prb_idx * 12 + i] = i_samples[i] + I * q_samples[i];
+                                        //printf("        Sample %d: I = %f, Q = %f\n", i, crealf(decoded_pkt->sections[section_count].iq_data[iq_chunk_prb_idx * 12 + i]), cimagf(decoded_pkt->sections[section_count].iq_data[iq_chunk_prb_idx * 12 + i]));
                                     }
                                 } else {
                                     printf("        IQ Sample Extraction failed with error code: %d\n", iq_result);
@@ -280,8 +282,8 @@ int fh_decode_packet(const fh_packet_t* raw_pkt, fh_decoded_packet_t* decoded_pk
                                     // Successfully decompressed
                                     //printf("        Decompressed IQ Samples:\n");
                                     for (int i = 0; i < 12; i++) {
-                                        decoded_pkt->iq_data[iq_chunk_prb_idx * 12 + i] = i_samples[i] + I * q_samples[i];
-                                        //printf("        Sample %d: I = %f, Q = %f\n", i, crealf(decoded_pkt->iq_data[iq_chunk_prb_idx * 12 + i]), cimagf(decoded_pkt->iq_data[iq_chunk_prb_idx * 12 + i]));
+                                        decoded_pkt->sections[section_count].iq_data[iq_chunk_prb_idx * 12 + i] = i_samples[i] + I * q_samples[i];
+                                        //printf("        Sample %d: I = %f, Q = %f\n", i, crealf(decoded_pkt->sections[section_count].iq_data[iq_chunk_prb_idx * 12 + i]), cimagf(decoded_pkt->sections[section_count].iq_data[iq_chunk_prb_idx * 12 + i]));
                                     }
                                 } else {
                                     printf("        BFP Decompression failed with error code: %d\n", decomp_result);
@@ -295,7 +297,7 @@ int fh_decode_packet(const fh_packet_t* raw_pkt, fh_decoded_packet_t* decoded_pk
                     } else {
                         printf("  IQ Data Compression Header parsing not implemented yet.\n");
                     }
-
+                    section_count++;
                 }
 
             } else {
@@ -314,9 +316,12 @@ void fh_decoded_packet_free(fh_decoded_packet_t *pkt) {
     if (pkt == NULL) {
         return;
     }
-
-    free(pkt->iq_data);
-    pkt->iq_data = NULL;
+    for (int i = 0; i < pkt->section_count; i++) {
+        free(pkt->sections[i].iq_data);
+        pkt->sections[i].iq_data = NULL;
+    }
+    free(pkt->sections);
+    pkt->sections = NULL;
 }
 
 static int64_t extract_signed_bits(const uint8_t *buffer, uint32_t bit_offset, int bit_width) {
