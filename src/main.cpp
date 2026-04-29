@@ -46,6 +46,13 @@ int main(int argc, char** argv) {
     std::size_t queue_packets = 4096;
     std::size_t queue_bytes = 32u * 1024u * 1024u;
 
+    bool ud_comp_hdr_present = false;
+    int ud_iq_width = 16;
+    int ud_iq_width_decompressed = 16;
+    const char *ud_comp_method = "NONE";
+
+    std::size_t memory_symbols = 10000;
+
     // Parse CLI options so the capture backend and queue can be tuned without recompiling.
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -90,7 +97,7 @@ int main(int argc, char** argv) {
             throw std::runtime_error("failed to create packet queue");
         }
 
-        fh_oran_memory_t* memory = fh_oran_memory_create(10000);
+        fh_oran_memory_t* memory = fh_oran_memory_create(memory_symbols);
         if (memory == nullptr) {
             fh_packet_queue_destroy(queue);
             throw std::runtime_error("failed to create ORAN memory");
@@ -118,9 +125,10 @@ int main(int argc, char** argv) {
             fh_packet_t pkt{};
             if (fh_packet_queue_pop(queue, &pkt, &g_stop) > 0) {
                 fh_decoded_packet_t decoded{};
-                if (fh_decode_packet(&pkt, &decoded) == 0) {
+                if (fh_decode_packet(&pkt, &decoded, ud_comp_hdr_present, ud_iq_width, ud_iq_width_decompressed, ud_comp_method) == 0) {
                     fh_oran_memory_save(memory, &decoded);
                 }
+                fh_decoded_packet_free(&decoded);
                 fh_packet_release(&pkt);
             }
         }
@@ -132,9 +140,10 @@ int main(int argc, char** argv) {
                 break;
             }
             fh_decoded_packet_t decoded{};
-            if (fh_decode_packet(&pkt, &decoded) == 0) {
+            if (fh_decode_packet(&pkt, &decoded, ud_comp_hdr_present, ud_iq_width, ud_iq_width_decompressed, ud_comp_method) == 0) {
                 fh_oran_memory_save(memory, &decoded);
             }
+            fh_decoded_packet_free(&decoded);
             fh_packet_release(&pkt);
         }
 

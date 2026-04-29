@@ -4,11 +4,10 @@
 #include <string.h>
 #include <stdbool.h>
 #include <stdlib.h>
-#include <pcap.h>
 #include <math.h>
 #include <complex.h>
-#include <netinet/if_ether.h>
 #include <arpa/inet.h>
+#include <net/ethernet.h>
 
 #include "bfp_decompress.h"
 
@@ -60,12 +59,18 @@ struct oran_iq_section_header {
 
 int extract_iq_samples(const char *ptr_prb, int bit_width, float i_samples[12], float q_samples[12]);
 
-int fh_decode_packet(const fh_packet_t* raw_pkt, fh_decoded_packet_t* decoded_pkt) {
+int fh_decode_packet(const fh_packet_t* raw_pkt, fh_decoded_packet_t* decoded_pkt, bool ud_comp_hdr_present, int ud_iq_width, int ud_iq_width_decompressed, const char *ud_comp_method) {
     if (raw_pkt == NULL || decoded_pkt == NULL) {
         return -1;
     }
 
     memset(decoded_pkt, 0, sizeof(*decoded_pkt));
+
+    // Allocate IQ data buffer for max 273 PRBus * 12 samples each
+    decoded_pkt->iq_data = (fh_complex_t *)malloc(3276 * sizeof(*decoded_pkt->iq_data));
+    if (decoded_pkt->iq_data == NULL) {
+        return -1;
+    }
 
     decoded_pkt->timestamp = raw_pkt->timestamp;
     decoded_pkt->caplen = raw_pkt->caplen;
@@ -73,26 +78,26 @@ int fh_decode_packet(const fh_packet_t* raw_pkt, fh_decoded_packet_t* decoded_pk
     memcpy(decoded_pkt->ingress_if, raw_pkt->ingress_if, sizeof(raw_pkt->ingress_if));
 
     if (raw_pkt->data != NULL && raw_pkt->caplen > 0) {
-        u_char *packet = raw_pkt->data;
+        uint8_t *packet = raw_pkt->data;
 
         // Handle Ethernet header
-        struct ether_header *eth_header = (struct ether_header *) packet;
-        printf("\n----------------------------------------\n");
-        printf("Packet received (%d bytes):\n", header.len);
+        struct ether_header *ether_header = (struct ether_header *) packet;
+        /*printf("\n----------------------------------------\n");
+        printf("Packet received (%d bytes):\n", raw_pkt->caplen);
         printf("  Src MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
-               eth_header->ether_shost[0], eth_header->ether_shost[1],
-               eth_header->ether_shost[2], eth_header->ether_shost[3],
-               eth_header->ether_shost[4], eth_header->ether_shost[5]);
+               ether_header->ether_shost[0], ether_header->ether_shost[1],
+               ether_header->ether_shost[2], ether_header->ether_shost[3],
+               ether_header->ether_shost[4], ether_header->ether_shost[5]);
         printf("  Dst MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
-               eth_header->ether_dhost[0], eth_header->ether_dhost[1],
-               eth_header->ether_dhost[2], eth_header->ether_dhost[3],
-               eth_header->ether_dhost[4], eth_header->ether_dhost[5]);
+               ether_header->ether_dhost[0], ether_header->ether_dhost[1],
+               ether_header->ether_dhost[2], ether_header->ether_dhost[3],
+               ether_header->ether_dhost[4], ether_header->ether_dhost[5]);
         printf("  EtherType: 0x%04x (%s)\n",
-               ntohs(eth_header->ether_type),
-               ntohs(eth_header->ether_type) == ETHERTYPE_IP ? "IPv4" :
-               ntohs(eth_header->ether_type) == ETHERTYPE_IPV6 ? "IPv6" :
-               ntohs(eth_header->ether_type) == ETHERTYPE_ARP ? "ARP" : "Other");
-        printf("  Payload length: %d bytes\n\n", (unsigned int)(header.len - sizeof(struct ether_header)));
+               ntohs(ether_header->ether_type),
+               ntohs(ether_header->ether_type) == ETHERTYPE_IP ? "IPv4" :
+               ntohs(ether_header->ether_type) == ETHERTYPE_IPV6 ? "IPv6" :
+               ntohs(ether_header->ether_type) == ETHERTYPE_ARP ? "ARP" : "Other");
+        printf("  Payload length: %d bytes\n\n", (unsigned int)(raw_pkt->caplen - sizeof(struct ether_header)));*/
 
         /*printf("  Bytes after Ethernet header: ");
         for (int i = 0; i < 8; i++) {
@@ -101,7 +106,7 @@ int fh_decode_packet(const fh_packet_t* raw_pkt, fh_decoded_packet_t* decoded_pk
         printf("\n");*/
 
         // Handle VLAN tags
-        const u_char *ptr = packet + sizeof(struct ether_header) - 2;
+        const uint8_t *ptr = packet + sizeof(struct ether_header) - 2;
         uint16_t ethertype = ntohs(*(uint16_t *)ptr);
         int vlan_count = 0;
 
@@ -139,14 +144,14 @@ int fh_decode_packet(const fh_packet_t* raw_pkt, fh_decoded_packet_t* decoded_pk
             printf("  Subsequence ID: %u\n", ecpri->subsequence_id);           // 7 bits → decimal*/
             
             // eCPRI payload starts after common header (8 bytes)
-            const u_char *ecpri_payload = packet + sizeof(struct ether_header) + 8;
+            const uint8_t *ecpri_payload = packet + sizeof(struct ether_header) + 8;
             /*printf("  eCPRI Payload (%u bytes): ", ntohs(ecpri->payload_size));
             for (int i = 0; i < ntohs(ecpri->payload_size) && i < 32; i++) {
                 printf("%02x ", ecpri_payload[i]);
             }
             printf("\n\n");*/
 
-            const u_char *ptr_oran = ptr + 2 + sizeof(struct ecpri_common_header);
+            const uint8_t *ptr_oran = ptr + 2 + sizeof(struct ecpri_common_header);
 
             /*printf("  RAW ORAN Radio App Header: ");
             for (int i = 0; i < 6; i++) {
@@ -195,7 +200,7 @@ int fh_decode_packet(const fh_packet_t* raw_pkt, fh_decoded_packet_t* decoded_pk
                 while (payload_left - section_length > 0) {
 
                     if (ud_comp_hdr_present == false) {
-                        const u_char *ptr_section = ptr_oran + ntohs(ecpri->payload_size) - payload_left;
+                        const uint8_t *ptr_section = ptr_oran + ntohs(ecpri->payload_size) - payload_left;
                         struct oran_iq_section_header *section = (struct oran_iq_section_header *)(ptr_section);
                         uint16_t section_id = ((section->section_id_first & 0x0F) << 8) | (section->section_id_last & 0x0F);
                         uint16_t start_prbu = ((section->start_prbu_first & 0x03) << 8) | (section->start_prbu_last & 0xFF);
@@ -234,7 +239,7 @@ int fh_decode_packet(const fh_packet_t* raw_pkt, fh_decoded_packet_t* decoded_pk
 
                         // Handle PRBs
                         for (size_t prb = 0; prb < decoded_pkt->num_prbu; prb++) {
-                            const u_char *ptr_prb = ptr_section + sizeof(struct oran_iq_section_header) + prb * ((ud_iq_width * 2 * 12) / 8 + ud_comp_param_length);
+                            const uint8_t *ptr_prb = ptr_section + sizeof(struct oran_iq_section_header) + prb * ((ud_iq_width * 2 * 12) / 8 + ud_comp_param_length);
                             /*if (strcmp(ud_comp_method, "BFP") == 0) {
                                 printf("        UD Compression Param: Reserved: %d, Exponent: %d\n", ptr_prb[0] & 0xF0, ptr_prb[0] & 0x0F);
                             }
@@ -303,6 +308,15 @@ int fh_decode_packet(const fh_packet_t* raw_pkt, fh_decoded_packet_t* decoded_pk
     }
 
     return 0;
+}
+
+void fh_decoded_packet_free(fh_decoded_packet_t *pkt) {
+    if (pkt == NULL) {
+        return;
+    }
+
+    free(pkt->iq_data);
+    pkt->iq_data = NULL;
 }
 
 static int64_t extract_signed_bits(const uint8_t *buffer, uint32_t bit_offset, int bit_width) {

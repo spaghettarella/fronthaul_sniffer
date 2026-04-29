@@ -3,6 +3,15 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <time.h>
+#include <stdbool.h>
+
+#ifdef __cplusplus
+#include <complex>
+typedef std::complex<float> fh_complex_t;
+#else
+#include <complex.h>
+typedef float complex fh_complex_t;
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -20,7 +29,7 @@ typedef struct fh_decoded_packet {
     uint8_t start_symbol_id;
     uint16_t start_prbu;
     uint16_t num_prbu;
-    float complex iq_data[];
+    fh_complex_t *iq_data;
 } fh_decoded_packet_t;
 
 typedef struct fh_packet {
@@ -31,7 +40,9 @@ typedef struct fh_packet {
     size_t len;
 } fh_packet_t;
 
-int fh_decode_packet(const fh_packet_t* raw_pkt, fh_decoded_packet_t* decoded_pkt, bool ud_comp_hdr_present, int ud_iq_width, int ud_iq_width_decompressed, char *ud_comp_method);
+int fh_decode_packet(const fh_packet_t* raw_pkt, fh_decoded_packet_t* decoded_pkt, bool ud_comp_hdr_present, int ud_iq_width, int ud_iq_width_decompressed, const char *ud_comp_method);
+
+void fh_decoded_packet_free(fh_decoded_packet_t *pkt);
 
 #ifdef __cplusplus
 }

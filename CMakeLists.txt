@@ -13,6 +13,7 @@ add_executable(fronthaul_sniffer
     src/capture/c_capture_socket_mode.c
     src/pipeline/c_packet_queue.c
     src/core/c_fronthaul_decoder.c
+    src/core/bfp_decompress.c
     src/core/c_oran_memory.c
 )
 
@@ -26,3 +27,4 @@ target_compile_definitions(fronthaul_sniffer PRIVATE
 )
 
 target_link_libraries(fronthaul_sniffer PRIVATE pthread)
+target_link_libraries(fronthaul_sniffer PRIVATE m)
