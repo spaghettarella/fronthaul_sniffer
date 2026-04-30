@@ -31,7 +31,8 @@ void print_usage(const char* argv0) {
         << "  --ud-comp-hdr-present <bool>          Whether user data compression header is present (default: false)\n"
         << "  --ud-iq-width <bits>                  Width of user data IQ samples (default: 16)\n"
         << "  --ud-iq-width-decompressed <bits>     Width of user data IQ samples after decompression (default: 16)\n"
-        << "  --ud-comp-method <method>             Compression method for user data (NONE or BFP; default: NONE)\n";
+        << "  --ud-comp-method <method>             Compression method for user data (NONE or BFP; default: NONE)\n"
+        << "  --scs_khz <value>                     Subcarrier spacing in kHz (default: 30)\n";
 }
 
 int queue_callback(const fh_packet_t* pkt, void* user_ctx) {
@@ -55,6 +56,7 @@ int main(int argc, char** argv) {
     int ud_iq_width = 16;
     int ud_iq_width_decompressed = 16;
     const char *ud_comp_method = "NONE";
+    int scs_khz = 30;
 
     std::size_t memory_symbols = 2800;
 
@@ -88,6 +90,8 @@ int main(int argc, char** argv) {
             ud_iq_width_decompressed = std::stoi(next_arg("--ud-iq-width-decompressed"));
         } else if (arg == "--ud-comp-method") {
             ud_comp_method = next_arg("--ud-comp-method").c_str();
+        } else if (arg == "--scs_khz") {
+            scs_khz = std::stoi(next_arg("--scs_khz"));
         } else if (arg == "--help" || arg == "-h") {
             print_usage(argv[0]);
             return 0;
@@ -141,7 +145,7 @@ int main(int argc, char** argv) {
             if (fh_packet_queue_pop(queue, &pkt, &g_stop) > 0) {
                 fh_decoded_packet_t decoded{};
                 if (fh_decode_packet(&pkt, &decoded, ud_comp_hdr_present, ud_iq_width, ud_iq_width_decompressed, ud_comp_method) == 0) {
-                    fh_oran_memory_save(memory, &decoded);
+                    fh_oran_memory_save(memory, &decoded, scs_khz);
                 }
                 fh_decoded_packet_free(&decoded);
                 fh_packet_release(&pkt);
@@ -156,7 +160,7 @@ int main(int argc, char** argv) {
             }
             fh_decoded_packet_t decoded{};
             if (fh_decode_packet(&pkt, &decoded, ud_comp_hdr_present, ud_iq_width, ud_iq_width_decompressed, ud_comp_method) == 0) {
-                fh_oran_memory_save(memory, &decoded);
+                fh_oran_memory_save(memory, &decoded, scs_khz);
             }
             fh_decoded_packet_free(&decoded);
             fh_packet_release(&pkt);
