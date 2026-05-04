@@ -15,6 +15,7 @@ add_executable(fronthaul_sniffer
     src/core/c_fronthaul_decoder.c
     src/core/bfp_decompress.c
     src/core/c_oran_memory.c
+    src/visualization/opengl_visualizer.cpp
 )
 
 target_include_directories(fronthaul_sniffer PRIVATE src)
@@ -28,3 +29,8 @@ target_compile_definitions(fronthaul_sniffer PRIVATE
 
 target_link_libraries(fronthaul_sniffer PRIVATE pthread)
 target_link_libraries(fronthaul_sniffer PRIVATE m)
+
+# Find GLFW and OpenGL for visualization
+find_package(glfw3 REQUIRED)
+find_package(OpenGL REQUIRED)
+target_link_libraries(fronthaul_sniffer PRIVATE glfw OpenGL::GL)

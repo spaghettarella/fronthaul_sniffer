@@ -2,7 +2,9 @@
 #include "core/c_fronthaul_decoder.h"
 #include "core/c_oran_memory.h"
 #include "pipeline/c_packet_queue.h"
+#include "visualization/opengl_visualizer.h"
 
+#include <chrono>
 #include <csignal>
 #include <cstddef>
 #include <cstdlib>
@@ -122,7 +124,13 @@ int main(int argc, char** argv) {
             throw std::runtime_error("failed to create ORAN memory (Not enough physical memory?)");
         }
 
-        // Run packet capture on a background thread so the main thread can decode and store.
+        // Create visualizer window for heatmap display (must be done on main thread)
+        opengl_visualizer_t* visualizer = visualizer_create(800, 600);
+        if (visualizer == nullptr) {
+            std::cerr << "warning: failed to create visualizer, continuing without display\n";
+        }
+
+        // Run packet capture on a background thread (just network I/O, no OpenGL)
         std::thread capture_thread([&] {
             char errbuf[256] = {0};
             const int rc = fh_capture_socket_run(
@@ -139,10 +147,26 @@ int main(int argc, char** argv) {
             fh_packet_queue_notify_all(queue);
         });
 
-        // Consume packets from the queue until shutdown is requested.
-        while (g_stop == 0) {
-            fh_packet_t pkt{};
-            if (fh_packet_queue_pop(queue, &pkt, &g_stop) > 0) {
+        // Run packet decode on a background thread
+        std::thread decode_thread([&] {
+            while (g_stop == 0) {
+                fh_packet_t pkt{};
+                if (fh_packet_queue_pop(queue, &pkt, &g_stop) > 0) {
+                    fh_decoded_packet_t decoded{};
+                    if (fh_decode_packet(&pkt, &decoded, ud_comp_hdr_present, ud_iq_width, ud_iq_width_decompressed, ud_comp_method) == 0) {
+                        fh_oran_memory_save(memory, &decoded, scs_khz);
+                    }
+                    fh_decoded_packet_free(&decoded);
+                    fh_packet_release(&pkt);
+                }
+            }
+            
+            // Drain any remaining packets after shutdown
+            for (;;) {
+                fh_packet_t pkt{};
+                if (fh_packet_queue_pop(queue, &pkt, &g_stop) <= 0) {
+                    break;
+                }
                 fh_decoded_packet_t decoded{};
                 if (fh_decode_packet(&pkt, &decoded, ud_comp_hdr_present, ud_iq_width, ud_iq_width_decompressed, ud_comp_method) == 0) {
                     fh_oran_memory_save(memory, &decoded, scs_khz);
@@ -150,26 +174,31 @@ int main(int argc, char** argv) {
                 fh_decoded_packet_free(&decoded);
                 fh_packet_release(&pkt);
             }
+        });
+
+        // Main thread runs visualizer render loop with OpenGL calls
+        int render_result = 0;
+        if (visualizer != nullptr) {
+            while (visualizer_is_running(visualizer) && g_stop == 0) {
+                render_result = visualizer_update(visualizer, memory);
+                if (render_result < 0) {
+                    g_stop = 1;
+                }
+            }
+        } else {
+            // If no visualizer, block on g_stop
+            while (g_stop == 0) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
         }
 
-        // Drain any packets left in the queue after the capture thread stops.
-        for (;;) {
-            fh_packet_t pkt{};
-            if (fh_packet_queue_pop(queue, &pkt, &g_stop) <= 0) {
-                break;
-            }
-            fh_decoded_packet_t decoded{};
-            if (fh_decode_packet(&pkt, &decoded, ud_comp_hdr_present, ud_iq_width, ud_iq_width_decompressed, ud_comp_method) == 0) {
-                fh_oran_memory_save(memory, &decoded, scs_khz);
-            }
-            fh_decoded_packet_free(&decoded);
-            fh_packet_release(&pkt);
-        }
-
-        // Wake any waiters, then join the capture thread before reading final stats.
+        // Wake any waiters, then join the threads
         fh_packet_queue_notify_all(queue);
         if (capture_thread.joinable()) {
             capture_thread.join();
+        }
+        if (decode_thread.joinable()) {
+            decode_thread.join();
         }
 
         // Print the queue and memory counters so the run can be inspected from the terminal.
@@ -186,6 +215,9 @@ int main(int argc, char** argv) {
                   << " lowest=" << mem_stats.symbol_lowest << '\n';
 
         // Release resources in reverse order of creation.
+        if (visualizer != nullptr) {
+            visualizer_destroy(visualizer);
+        }
         fh_oran_memory_destroy(memory);
         fh_packet_queue_destroy(queue);
     } catch (const std::exception& ex) {
