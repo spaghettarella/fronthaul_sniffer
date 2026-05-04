@@ -178,8 +178,12 @@ int main(int argc, char** argv) {
                   << " dropped_bytes=" << stats.dropped_bytes << '\n';
 
         const fh_oran_memory_stats_t mem_stats = fh_oran_memory_stats(memory);
-        std::cout << "[memory] stored_packets=" << mem_stats.stored_symbols
-                  << " max_packets=" << mem_stats.max_symbols << '\n';
+        int occupancy = (mem_stats.symbol_highest >= mem_stats.symbol_lowest) ? 
+                        (mem_stats.symbol_highest - mem_stats.symbol_lowest + 1) : 0;
+        std::cout << "[memory] occupancy=" << occupancy
+                  << " max_capacity=" << mem_stats.max_symbols 
+                  << " highest=" << mem_stats.symbol_highest 
+                  << " lowest=" << mem_stats.symbol_lowest << '\n';
 
         // Release resources in reverse order of creation.
         fh_oran_memory_destroy(memory);

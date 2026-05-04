@@ -20,14 +20,13 @@ typedef struct fh_oran_memory {
     fh_complex_t** symbols;  // 2D array: symbols[i][j] where i is symbol, j is IQ sample (0-3275)
     int symbol_lowest;
     int symbol_highest;
-    size_t symbol_count;
+    int index_symbol_highest;
     size_t max_symbols;
 } fh_oran_memory_t;
 
 typedef struct fh_oran_memory_stats {
     int symbol_lowest;
     int symbol_highest;
-    size_t stored_symbols;
     size_t max_symbols;
 } fh_oran_memory_stats_t;
 
@@ -35,6 +34,7 @@ fh_oran_memory_t* fh_oran_memory_create(size_t max_symbols);
 void fh_oran_memory_destroy(fh_oran_memory_t* mem);
 
 int fh_oran_memory_save(fh_oran_memory_t* mem, const fh_decoded_packet_t* pkt, int scs_khz);
+int fh_oran_memory_wipe(fh_oran_memory_t* mem);
 
 fh_oran_memory_stats_t fh_oran_memory_stats(const fh_oran_memory_t* mem);
 

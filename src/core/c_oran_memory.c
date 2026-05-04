@@ -21,6 +21,25 @@ static int compute_symbol_number(const fh_section_t* section, int scs_khz) {
            section->start_symbol_id;
 }
 
+static void clear_symbol_row(fh_oran_memory_t* mem, size_t idx) {
+    if (mem == NULL || mem->symbols == NULL || idx >= mem->max_symbols || mem->symbols[idx] == NULL) {
+        return;
+    }
+
+    memset(mem->symbols[idx], 0, 3276 * sizeof(fh_complex_t));
+}
+
+static void clear_symbol_rows(fh_oran_memory_t* mem, size_t start_idx, size_t count) {
+    if (mem == NULL || mem->symbols == NULL || mem->max_symbols == 0 || count == 0) {
+        return;
+    }
+
+    for (size_t step = 0; step < count; step++) {
+        size_t idx = (start_idx + step) % mem->max_symbols;
+        clear_symbol_row(mem, idx);
+    }
+}
+
 fh_oran_memory_t* fh_oran_memory_create(size_t max_symbols) {
     // Reject nonsensical capacity requests early.
     if (max_symbols == 0) {
@@ -39,7 +58,7 @@ fh_oran_memory_t* fh_oran_memory_create(size_t max_symbols) {
     memset(mem, 0, sizeof(*mem));
     mem->symbol_lowest = INT_MAX;
     mem->symbol_highest = INT_MIN;
-    mem->symbol_count = 0;
+    mem->index_symbol_highest = 0;
     mem->max_symbols = max_symbols;
     mem->symbols = (fh_complex_t**)malloc(max_symbols * sizeof(fh_complex_t*));
     if (mem->symbols == NULL) {
@@ -99,20 +118,32 @@ int fh_oran_memory_save(fh_oran_memory_t* mem, const fh_decoded_packet_t* pkt, i
             continue;
         }
 
-        if (mem->symbol_count == 0) {
-            mem->symbol_lowest = symbol_number;
+        if (mem->symbol_highest == INT_MIN) {
+            // First symbol defines the initial ring position.
+            mem->index_symbol_highest = 0;
             mem->symbol_highest = symbol_number;
+            mem->symbol_lowest = symbol_number - (int)(mem->max_symbols - 1);
         } else if (symbol_number < mem->symbol_lowest) {
             printf("Warning: symbol number %d is older than the current memory base and will be skipped\n", symbol_number);
             continue;
-        } else if (symbol_number > mem->symbol_highest) {
-            mem->symbol_highest = symbol_number;
         }
 
-        int idx = symbol_number - mem->symbol_lowest;
-        if (idx < 0 || (size_t)idx >= mem->max_symbols) {
-            printf("Warning: symbol number %d is out of memory bounds and will be skipped\n", symbol_number);
-            continue;
+        if (symbol_number > mem->symbol_highest) {
+            size_t delta = (size_t)(symbol_number - mem->symbol_highest);
+            size_t old_highest_idx = mem->index_symbol_highest;
+
+            if (delta >= mem->max_symbols) {
+                // The new symbol is so far ahead that the whole window is replaced.
+                clear_symbol_rows(mem, 0, mem->max_symbols);
+            } else {
+                // Clear only the rows that are being overwritten by the new window.
+                size_t first_overwritten = (old_highest_idx + 1) % mem->max_symbols;
+                clear_symbol_rows(mem, first_overwritten, delta);
+            }
+
+            mem->index_symbol_highest = (old_highest_idx + delta) % mem->max_symbols;
+            mem->symbol_highest = symbol_number;
+            mem->symbol_lowest = symbol_number - (int)(mem->max_symbols - 1);
         }
 
         // Calculate the destination offset from the PRB start inside the symbol row.
@@ -133,12 +164,29 @@ int fh_oran_memory_save(fh_oran_memory_t* mem, const fh_decoded_packet_t* pkt, i
             continue;
         }
 
+        size_t idx = (mem->index_symbol_highest + mem->max_symbols - (size_t)(mem->symbol_highest - symbol_number)) % mem->max_symbols;
+
         // Copy only the requested PRB range into the correct location in the symbol buffer.
         memcpy(mem->symbols[idx] + start_iq, section->iq_data, iq_count * sizeof(fh_complex_t));
-        if ((size_t)(idx + 1) > mem->symbol_count) { // TODO: idx and symbol count do not neccesarily start at 0.
-            mem->symbol_count = (size_t)(idx + 1);
+    }
+
+    return 0;
+}
+
+int fh_oran_memory_wipe(fh_oran_memory_t* mem) {
+    // Validate pointer from caller.
+    if (mem == NULL || mem->symbols == NULL) {
+        return -1;
+    }
+
+    // Zero out all symbol buffers and reset counters.
+    for (size_t i = 0; i < mem->max_symbols; i++) {
+        if (mem->symbols[i] != NULL) {
+            memset(mem->symbols[i], 0, 3276 * sizeof(fh_complex_t));
         }
     }
+    mem->symbol_lowest = INT_MAX;
+    mem->symbol_highest = INT_MIN;
 
     return 0;
 }
@@ -152,7 +200,6 @@ fh_oran_memory_stats_t fh_oran_memory_stats(const fh_oran_memory_t* mem) {
     if (mem != NULL) {
         stats.symbol_lowest = mem->symbol_lowest;
         stats.symbol_highest = mem->symbol_highest;
-        stats.stored_symbols = mem->symbol_count;
         stats.max_symbols = mem->max_symbols;
     }
 
