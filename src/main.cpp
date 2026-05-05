@@ -1,4 +1,5 @@
 #include "capture/c_capture_socket_mode.h"
+#include "capture/c_pcap_demo_stream.h"
 #include "core/c_fronthaul_decoder.h"
 #include "core/c_oran_memory.h"
 #include "pipeline/c_packet_queue.h"
@@ -34,7 +35,9 @@ void print_usage(const char* argv0) {
         << "  --ud-iq-width <bits>                  Width of user data IQ samples (default: 16)\n"
         << "  --ud-iq-width-decompressed <bits>     Width of user data IQ samples after decompression (default: 16)\n"
         << "  --ud-comp-method <method>             Compression method for user data (NONE or BFP; default: NONE)\n"
-        << "  --scs_khz <value>                     Subcarrier spacing in kHz (default: 30)\n";
+        << "  --scs-khz <value>                     Subcarrier spacing in kHz (default: 30)\n"
+        << "  --demo-pcap <path> <speed>            Stream packets from a pcap file in <path> instead of live capture with <speed> packets per second\n"
+        << "  --help, -h                            Show this help message\n";
 }
 
 int queue_callback(const fh_packet_t* pkt, void* user_ctx) {
@@ -59,6 +62,9 @@ int main(int argc, char** argv) {
     int ud_iq_width_decompressed = 16;
     const char *ud_comp_method = "NONE";
     int scs_khz = 30;
+    bool demo_pcap_enabled = false;
+    std::string demo_pcap_path = "../src/capture/demo.pcap";
+    int demo_pcap_speed = 25;
 
     std::size_t memory_symbols = 2800;
 
@@ -92,8 +98,31 @@ int main(int argc, char** argv) {
             ud_iq_width_decompressed = std::stoi(next_arg("--ud-iq-width-decompressed"));
         } else if (arg == "--ud-comp-method") {
             ud_comp_method = next_arg("--ud-comp-method").c_str();
-        } else if (arg == "--scs_khz") {
-            scs_khz = std::stoi(next_arg("--scs_khz"));
+        } else if (arg == "--scs-khz") {
+            scs_khz = std::stoi(next_arg("--scs-khz"));
+        } else if (arg == "--demo-pcap") {
+            // Support `--demo-pcap` with optional <path> and optional <speed>.
+            // With no arguments, use the default path relative to `build/`.
+            if (i + 1 >= argc) {
+                demo_pcap_enabled = true;
+            } else {
+                std::string peek = argv[i + 1];
+                if (!peek.empty() && peek.rfind("--", 0) == 0) {
+                    demo_pcap_enabled = true;
+                } else {
+                    demo_pcap_path = next_arg("--demo-pcap");
+                    if (i + 1 < argc) {
+                        std::string peek2 = argv[i + 1];
+                        if (!peek2.empty() && peek2.rfind("--", 0) != 0) {
+                            demo_pcap_speed = std::stoi(next_arg("--demo-pcap"));
+                            if (demo_pcap_speed <= 0) {
+                                throw std::invalid_argument("--demo-pcap speed must be > 0");
+                            }
+                        }
+                    }
+                    demo_pcap_enabled = true;
+                }
+            }
         } else if (arg == "--help" || arg == "-h") {
             print_usage(argv[0]);
             return 0;
@@ -130,16 +159,30 @@ int main(int argc, char** argv) {
             std::cerr << "warning: failed to create visualizer, continuing without display\n";
         }
 
-        // Run packet capture on a background thread (just network I/O, no OpenGL)
+        // Run packet capture on a background thread (just network I/O/file replay, no OpenGL)
         std::thread capture_thread([&] {
             char errbuf[256] = {0};
-            const int rc = fh_capture_socket_run(
-                &capture_options,
-                queue_callback,
-                queue,
-                &g_stop,
-                errbuf,
-                sizeof(errbuf));
+            int rc = 0;
+            if (demo_pcap_enabled) {
+                fh_pcap_stream_options_t demo_options{};
+                demo_options.pcap_path = demo_pcap_path.c_str();
+                demo_options.demo_pcap_timeout = 1.0 / static_cast<double>(demo_pcap_speed);
+                rc = fh_pcap_stream_run(
+                    &demo_options,
+                    queue_callback,
+                    queue,
+                    &g_stop,
+                    errbuf,
+                    sizeof(errbuf));
+            } else {
+                rc = fh_capture_socket_run(
+                    &capture_options,
+                    queue_callback,
+                    queue,
+                    &g_stop,
+                    errbuf,
+                    sizeof(errbuf));
+            }
             if (rc != 0) {
                 std::cerr << "capture error: " << errbuf << '\n';
             }

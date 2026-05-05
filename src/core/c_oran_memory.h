@@ -1,6 +1,6 @@
 #pragma once
 
-#include "core/c_fronthaul_decoder.h"
+#include "c_fronthaul_decoder.h"
 
 #include <stddef.h>
 

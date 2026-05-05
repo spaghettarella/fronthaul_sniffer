@@ -11,6 +11,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 add_executable(fronthaul_sniffer
     src/main.cpp
     src/capture/c_capture_socket_mode.c
+    src/capture/c_pcap_demo_stream.c
     src/pipeline/c_packet_queue.c
     src/core/c_fronthaul_decoder.c
     src/core/bfp_decompress.c
@@ -29,6 +30,9 @@ target_compile_definitions(fronthaul_sniffer PRIVATE
 
 target_link_libraries(fronthaul_sniffer PRIVATE pthread)
 target_link_libraries(fronthaul_sniffer PRIVATE m)
+
+find_library(PCAP_LIBRARY NAMES pcap REQUIRED)
+target_link_libraries(fronthaul_sniffer PRIVATE ${PCAP_LIBRARY})
 
 # Find GLFW and OpenGL for visualization
 find_package(glfw3 REQUIRED)

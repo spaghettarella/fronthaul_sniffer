@@ -1,4 +1,4 @@
-#include "pipeline/c_packet_queue.h"
+#include "c_packet_queue.h"
 
 #include <errno.h>
 #include <pthread.h>

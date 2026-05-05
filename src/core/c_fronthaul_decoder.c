@@ -192,9 +192,25 @@ int fh_decode_packet(const fh_packet_t* raw_pkt, fh_decoded_packet_t* decoded_pk
                 int section_length = 0;
                 int payload_left = ntohs(ecpri->payload_size) - sizeof(struct oran_iq_radio_app_header);
                 int section_count = 0;
+                /* Allocate an initial sections array so we can store parsed sections.
+                 * We don't know the exact number of sections up-front, so use a
+                 * reasonable upper bound and prevent overruns. If more sections
+                 * are required, the parser will stop adding new sections.
+                 */
+                const int MAX_SECTIONS = 256;
+                if (decoded_pkt->sections == NULL) {
+                    decoded_pkt->sections = calloc((size_t)MAX_SECTIONS, sizeof(*decoded_pkt->sections));
+                    if (decoded_pkt->sections == NULL) {
+                        return -1;
+                    }
+                }
                 while (payload_left - section_length > 0) {
 
                     if (ud_comp_hdr_present == false) {
+                        if (section_count >= MAX_SECTIONS) {
+                            // avoid buffer overflow into sections array
+                            break;
+                        }
                         const uint8_t *ptr_section = ptr_oran + ntohs(ecpri->payload_size) - payload_left;
                         struct oran_iq_section_header *section = (struct oran_iq_section_header *)(ptr_section);
                         uint16_t section_id = ((section->section_id_first & 0x0F) << 8) | (section->section_id_last & 0x0F);
