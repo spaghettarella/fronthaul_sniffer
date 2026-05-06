@@ -4,16 +4,23 @@
 #include "core/c_oran_memory.h"
 #include "pipeline/c_packet_queue.h"
 #include "visualization/opengl_visualizer.h"
+#include "gui/imgui_visualizer_interface.h"
 
 #include <chrono>
 #include <csignal>
 #include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unordered_map>
+#include <vector>
+
+// The memory key structs are defined in the GUI interface header
+// and used here in the main program
 
 namespace {
 volatile sig_atomic_t g_stop = 0;
@@ -30,13 +37,13 @@ void print_usage(const char* argv0) {
         << "  --timeout-ms <ms>                     Read timeout in milliseconds (default: 100)\n"
         << "  --queue-packets <count>               Max packets buffered before processing (default: 4096)\n"
         << "  --queue-bytes <bytes>                 Max bytes buffered before processing (default: 32MiB)\n"
-        << "  --memory-size <symbols>               Max symbols buffered (max: 573440; default: 2800)\n"
+        << "  --memory-size <symbols>               Max symbols buffered per eAxC_ID and Direction (max: 573440; default: 2800)\n"
         << "  --ud-comp-hdr-present <bool>          Whether user data compression header is present (default: false)\n"
-        << "  --ud-iq-width <bits>                  Width of user data IQ samples (default: 16)\n"
+        << "  --ud-iq-width <bits>                  Width of user data IQ samples (default: 9)\n"
         << "  --ud-iq-width-decompressed <bits>     Width of user data IQ samples after decompression (default: 16)\n"
         << "  --ud-comp-method <method>             Compression method for user data (NONE or BFP; default: NONE)\n"
         << "  --scs-khz <value>                     Subcarrier spacing in kHz (default: 30)\n"
-        << "  --demo-pcap <path> <speed>            Stream packets from a pcap file in <path> instead of live capture with <speed> packets per second\n"
+        << "  --demo-pcap <path> <speed>            Stream packets from a pcap file in <path> (instead of live capture) with <speed> packets per second\n"
         << "  --help, -h                            Show this help message\n";
 }
 
@@ -45,7 +52,54 @@ int queue_callback(const fh_packet_t* pkt, void* user_ctx) {
     const int rc = fh_packet_queue_push_copy(queue, pkt);
     return (rc < 0) ? -1 : 0;
 }
-}  // namespace
+
+int fh_memory_manage(
+    fh_packet_t* pkt,
+    std::unordered_map<fh_memory_key_t, fh_oran_memory_t*>& memories,
+    std::vector<fh_memory_key_t>& discovered_keys,
+    fh_oran_memory_t*& display_memory,
+    std::size_t memory_symbols,
+    int scs_khz,
+    bool ud_comp_hdr_present,
+    int ud_iq_width,
+    int ud_iq_width_decompressed,
+    const char* ud_comp_method) {
+    if (pkt == nullptr) {
+        return -1;
+    }
+
+    // Decode once, then route the packet to the memory buffer that matches
+    fh_decoded_packet_t decoded{};
+    int rc = fh_decode_packet(pkt, &decoded, ud_comp_hdr_present, ud_iq_width, ud_iq_width_decompressed, ud_comp_method);
+    if (rc == 0 && decoded.section_count > 0 && decoded.sections != nullptr) {
+        const fh_memory_key_t key{decoded.sections[0].eaxc_id, decoded.sections[0].data_direction};
+        auto it = memories.find(key);
+        if (it == memories.end()) {
+            // Create a new ring buffer the first time we see a new stream key.
+            fh_oran_memory_t* new_memory = fh_oran_memory_create(memory_symbols);
+            if (new_memory != nullptr) {
+                memories.emplace(key, new_memory);
+                discovered_keys.push_back(key);
+                if (display_memory == nullptr) {
+                    // Keep the first discovered memory as the default visualizer target.
+                    display_memory = new_memory;
+                }
+                it = memories.find(key);
+            }
+        }
+
+        if (it != memories.end() && it->second != nullptr) {
+            // Store the decoded symbols into the memory that matches this packet stream.
+            fh_oran_memory_save(it->second, &decoded, scs_khz);
+        }
+    }
+
+    // Ownership of the raw packet and decoded packet ends here.
+    fh_decoded_packet_free(&decoded);
+    fh_packet_release(pkt);
+    return rc;
+}
+}  // namespace closed
 
 int main(int argc, char** argv) {
     fh_capture_socket_options_t capture_options{};
@@ -58,7 +112,7 @@ int main(int argc, char** argv) {
     std::size_t queue_bytes = 32u * 1024u * 1024u;
 
     bool ud_comp_hdr_present = false;
-    int ud_iq_width = 16;
+    int ud_iq_width = 9;
     int ud_iq_width_decompressed = 16;
     const char *ud_comp_method = "NONE";
     int scs_khz = 30;
@@ -147,16 +201,26 @@ int main(int argc, char** argv) {
             throw std::runtime_error("failed to create packet queue");
         }
 
-        fh_oran_memory_t* memory = fh_oran_memory_create(memory_symbols);
-        if (memory == nullptr) {
-            fh_packet_queue_destroy(queue);
-            throw std::runtime_error("failed to create ORAN memory (Not enough physical memory?)");
-        }
+        // Per-stream memory buffers keyed by (eAxC_ID, data_direction).
+        std::unordered_map<fh_memory_key_t, fh_oran_memory_t*> memories;
+        // Keep discovery order so we can print the list of active streams later.
+        std::vector<fh_memory_key_t> discovered_keys;
+        // The visualizer renders one memory instance; by default we show the first one seen.
+        fh_oran_memory_t* display_memory = nullptr;
 
         // Create visualizer window for heatmap display (must be done on main thread)
         opengl_visualizer_t* visualizer = visualizer_create(800, 600);
         if (visualizer == nullptr) {
             std::cerr << "warning: failed to create visualizer, continuing without display\n";
+        }
+
+        // Initialize ImGui for stream selection interface
+        imgui_visualizer_state_t* imgui_state = nullptr;
+        if (visualizer != nullptr) {
+            imgui_state = imgui_visualizer_init(800, 600);
+            if (imgui_state == nullptr) {
+                std::cerr << "warning: failed to initialize ImGui, continuing without stream selector\n";
+            }
         }
 
         // Run packet capture on a background thread (just network I/O/file replay, no OpenGL)
@@ -190,17 +254,24 @@ int main(int argc, char** argv) {
             fh_packet_queue_notify_all(queue);
         });
 
-        // Run packet decode on a background thread
+        // Run packet decode on a background thread.
+        // The same helper is used both during normal operation and during shutdown draining
+        // so that packet handling stays in one place.
         std::thread decode_thread([&] {
             while (g_stop == 0) {
                 fh_packet_t pkt{};
                 if (fh_packet_queue_pop(queue, &pkt, &g_stop) > 0) {
-                    fh_decoded_packet_t decoded{};
-                    if (fh_decode_packet(&pkt, &decoded, ud_comp_hdr_present, ud_iq_width, ud_iq_width_decompressed, ud_comp_method) == 0) {
-                        fh_oran_memory_save(memory, &decoded, scs_khz);
-                    }
-                    fh_decoded_packet_free(&decoded);
-                    fh_packet_release(&pkt);
+                    fh_memory_manage(
+                        &pkt,
+                        memories,
+                        discovered_keys,
+                        display_memory,
+                        memory_symbols,
+                        scs_khz,
+                        ud_comp_hdr_present,
+                        ud_iq_width,
+                        ud_iq_width_decompressed,
+                        ud_comp_method);
                 }
             }
             
@@ -210,12 +281,17 @@ int main(int argc, char** argv) {
                 if (fh_packet_queue_pop(queue, &pkt, &g_stop) <= 0) {
                     break;
                 }
-                fh_decoded_packet_t decoded{};
-                if (fh_decode_packet(&pkt, &decoded, ud_comp_hdr_present, ud_iq_width, ud_iq_width_decompressed, ud_comp_method) == 0) {
-                    fh_oran_memory_save(memory, &decoded, scs_khz);
-                }
-                fh_decoded_packet_free(&decoded);
-                fh_packet_release(&pkt);
+                fh_memory_manage(
+                    &pkt,
+                    memories,
+                    discovered_keys,
+                    display_memory,
+                    memory_symbols,
+                    scs_khz,
+                    ud_comp_hdr_present,
+                    ud_iq_width,
+                    ud_iq_width_decompressed,
+                    ud_comp_method);
             }
         });
 
@@ -223,7 +299,31 @@ int main(int argc, char** argv) {
         int render_result = 0;
         if (visualizer != nullptr) {
             while (visualizer_is_running(visualizer) && g_stop == 0) {
-                render_result = visualizer_update(visualizer, memory);
+                // Build array of memory pointers for ImGui interface
+                std::vector<fh_oran_memory_t*> memory_ptrs;
+                for (const auto& key : discovered_keys) {
+                    auto it = memories.find(key);
+                    if (it != memories.end()) {
+                        memory_ptrs.push_back(it->second);
+                    } else {
+                        memory_ptrs.push_back(nullptr);
+                    }
+                }
+
+                // Render ImGui stream selection interface
+                if (imgui_state != nullptr && !discovered_keys.empty()) {
+                    display_memory = imgui_visualizer_render(
+                        imgui_state,
+                        discovered_keys.data(),
+                        discovered_keys.size(),
+                        memory_ptrs.data(),
+                        display_memory,
+                        800,
+                        600);
+                }
+
+                // Render heatmap visualization
+                render_result = visualizer_update(visualizer, display_memory);
                 if (render_result < 0) {
                     g_stop = 1;
                 }
@@ -249,19 +349,37 @@ int main(int argc, char** argv) {
         std::cout << "[queue] dropped_packets=" << stats.dropped_packets
                   << " dropped_bytes=" << stats.dropped_bytes << '\n';
 
-        const fh_oran_memory_stats_t mem_stats = fh_oran_memory_stats(memory);
-        int occupancy = (mem_stats.symbol_highest >= mem_stats.symbol_lowest) ? 
-                        (mem_stats.symbol_highest - mem_stats.symbol_lowest + 1) : 0;
-        std::cout << "[memory] occupancy=" << occupancy
-                  << " max_capacity=" << mem_stats.max_symbols 
-                  << " highest=" << mem_stats.symbol_highest 
-                  << " lowest=" << mem_stats.symbol_lowest << '\n';
+        std::cout << "[memory] tracked_streams=" << discovered_keys.size() << '\n';
+        for (const auto& key : discovered_keys) {
+            auto it = memories.find(key);
+            if (it == memories.end() || it->second == nullptr) {
+                continue;
+            }
+            const fh_oran_memory_stats_t mem_stats = fh_oran_memory_stats(it->second);
+            int occupancy = (mem_stats.symbol_highest >= mem_stats.symbol_lowest)
+                                ? (mem_stats.symbol_highest - mem_stats.symbol_lowest + 1)
+                                : 0;
+            std::cout << "[memory] eaxc_id=" << key.eaxc_id
+                      << " data_direction=" << static_cast<int>(key.data_direction)
+                      << " occupancy=" << occupancy
+                      << " max_capacity=" << mem_stats.max_symbols
+                      << " highest=" << mem_stats.symbol_highest
+                      << " lowest=" << mem_stats.symbol_lowest << '\n';
+        }
 
         // Release resources in reverse order of creation.
+        if (imgui_state != nullptr) {
+            imgui_visualizer_shutdown(imgui_state);
+        }
         if (visualizer != nullptr) {
             visualizer_destroy(visualizer);
         }
-        fh_oran_memory_destroy(memory);
+        for (auto& entry : memories) {
+            if (entry.second != nullptr) {
+                fh_oran_memory_destroy(entry.second);
+                entry.second = nullptr;
+            }
+        }
         fh_packet_queue_destroy(queue);
     } catch (const std::exception& ex) {
         std::cerr << "fatal: " << ex.what() << '\n';

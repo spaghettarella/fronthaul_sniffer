@@ -12,7 +12,7 @@
 // Constants for heatmap layout
 #define HEATMAP_WIDTH_PRBS 273
 #define HEATMAP_SAMPLES_PER_PRB 12
-#define HEATMAP_TEXTURE_WIDTH (HEATMAP_WIDTH_PRBS * 3)  // 3 samples side-by-side per PRB = 819
+#define HEATMAP_TEXTURE_WIDTH (HEATMAP_WIDTH_PRBS * HEATMAP_SAMPLES_PER_PRB)  // 3276 - all IQ samples
 #define HEATMAP_TEXTURE_HEIGHT 200  // Display last 200 symbols
 
 typedef struct opengl_visualizer {
@@ -88,7 +88,7 @@ opengl_visualizer_t* visualizer_create(int width, int height) {
     glfwSetErrorCallback(error_callback);
     glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
     
-    GLFWwindow* window = glfwCreateWindow(width, height, "ORAN IQ Heatmap", NULL, NULL);
+    GLFWwindow* window = glfwCreateWindow(width, height, "ORAN Fronthaul Waterfall", NULL, NULL);
     if (!window) {
         fprintf(stderr, "Failed to create GLFW window\n");
         glfwTerminate();

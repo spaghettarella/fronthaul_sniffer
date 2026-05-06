@@ -8,6 +8,13 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# Fetch ImGui for stream selection interface
+include(FetchContent)
+FetchContent_Declare(imgui
+    URL https://github.com/ocornut/imgui/archive/v1.89.8.tar.gz
+)
+FetchContent_MakeAvailable(imgui)
+
 add_executable(fronthaul_sniffer
     src/main.cpp
     src/capture/c_capture_socket_mode.c
@@ -17,15 +24,26 @@ add_executable(fronthaul_sniffer
     src/core/bfp_decompress.c
     src/core/c_oran_memory.c
     src/visualization/opengl_visualizer.cpp
+    src/gui/imgui_visualizer_interface.cpp
+    ${imgui_SOURCE_DIR}/imgui.cpp
+    ${imgui_SOURCE_DIR}/imgui_demo.cpp
+    ${imgui_SOURCE_DIR}/imgui_draw.cpp
+    ${imgui_SOURCE_DIR}/imgui_tables.cpp
+    ${imgui_SOURCE_DIR}/imgui_widgets.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_glfw.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_opengl2.cpp
 )
 
 target_include_directories(fronthaul_sniffer PRIVATE src)
+target_include_directories(fronthaul_sniffer PRIVATE ${imgui_SOURCE_DIR})
+target_include_directories(fronthaul_sniffer PRIVATE ${imgui_SOURCE_DIR}/backends)
 
 target_compile_options(fronthaul_sniffer PRIVATE -Wall -Wextra -Wpedantic)
 
 target_compile_definitions(fronthaul_sniffer PRIVATE
     _DEFAULT_SOURCE
     _POSIX_C_SOURCE=200809L
+    IMGUI_IMPL_OPENGL_LOADER_GLAD
 )
 
 target_link_libraries(fronthaul_sniffer PRIVATE pthread)
