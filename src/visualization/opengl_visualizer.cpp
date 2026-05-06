@@ -86,6 +86,7 @@ opengl_visualizer_t* visualizer_create(int width, int height) {
     }
     
     glfwSetErrorCallback(error_callback);
+    glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
     
     GLFWwindow* window = glfwCreateWindow(width, height, "ORAN IQ Heatmap", NULL, NULL);
     if (!window) {
@@ -127,12 +128,13 @@ opengl_visualizer_t* visualizer_create(int width, int height) {
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, HEATMAP_TEXTURE_WIDTH, HEATMAP_TEXTURE_HEIGHT, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
     
     // Set up OpenGL state for 2D rendering
+    glDisable(GL_DEPTH_TEST);
+    glViewport(0, 0, width, height);
     glMatrixMode(GL_PROJECTION);
     glLoadIdentity();
     glOrtho(0, width, height, 0, -1, 1);
     glMatrixMode(GL_MODELVIEW);
     glLoadIdentity();
-    glDisable(GL_DEPTH_TEST);
     
     return vis;
 }
@@ -230,6 +232,24 @@ int visualizer_update(opengl_visualizer_t* vis, const fh_oran_memory_t* memory) 
     }
     
     glfwPollEvents();
+
+    int fb_width = 0;
+    int fb_height = 0;
+    glfwGetFramebufferSize(vis->window, &fb_width, &fb_height);
+    if (fb_width <= 0 || fb_height <= 0) {
+        return 0;
+    }
+
+    if (fb_width != vis->width || fb_height != vis->height) {
+        vis->width = fb_width;
+        vis->height = fb_height;
+        glViewport(0, 0, vis->width, vis->height);
+        glMatrixMode(GL_PROJECTION);
+        glLoadIdentity();
+        glOrtho(0, vis->width, vis->height, 0, -1, 1);
+        glMatrixMode(GL_MODELVIEW);
+        glLoadIdentity();
+    }
     
     // Update texture from memory
     update_heatmap_texture(vis, memory);
@@ -241,9 +261,9 @@ int visualizer_update(opengl_visualizer_t* vis, const fh_oran_memory_t* memory) 
     
     glBegin(GL_QUADS);
     glTexCoord2f(0, 0); glVertex2f(0, 0);
-    glTexCoord2f(1, 0); glVertex2f(vis->width, 0);
-    glTexCoord2f(1, 1); glVertex2f(vis->width, vis->height);
-    glTexCoord2f(0, 1); glVertex2f(0, vis->height);
+    glTexCoord2f(1, 0); glVertex2f((float)vis->width, 0);
+    glTexCoord2f(1, 1); glVertex2f((float)vis->width, (float)vis->height);
+    glTexCoord2f(0, 1); glVertex2f(0, (float)vis->height);
     glEnd();
     
     glDisable(GL_TEXTURE_2D);

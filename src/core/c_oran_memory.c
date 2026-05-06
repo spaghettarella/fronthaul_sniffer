@@ -5,7 +5,7 @@
 #include <string.h>
 #include <limits.h>
 
-static int compute_symbol_number(const fh_section_t* section, int scs_khz) {
+static int compute_symbol_number(uint64_t frame_counter, const fh_section_t* section, int scs_khz) {
     if (section == NULL || scs_khz <= 0) {
         return -1;
     }
@@ -15,10 +15,23 @@ static int compute_symbol_number(const fh_section_t* section, int scs_khz) {
         slots_per_subframe = 1;
     }
 
-    return section->frame_id * 10 * slots_per_subframe * 14 +
-           section->subframe_id * slots_per_subframe * 14 +
-           section->slot_id * 14 +
-           section->start_symbol_id;
+    // The `frame_counter` tracks the number of 256-frame wraparounds observed.
+    // The actual absolute frame number is therefore:
+    //    full_frame = frame_counter * 256 + section->frame_id
+    uint64_t full_frame = frame_counter * 256ULL + (uint8_t)section->frame_id;
+
+    // Compute a symbol index from the absolute frame number, subframe, slot and symbol.
+    // Keep the final result as int for compatibility with the rest of the code.
+    uint64_t sym = full_frame * 10ULL * (uint64_t)slots_per_subframe * 14ULL
+                 + (uint64_t)section->subframe_id * (uint64_t)slots_per_subframe * 14ULL
+                 + (uint64_t)section->slot_id * 14ULL
+                 + (uint64_t)section->start_symbol_id;
+
+    if (sym > (uint64_t)INT_MAX) {
+        // Avoid overflow when converting to int; saturate to INT_MAX.
+        return INT_MAX;
+    }
+    return (int)sym;
 }
 
 static void clear_symbol_row(fh_oran_memory_t* mem, size_t idx) {
@@ -80,6 +93,10 @@ fh_oran_memory_t* fh_oran_memory_create(size_t max_symbols) {
         }
     }
 
+    // Initialize frame tracking for wraparound detection.
+    mem->frame_counter = 0;
+    mem->last_frame_id = 0;
+
     return mem;
 }
 
@@ -113,7 +130,13 @@ int fh_oran_memory_save(fh_oran_memory_t* mem, const fh_decoded_packet_t* pkt, i
     for (int i = 0; i < pkt->section_count; i++) {
         const fh_section_t* section = &pkt->sections[i];
 
-        int symbol_number = compute_symbol_number(section, scs_khz);
+        // Detect frame_id wraparound (8-bit counter resets to 0 after 255)
+        if (section->frame_id < mem->last_frame_id) {
+            mem->frame_counter++;
+        }
+        mem->last_frame_id = section->frame_id;
+
+        int symbol_number = compute_symbol_number(mem->frame_counter, section, scs_khz);
         if (symbol_number < 0) {
             continue;
         }
@@ -187,6 +210,8 @@ int fh_oran_memory_wipe(fh_oran_memory_t* mem) {
     }
     mem->symbol_lowest = INT_MAX;
     mem->symbol_highest = INT_MIN;
+    mem->frame_counter = 0;
+    mem->last_frame_id = 0;
 
     return 0;
 }

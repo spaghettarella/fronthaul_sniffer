@@ -22,6 +22,8 @@ typedef struct fh_oran_memory {
     int symbol_highest;
     int index_symbol_highest;
     size_t max_symbols;
+    uint64_t frame_counter;  // Continuous frame counter (tracks wraparounds of 8-bit frame_id)
+    uint8_t last_frame_id;   // Previous frame_id; used to detect wraparound
 } fh_oran_memory_t;
 
 typedef struct fh_oran_memory_stats {
