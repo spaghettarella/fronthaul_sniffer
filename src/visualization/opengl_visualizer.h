@@ -25,6 +25,9 @@ void visualizer_run(opengl_visualizer_t* vis, const fh_oran_memory_t* memory);
 // Returns 0 on success, negative on window close or error
 int visualizer_update(opengl_visualizer_t* vis, const fh_oran_memory_t* memory);
 
+// Present the current backbuffer to the screen after overlay drawing is finished
+void visualizer_present(opengl_visualizer_t* vis);
+
 // Check if the window is still open
 int visualizer_is_running(const opengl_visualizer_t* vis);
 

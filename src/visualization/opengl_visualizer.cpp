@@ -267,9 +267,16 @@ int visualizer_update(opengl_visualizer_t* vis, const fh_oran_memory_t* memory) 
     glEnd();
     
     glDisable(GL_TEXTURE_2D);
-    glfwSwapBuffers(vis->window);
     
     return 0;
+}
+
+void visualizer_present(opengl_visualizer_t* vis) {
+    if (!vis || !vis->window || !vis->is_running) {
+        return;
+    }
+
+    glfwSwapBuffers(vis->window);
 }
 
 void visualizer_run(opengl_visualizer_t* vis, const fh_oran_memory_t* memory) {
@@ -278,6 +285,7 @@ void visualizer_run(opengl_visualizer_t* vis, const fh_oran_memory_t* memory) {
     }
     
     while (vis->is_running && visualizer_update(vis, memory) == 0) {
+        visualizer_present(vis);
         // Loop continues
     }
 }

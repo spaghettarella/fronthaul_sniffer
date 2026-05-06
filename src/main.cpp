@@ -326,7 +326,14 @@ int main(int argc, char** argv) {
                 render_result = visualizer_update(visualizer, display_memory);
                 if (render_result < 0) {
                     g_stop = 1;
+                    continue;
                 }
+
+                if (imgui_state != nullptr && !discovered_keys.empty()) {
+                    imgui_visualizer_present();
+                }
+
+                visualizer_present(visualizer);
             }
         } else {
             // If no visualizer, block on g_stop

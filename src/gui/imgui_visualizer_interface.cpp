@@ -132,53 +132,71 @@ fh_oran_memory_t* imgui_visualizer_render(
     // Display stream list
     ImGui::BeginChild("StreamList", ImVec2(280, 120), true, ImGuiWindowFlags_AlwaysAutoResize);
 
-    for (int i = 0; i < num_unique_streams; i++) {
-        uint16_t eaxc_id = streams[i].eaxc_id;
-        ImGui::PushID(i);
+    if (ImGui::BeginTable("stream_table", 3, ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_RowBg)) {
+        ImGui::TableSetupColumn("eAxC_ID", ImGuiTableColumnFlags_WidthFixed, 90.0f);
+        ImGui::TableSetupColumn("UL", ImGuiTableColumnFlags_WidthFixed, 48.0f);
+        ImGui::TableSetupColumn("DL", ImGuiTableColumnFlags_WidthFixed, 48.0f);
+        ImGui::TableHeadersRow();
 
-        // Format eAxC_ID for display
-        char eaxc_label[16];
-        snprintf(eaxc_label, sizeof(eaxc_label), "0x%04X", eaxc_id);
+        for (int i = 0; i < num_unique_streams; i++) {
+            uint16_t eaxc_id = streams[i].eaxc_id;
+            ImGui::PushID(i);
 
-        // Radio button for stream selection
-        bool is_selected = (state->selected_eaxc_id_index == i);
-        if (ImGui::Selectable(eaxc_label, is_selected)) {
-            state->selected_eaxc_id_index = i;
-        }
+            const bool row_selected = (state->selected_eaxc_id_index == i);
+            const bool ul_selected = row_selected && state->selected_data_direction == 0;
+            const bool dl_selected = row_selected && state->selected_data_direction == 1;
 
-        ImGui::SameLine(120);
+            ImGui::TableNextRow();
 
-        // Direction selector (combo for available directions)
-        int available_directions = 0;
-        int direction_indices[2];
-        const char* available_labels[2];
+            ImGui::TableSetColumnIndex(0);
 
-        if (streams[i].has_ul) {
-            direction_indices[available_directions] = 0;
-            available_labels[available_directions] = "UL";
-            available_directions++;
-        }
-        if (streams[i].has_dl) {
-            direction_indices[available_directions] = 1;
-            available_labels[available_directions] = "DL";
-            available_directions++;
-        }
+            // Format eAxC_ID for display
+            char eaxc_label[16];
+            snprintf(eaxc_label, sizeof(eaxc_label), "0x%04X", eaxc_id);
 
-        // Find current selection index in available directions
-        int current_direction_idx = 0;
-        for (int j = 0; j < available_directions; j++) {
-            if (direction_indices[j] == state->selected_data_direction) {
-                current_direction_idx = j;
-                break;
+            // Select the whole row when clicking the eAxC label.
+            if (ImGui::Selectable(eaxc_label, row_selected)) {
+                state->selected_eaxc_id_index = i;
+                if (!streams[i].has_ul && streams[i].has_dl) {
+                    state->selected_data_direction = 1;
+                } else if (!streams[i].has_dl && streams[i].has_ul) {
+                    state->selected_data_direction = 0;
+                }
             }
+
+            auto draw_direction_button = [&](const char* label, uint8_t direction, bool available, bool active) {
+                ImGui::TableSetColumnIndex(direction == 0 ? 1 : 2);
+                if (!available) {
+                    ImGui::BeginDisabled();
+                }
+
+                if (active) {
+                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.55f, 0.95f, 1.00f));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.26f, 0.64f, 1.00f, 1.00f));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.14f, 0.40f, 0.80f, 1.00f));
+                }
+
+                if (ImGui::Button(label, ImVec2(40.0f, 0.0f))) {
+                    state->selected_eaxc_id_index = i;
+                    state->selected_data_direction = direction;
+                }
+
+                if (active) {
+                    ImGui::PopStyleColor(3);
+                }
+
+                if (!available) {
+                    ImGui::EndDisabled();
+                }
+            };
+
+            draw_direction_button("UL", 0, streams[i].has_ul, ul_selected);
+            draw_direction_button("DL", 1, streams[i].has_dl, dl_selected);
+
+            ImGui::PopID();
         }
 
-        if (ImGui::Combo("##direction", &current_direction_idx, available_labels, available_directions)) {
-            state->selected_data_direction = direction_indices[current_direction_idx];
-            state->prev_data_direction = state->selected_data_direction;
-        }
-
-        ImGui::PopID();
+        ImGui::EndTable();
     }
 
     ImGui::EndChild();
@@ -192,9 +210,8 @@ fh_oran_memory_t* imgui_visualizer_render(
 
     ImGui::End();
 
-    // Render ImGui
+    // Finalize the frame so the caller can submit draw data after the heatmap pass.
     ImGui::Render();
-    ImGui_ImplOpenGL2_RenderDrawData(ImGui::GetDrawData());
 
     // Find and return the selected memory
     if (num_unique_streams > 0 && state->selected_eaxc_id_index < num_unique_streams) {
@@ -212,6 +229,19 @@ fh_oran_memory_t* imgui_visualizer_render(
     }
 
     return current_display_memory;
+}
+
+void imgui_visualizer_present(void) {
+    if (ImGui::GetCurrentContext() == nullptr) {
+        return;
+    }
+
+    ImDrawData* draw_data = ImGui::GetDrawData();
+    if (draw_data == nullptr) {
+        return;
+    }
+
+    ImGui_ImplOpenGL2_RenderDrawData(draw_data);
 }
 
 void imgui_visualizer_shutdown(imgui_visualizer_state_t* state) {

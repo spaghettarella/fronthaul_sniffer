@@ -47,6 +47,10 @@ typedef struct imgui_visualizer_state imgui_visualizer_state_t;
 // Returns a state handle on success, NULL on failure
 imgui_visualizer_state_t* imgui_visualizer_init(int window_width, int window_height);
 
+// Render the finalized ImGui draw data into the current OpenGL backbuffer
+// Call this after the scene has been drawn and before the buffer swap
+void imgui_visualizer_present(void);
+
 // Render the stream selection interface
 // Should be called once per frame, after OpenGL setup but before buffer swap
 // state: the state handle from imgui_visualizer_init
