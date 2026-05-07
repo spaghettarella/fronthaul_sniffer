@@ -19,6 +19,7 @@ add_executable(fronthaul_sniffer
     src/main.cpp
     src/capture/c_capture_socket_mode.c
     src/capture/c_pcap_demo_stream.c
+    src/capture/c_capture_loopback_mode.c
     src/pipeline/c_packet_queue.c
     src/core/c_fronthaul_decoder.c
     src/core/bfp_decompress.c

@@ -1,5 +1,6 @@
 #include "capture/c_capture_socket_mode.h"
 #include "capture/c_pcap_demo_stream.h"
+#include "capture/c_capture_loopback_mode.h"
 #include "core/c_fronthaul_decoder.h"
 #include "core/c_oran_memory.h"
 #include "pipeline/c_packet_queue.h"
@@ -233,6 +234,19 @@ int main(int argc, char** argv) {
                 demo_options.demo_pcap_timeout = 1.0 / static_cast<double>(demo_pcap_speed);
                 rc = fh_pcap_stream_run(
                     &demo_options,
+                    queue_callback,
+                    queue,
+                    &g_stop,
+                    errbuf,
+                    sizeof(errbuf));
+            } else if (iface == "lo") {
+                // Use tcpdump backend for loopback interface
+                fh_capture_loopback_options_t loopback_options{};
+                loopback_options.interface_name = iface.c_str();
+                loopback_options.snaplen = capture_options.snaplen;
+                loopback_options.timeout_ms = capture_options.timeout_ms;
+                rc = fh_capture_loopback_run(
+                    &loopback_options,
                     queue_callback,
                     queue,
                     &g_stop,

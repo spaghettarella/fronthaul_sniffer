@@ -44,6 +44,9 @@ imgui_visualizer_state_t* imgui_visualizer_init(int window_width, int window_hei
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
 
+    // IMPORTANT: Set display size to match the window we're rendering to
+    io.DisplaySize = ImVec2(static_cast<float>(window_width), static_cast<float>(window_height));
+    
     // Setup ImGui style
     ImGui::StyleColorsDark();
 
@@ -72,6 +75,10 @@ fh_oran_memory_t* imgui_visualizer_render(
     ImGui_ImplOpenGL2_NewFrame();
     ImGui_ImplGlfw_NewFrame();
     ImGui::NewFrame();
+
+    // Update display size in case window was resized, and grab IO reference
+    ImGuiIO& io = ImGui::GetIO();
+    io.DisplaySize = ImVec2(static_cast<float>(window_width), static_cast<float>(window_height));
 
     // Create stream selection window
     ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_FirstUseEver);
@@ -132,11 +139,13 @@ fh_oran_memory_t* imgui_visualizer_render(
     // Display stream list
     ImGui::BeginChild("StreamList", ImVec2(280, 120), true, ImGuiWindowFlags_AlwaysAutoResize);
 
+    ImGui::TextUnformatted("Columns: eAxC_ID | UL | DL");
+    ImGui::Spacing();
+
     if (ImGui::BeginTable("stream_table", 3, ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_RowBg)) {
         ImGui::TableSetupColumn("eAxC_ID", ImGuiTableColumnFlags_WidthFixed, 90.0f);
         ImGui::TableSetupColumn("UL", ImGuiTableColumnFlags_WidthFixed, 48.0f);
         ImGui::TableSetupColumn("DL", ImGuiTableColumnFlags_WidthFixed, 48.0f);
-        ImGui::TableHeadersRow();
 
         for (int i = 0; i < num_unique_streams; i++) {
             uint16_t eaxc_id = streams[i].eaxc_id;
@@ -154,8 +163,9 @@ fh_oran_memory_t* imgui_visualizer_render(
             char eaxc_label[16];
             snprintf(eaxc_label, sizeof(eaxc_label), "0x%04X", eaxc_id);
 
-            // Select the whole row when clicking the eAxC label.
-            if (ImGui::Selectable(eaxc_label, row_selected)) {
+            bool eaxc_clicked = ImGui::Button(eaxc_label, ImVec2(80.0f, 0.0f));
+
+            if (eaxc_clicked) {
                 state->selected_eaxc_id_index = i;
                 if (!streams[i].has_ul && streams[i].has_dl) {
                     state->selected_data_direction = 1;
@@ -166,6 +176,7 @@ fh_oran_memory_t* imgui_visualizer_render(
 
             auto draw_direction_button = [&](const char* label, uint8_t direction, bool available, bool active) {
                 ImGui::TableSetColumnIndex(direction == 0 ? 1 : 2);
+                
                 if (!available) {
                     ImGui::BeginDisabled();
                 }
@@ -176,17 +187,19 @@ fh_oran_memory_t* imgui_visualizer_render(
                     ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.14f, 0.40f, 0.80f, 1.00f));
                 }
 
-                if (ImGui::Button(label, ImVec2(40.0f, 0.0f))) {
-                    state->selected_eaxc_id_index = i;
-                    state->selected_data_direction = direction;
-                }
-
+                bool button_clicked = ImGui::Button(label, ImVec2(40.0f, 0.0f));
+                
                 if (active) {
                     ImGui::PopStyleColor(3);
                 }
 
                 if (!available) {
                     ImGui::EndDisabled();
+                }
+                
+                if (button_clicked) {
+                    state->selected_eaxc_id_index = i;
+                    state->selected_data_direction = direction;
                 }
             };
 
@@ -227,7 +240,7 @@ fh_oran_memory_t* imgui_visualizer_render(
             }
         }
     }
-
+    
     return current_display_memory;
 }
 

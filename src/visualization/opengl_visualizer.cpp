@@ -13,13 +13,15 @@
 #define HEATMAP_WIDTH_PRBS 273
 #define HEATMAP_SAMPLES_PER_PRB 12
 #define HEATMAP_TEXTURE_WIDTH (HEATMAP_WIDTH_PRBS * HEATMAP_SAMPLES_PER_PRB)  // 3276 - all IQ samples
-#define HEATMAP_TEXTURE_HEIGHT 200  // Display last 200 symbols
+#define HEATMAP_DEFAULT_TEXTURE_HEIGHT 200  // Default display height (symbols)
 
 typedef struct opengl_visualizer {
     GLFWwindow* window;
     GLuint texture_id;
     int width;
     int height;
+    int tex_height; // number of symbol rows in the texture
+    int tex_max_height; // maximum texture height supported by GL
     int is_running;
     uint8_t* texture_data;  // RGBA framebuffer
 } opengl_visualizer_t;
@@ -109,10 +111,19 @@ opengl_visualizer_t* visualizer_create(int width, int height) {
     vis->window = window;
     vis->width = width;
     vis->height = height;
+        // Query GL maximum texture size (applies to width/height); use it to bound our texture height
+        GLint max_tex_size = 0;
+        glGetIntegerv(GL_MAX_TEXTURE_SIZE, &max_tex_size);
+        if (max_tex_size <= 0) {
+            max_tex_size = 4096; // fallback conservative default
+        }
+        vis->tex_height = HEATMAP_DEFAULT_TEXTURE_HEIGHT;
+        if (vis->tex_height > max_tex_size) vis->tex_height = max_tex_size;
+        vis->tex_max_height = max_tex_size;
     vis->is_running = 1;
     
-    // Allocate texture buffer
-    vis->texture_data = (uint8_t*)calloc(HEATMAP_TEXTURE_WIDTH * HEATMAP_TEXTURE_HEIGHT * 4, sizeof(uint8_t));
+    // Allocate texture buffer (width x tex_height)
+    vis->texture_data = (uint8_t*)calloc(HEATMAP_TEXTURE_WIDTH * vis->tex_height * 4, sizeof(uint8_t));
     if (!vis->texture_data) {
         free(vis);
         glfwDestroyWindow(window);
@@ -125,7 +136,7 @@ opengl_visualizer_t* visualizer_create(int width, int height) {
     glBindTexture(GL_TEXTURE_2D, vis->texture_id);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, HEATMAP_TEXTURE_WIDTH, HEATMAP_TEXTURE_HEIGHT, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, HEATMAP_TEXTURE_WIDTH, vis->tex_height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
     
     // Set up OpenGL state for 2D rendering
     glDisable(GL_DEPTH_TEST);
@@ -145,8 +156,27 @@ static void update_heatmap_texture(opengl_visualizer_t* vis, const fh_oran_memor
         return;
     }
     
+    // Ensure texture size matches memory size (dynamic height)
+    int desired_height = vis->tex_height;
+    if (memory && memory->max_symbols > 0) {
+        // Prefer to match memory size, but clamp to GL max texture size
+        int mem_h = (int)memory->max_symbols;
+        int cap = vis->tex_max_height > 0 ? vis->tex_max_height : 4096;
+        desired_height = (mem_h > cap) ? cap : mem_h;
+        if (desired_height <= 0) desired_height = HEATMAP_DEFAULT_TEXTURE_HEIGHT;
+    }
+
+    if (desired_height != vis->tex_height) {
+        // Reallocate CPU-side buffer and resize GPU texture
+        free(vis->texture_data);
+        vis->tex_height = desired_height;
+        vis->texture_data = (uint8_t*)calloc(HEATMAP_TEXTURE_WIDTH * vis->tex_height * 4, sizeof(uint8_t));
+        glBindTexture(GL_TEXTURE_2D, vis->texture_id);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, HEATMAP_TEXTURE_WIDTH, vis->tex_height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    }
+
     // Clear texture
-    memset(vis->texture_data, 0, HEATMAP_TEXTURE_WIDTH * HEATMAP_TEXTURE_HEIGHT * 4);
+    memset(vis->texture_data, 0, HEATMAP_TEXTURE_WIDTH * vis->tex_height * 4);
     
     // Calculate which symbols to display (most recent ones)
     int symbol_count = (memory->symbol_highest >= memory->symbol_lowest) ? 
@@ -155,7 +185,7 @@ static void update_heatmap_texture(opengl_visualizer_t* vis, const fh_oran_memor
         return;  // No data yet
     }
     
-    int display_height = (symbol_count < HEATMAP_TEXTURE_HEIGHT) ? symbol_count : HEATMAP_TEXTURE_HEIGHT;
+    int display_height = (symbol_count < vis->tex_height) ? symbol_count : vis->tex_height;
     
     // Find max magnitude for normalization
     float max_magnitude = 1e-9f;
@@ -193,7 +223,7 @@ static void update_heatmap_texture(opengl_visualizer_t* vis, const fh_oran_memor
         }
         
         // Texture row is inverted: newest at bottom
-        int tex_row = HEATMAP_TEXTURE_HEIGHT - 1 - sym_offset;
+        int tex_row = vis->tex_height - 1 - sym_offset;
         
         for (int col = 0; col < HEATMAP_TEXTURE_WIDTH; col++) {
             size_t iq_idx = col;
@@ -218,7 +248,7 @@ static void update_heatmap_texture(opengl_visualizer_t* vis, const fh_oran_memor
     
     // Upload texture to GPU
     glBindTexture(GL_TEXTURE_2D, vis->texture_id);
-    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, HEATMAP_TEXTURE_WIDTH, HEATMAP_TEXTURE_HEIGHT, GL_RGBA, GL_UNSIGNED_BYTE, vis->texture_data);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, HEATMAP_TEXTURE_WIDTH, vis->tex_height, GL_RGBA, GL_UNSIGNED_BYTE, vis->texture_data);
 }
 
 int visualizer_update(opengl_visualizer_t* vis, const fh_oran_memory_t* memory) {

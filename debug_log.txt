@@ -1,0 +1,203 @@
+klarwein@klarwein:~/Documents/GITs/fronthaul_sniffer/build$ ./fronthaul_sniffer --demo-pcap ../src/capture/demo.pcap 2>&1 \
+| grep -E "\[PRE_EAXC_BUTTON\]|\[POST_EAXC_BUTTON\]|\[PRE_BUTTON\]|\[POST_BUTTON\]|\[EAXC_CLICK\]|\[CLICK\]|\[STATE_CHANGE\]|\[STATE_RESET\]" \
+| sed -u -n '1,200p'
+[PRE_EAXC_BUTTON] i=1 eaxc=0x0001 mouse=(1314,1156)
+[POST_EAXC_BUTTON] i=1 eaxc=0x0001 clicked=0 hovered=0 active=0 mouse=(1314,1156)
+[PRE_BUTTON] About to render 0001 UL button
+[POST_BUTTON] button_clicked=0 hovered=0 active=0 mouse=(1314,1156) rect=(358,165)-(398,184) mdown=0 mclicked=0
+[PRE_EAXC_BUTTON] i=1 eaxc=0x0001 mouse=(1314,1156)
+[POST_EAXC_BUTTON] i=1 eaxc=0x0001 clicked=0 hovered=0 active=0 mouse=(1314,1156)
+[PRE_BUTTON] About to render 0001 UL button
+[POST_BUTTON] button_clicked=0 hovered=0 active=0 mouse=(1314,1156) rect=(358,165)-(398,184) mdown=0 mclicked=0
+[PRE_EAXC_BUTTON] i=1 eaxc=0x0001 mouse=(1314,1156)
+[POST_EAXC_BUTTON] i=1 eaxc=0x0001 clicked=0 hovered=0 active=0 mouse=(1314,1156)
+[PRE_BUTTON] About to render 0001 UL button
+[POST_BUTTON] button_clicked=0 hovered=0 active=0 mouse=(1314,1156) rect=(358,165)-(398,184) mdown=0 mclicked=0
+[PRE_EAXC_BUTTON] i=1 eaxc=0x0001 mouse=(1314,1156)
+[POST_EAXC_BUTTON] i=1 eaxc=0x0001 clicked=0 hovered=0 active=0 mouse=(1314,1156)
+[PRE_BUTTON] About to render 0001 UL button
+[POST_BUTTON] button_clicked=0 hovered=0 active=0 mouse=(1314,1156) rect=(358,165)-(398,184) mdown=0 mclicked=0
+[PRE_EAXC_BUTTON] i=1 eaxc=0x0001 mouse=(1314,1156)
+[POST_EAXC_BUTTON] i=1 eaxc=0x0001 clicked=0 hovered=0 active=0 mouse=(1314,1156)
+[PRE_BUTTON] About to render 0001 UL button
+[POST_BUTTON] button_clicked=0 hovered=0 active=0 mouse=(1314,1156) rect=(358,165)-(398,184) mdown=0 mclicked=0
+[PRE_EAXC_BUTTON] i=1 eaxc=0x0001 mouse=(1314,1156)
+[POST_EAXC_BUTTON] i=1 eaxc=0x0001 clicked=0 hovered=0 active=0 mouse=(1314,1156)
+[PRE_BUTTON] About to render 0001 UL button
+[POST_BUTTON] button_clicked=0 hovered=0 active=0 mouse=(1314,1156) rect=(358,165)-(398,184) mdown=0 mclicked=0
+[PRE_EAXC_BUTTON] i=1 eaxc=0x0001 mouse=(1314,1156)
+[POST_EAXC_BUTTON] i=1 eaxc=0x0001 clicked=0 hovered=0 active=0 mouse=(1314,1156)
+[PRE_BUTTON] About to render 0001 UL button
+[POST_BUTTON] button_clicked=0 hovered=0 active=0 mouse=(1314,1156) rect=(358,165)-(398,184) mdown=0 mclicked=0
+[PRE_EAXC_BUTTON] i=1 eaxc=0x0001 mouse=(1314,1156)
+[POST_EAXC_BUTTON] i=1 eaxc=0x0001 clicked=0 hovered=0 active=0 mouse=(1314,1156)
+[PRE_BUTTON] About to render 0001 UL button
+[POST_BUTTON] button_clicked=0 hovered=0 active=0 mouse=(1314,1156) rect=(358,165)-(398,184) mdown=0 mclicked=0
+[PRE_EAXC_BUTTON] i=1 eaxc=0x0001 mouse=(1314,1156)
+[POST_EAXC_BUTTON] i=1 eaxc=0x0001 clicked=0 hovered=0 active=0 mouse=(1314,1156)
+[PRE_BUTTON] About to render 0001 UL button
+[POST_BUTTON] button_clicked=0 hovered=0 active=0 mouse=(1314,1156) rect=(358,165)-(398,184) mdown=0 mclicked=0
+[PRE_EAXC_BUTTON] i=1 eaxc=0x0001 mouse=(1314,1156)
+[POST_EAXC_BUTTON] i=1 eaxc=0x0001 clicked=0 hovered=0 active=0 mouse=(1314,1156)
+[PRE_BUTTON] About to render 0001 UL button
+[POST_BUTTON] button_clicked=0 hovered=0 active=0 mouse=(1314,1156) rect=(358,165)-(398,184) mdown=0 mclicked=0
+[PRE_EAXC_BUTTON] i=1 eaxc=0x0001 mouse=(1314,1156)
+[POST_EAXC_BUTTON] i=1 eaxc=0x0001 clicked=0 hovered=0 active=0 mouse=(1314,1156)
+[PRE_BUTTON] About to render 0001 UL button
+[POST_BUTTON] button_clicked=0 hovered=0 active=0 mouse=(1314,1156) rect=(358,165)-(398,184) mdown=0 mclicked=0
+[PRE_EAXC_BUTTON] i=1 eaxc=0x0001 mouse=(1314,1156)
+[POST_EAXC_BUTTON] i=1 eaxc=0x0001 clicked=0 hovered=0 active=0 mouse=(1314,1156)
+[PRE_BUTTON] About to render 0001 UL button
+[POST_BUTTON] button_clicked=0 hovered=0 active=0 mouse=(1314,1156) rect=(358,165)-(398,184) mdown=0 mclicked=0
+[PRE_EAXC_BUTTON] i=1 eaxc=0x0001 mouse=(1314,1156)
+[POST_EAXC_BUTTON] i=1 eaxc=0x0001 clicked=0 hovered=0 active=0 mouse=(1314,1156)
+[PRE_BUTTON] About to render 0001 UL button
+[POST_BUTTON] button_clicked=0 hovered=0 active=0 mouse=(1314,1156) rect=(358,165)-(398,184) mdown=0 mclicked=0
+[PRE_EAXC_BUTTON] i=1 eaxc=0x0001 mouse=(1314,1156)
+[POST_EAXC_BUTTON] i=1 eaxc=0x0001 clicked=0 hovered=0 active=0 mouse=(1314,1156)
+[PRE_BUTTON] About to render 0001 UL button
+[POST_BUTTON] button_clicked=0 hovered=0 active=0 mouse=(1314,1156) rect=(358,165)-(398,184) mdown=0 mclicked=0
+[PRE_EAXC_BUTTON] i=1 eaxc=0x0001 mouse=(1314,1156)
+[POST_EAXC_BUTTON] i=1 eaxc=0x0001 clicked=0 hovered=0 active=0 mouse=(1314,1156)
+[PRE_BUTTON] About to render 0001 UL button
+[POST_BUTTON] button_clicked=0 hovered=0 active=0 mouse=(1314,1156) rect=(358,165)-(398,184) mdown=0 mclicked=0
+[PRE_EAXC_BUTTON] i=1 eaxc=0x0001 mouse=(1314,1156)
+[POST_EAXC_BUTTON] i=1 eaxc=0x0001 clicked=0 hovered=0 active=0 mouse=(1314,1156)
+[PRE_BUTTON] About to render 0001 UL button
+[POST_BUTTON] button_clicked=0 hovered=0 active=0 mouse=(1314,1156) rect=(358,165)-(398,184) mdown=0 mclicked=0
+[PRE_EAXC_BUTTON] i=1 eaxc=0x0001 mouse=(1314,1154)
+[POST_EAXC_BUTTON] i=1 eaxc=0x0001 clicked=0 hovered=0 active=0 mouse=(1314,1154)
+[PRE_BUTTON] About to render 0001 UL button
+[POST_BUTTON] button_clicked=0 hovered=0 active=0 mouse=(1314,1154) rect=(358,165)-(398,184) mdown=0 mclicked=0
+[PRE_EAXC_BUTTON] i=1 eaxc=0x0001 mouse=(1313,1150)
+[POST_EAXC_BUTTON] i=1 eaxc=0x0001 clicked=0 hovered=0 active=0 mouse=(1313,1150)
+[PRE_BUTTON] About to render 0001 UL button
+[POST_BUTTON] button_clicked=0 hovered=0 active=0 mouse=(1313,1150) rect=(358,165)-(398,184) mdown=0 mclicked=0
+[PRE_EAXC_BUTTON] i=1 eaxc=0x0001 mouse=(1310,1147)
+[POST_EAXC_BUTTON] i=1 eaxc=0x0001 clicked=0 hovered=0 active=0 mouse=(1310,1147)
+[PRE_BUTTON] About to render 0001 UL button
+[POST_BUTTON] button_clicked=0 hovered=0 active=0 mouse=(1310,1147) rect=(358,165)-(398,184) mdown=0 mclicked=0
+[PRE_EAXC_BUTTON] i=1 eaxc=0x0001 mouse=(1305,1142)
+[POST_EAXC_BUTTON] i=1 eaxc=0x0001 clicked=0 hovered=0 active=0 mouse=(1305,1142)
+[PRE_BUTTON] About to render 0001 UL button
+[POST_BUTTON] button_clicked=0 hovered=0 active=0 mouse=(1305,1142) rect=(358,165)-(398,184) mdown=0 mclicked=0
+[PRE_EAXC_BUTTON] i=1 eaxc=0x0001 mouse=(1296,1134)
+[POST_EAXC_BUTTON] i=1 eaxc=0x0001 clicked=0 hovered=0 active=0 mouse=(1296,1134)
+[PRE_BUTTON] About to render 0001 UL button
+[POST_BUTTON] button_clicked=0 hovered=0 active=0 mouse=(1296,1134) rect=(358,165)-(398,184) mdown=0 mclicked=0
+[PRE_EAXC_BUTTON] i=1 eaxc=0x0001 mouse=(1284,1123)
+[POST_EAXC_BUTTON] i=1 eaxc=0x0001 clicked=0 hovered=0 active=0 mouse=(1284,1123)
+[PRE_BUTTON] About to render 0001 UL button
+[POST_BUTTON] button_clicked=0 hovered=0 active=0 mouse=(1284,1123) rect=(358,165)-(398,184) mdown=0 mclicked=0
+[PRE_EAXC_BUTTON] i=1 eaxc=0x0001 mouse=(1263,1104)
+[POST_EAXC_BUTTON] i=1 eaxc=0x0001 clicked=0 hovered=0 active=0 mouse=(1263,1104)
+[PRE_BUTTON] About to render 0001 UL button
+[POST_BUTTON] button_clicked=0 hovered=0 active=0 mouse=(1263,1104) rect=(358,165)-(398,184) mdown=0 mclicked=0
+[PRE_EAXC_BUTTON] i=1 eaxc=0x0001 mouse=(1238,1077)
+[POST_EAXC_BUTTON] i=1 eaxc=0x0001 clicked=0 hovered=0 active=0 mouse=(1238,1077)
+[PRE_BUTTON] About to render 0001 UL button
+[POST_BUTTON] button_clicked=0 hovered=0 active=0 mouse=(1238,1077) rect=(358,165)-(398,184) mdown=0 mclicked=0
+[PRE_EAXC_BUTTON] i=1 eaxc=0x0001 mouse=(1211,1043)
+[POST_EAXC_BUTTON] i=1 eaxc=0x0001 clicked=0 hovered=0 active=0 mouse=(1211,1043)
+[PRE_BUTTON] About to render 0001 UL button
+[POST_BUTTON] button_clicked=0 hovered=0 active=0 mouse=(1211,1043) rect=(358,165)-(398,184) mdown=0 mclicked=0
+[PRE_EAXC_BUTTON] i=1 eaxc=0x0001 mouse=(1177,1007)
+[POST_EAXC_BUTTON] i=1 eaxc=0x0001 clicked=0 hovered=0 active=0 mouse=(1177,1007)
+[PRE_BUTTON] About to render 0001 UL button
+[POST_BUTTON] button_clicked=0 hovered=0 active=0 mouse=(1177,1007) rect=(358,165)-(398,184) mdown=0 mclicked=0
+[PRE_EAXC_BUTTON] i=1 eaxc=0x0001 mouse=(1141,967)
+[POST_EAXC_BUTTON] i=1 eaxc=0x0001 clicked=0 hovered=0 active=0 mouse=(1141,967)
+[PRE_BUTTON] About to render 0001 UL button
+[POST_BUTTON] button_clicked=0 hovered=0 active=0 mouse=(1141,967) rect=(358,165)-(398,184) mdown=0 mclicked=0
+[PRE_EAXC_BUTTON] i=1 eaxc=0x0001 mouse=(1105,923)
+[POST_EAXC_BUTTON] i=1 eaxc=0x0001 clicked=0 hovered=0 active=0 mouse=(1105,923)
+[PRE_BUTTON] About to render 0001 UL button
+[POST_BUTTON] button_clicked=0 hovered=0 active=0 mouse=(1105,923) rect=(358,165)-(398,184) mdown=0 mclicked=0
+[PRE_EAXC_BUTTON] i=1 eaxc=0x0001 mouse=(1065,877)
+[POST_EAXC_BUTTON] i=1 eaxc=0x0001 clicked=0 hovered=0 active=0 mouse=(1065,877)
+[PRE_BUTTON] About to render 0001 UL button
+[POST_BUTTON] button_clicked=0 hovered=0 active=0 mouse=(1065,877) rect=(358,165)-(398,184) mdown=0 mclicked=0
+[PRE_EAXC_BUTTON] i=1 eaxc=0x0001 mouse=(1013,813)
+[POST_EAXC_BUTTON] i=1 eaxc=0x0001 clicked=0 hovered=0 active=0 mouse=(1013,813)
+[PRE_BUTTON] About to render 0001 UL button
+[POST_BUTTON] button_clicked=0 hovered=0 active=0 mouse=(1013,813) rect=(358,165)-(398,184) mdown=0 mclicked=0
+[PRE_EAXC_BUTTON] i=1 eaxc=0x0001 mouse=(977,771)
+[POST_EAXC_BUTTON] i=1 eaxc=0x0001 clicked=0 hovered=0 active=0 mouse=(977,771)
+[PRE_BUTTON] About to render 0001 UL button
+[POST_BUTTON] button_clicked=0 hovered=0 active=0 mouse=(977,771) rect=(358,165)-(398,184) mdown=0 mclicked=0
+[PRE_EAXC_BUTTON] i=1 eaxc=0x0001 mouse=(943,731)
+[POST_EAXC_BUTTON] i=1 eaxc=0x0001 clicked=0 hovered=0 active=0 mouse=(943,731)
+[PRE_BUTTON] About to render 0001 UL button
+[POST_BUTTON] button_clicked=0 hovered=0 active=0 mouse=(943,731) rect=(358,165)-(398,184) mdown=0 mclicked=0
+[PRE_EAXC_BUTTON] i=1 eaxc=0x0001 mouse=(911,693)
+[POST_EAXC_BUTTON] i=1 eaxc=0x0001 clicked=0 hovered=0 active=0 mouse=(911,693)
+[PRE_BUTTON] About to render 0001 UL button
+[POST_BUTTON] button_clicked=0 hovered=0 active=0 mouse=(911,693) rect=(358,165)-(398,184) mdown=0 mclicked=0
+[PRE_EAXC_BUTTON] i=1 eaxc=0x0001 mouse=(887,664)
+[POST_EAXC_BUTTON] i=1 eaxc=0x0001 clicked=0 hovered=0 active=0 mouse=(887,664)
+[PRE_BUTTON] About to render 0001 UL button
+[POST_BUTTON] button_clicked=0 hovered=0 active=0 mouse=(887,664) rect=(358,165)-(398,184) mdown=0 mclicked=0
+[PRE_EAXC_BUTTON] i=1 eaxc=0x0001 mouse=(869,646)
+[POST_EAXC_BUTTON] i=1 eaxc=0x0001 clicked=0 hovered=0 active=0 mouse=(869,646)
+[PRE_BUTTON] About to render 0001 UL button
+[POST_BUTTON] button_clicked=0 hovered=0 active=0 mouse=(869,646) rect=(358,165)-(398,184) mdown=0 mclicked=0
+[PRE_EAXC_BUTTON] i=1 eaxc=0x0001 mouse=(858,625)
+[POST_EAXC_BUTTON] i=1 eaxc=0x0001 clicked=0 hovered=0 active=0 mouse=(858,625)
+[PRE_BUTTON] About to render 0001 UL button
+[POST_BUTTON] button_clicked=0 hovered=0 active=0 mouse=(858,625) rect=(358,165)-(398,184) mdown=0 mclicked=0
+[PRE_EAXC_BUTTON] i=1 eaxc=0x0001 mouse=(850,604)
+[POST_EAXC_BUTTON] i=1 eaxc=0x0001 clicked=0 hovered=0 active=0 mouse=(850,604)
+[PRE_BUTTON] About to render 0001 UL button
+[POST_BUTTON] button_clicked=0 hovered=0 active=0 mouse=(850,604) rect=(358,165)-(398,184) mdown=0 mclicked=0
+[PRE_EAXC_BUTTON] i=1 eaxc=0x0001 mouse=(833,579)
+[POST_EAXC_BUTTON] i=1 eaxc=0x0001 clicked=0 hovered=0 active=0 mouse=(833,579)
+[PRE_BUTTON] About to render 0001 UL button
+[POST_BUTTON] button_clicked=0 hovered=0 active=0 mouse=(833,579) rect=(358,165)-(398,184) mdown=0 mclicked=0
+[PRE_EAXC_BUTTON] i=1 eaxc=0x0001 mouse=(832,575)
+[POST_EAXC_BUTTON] i=1 eaxc=0x0001 clicked=0 hovered=0 active=0 mouse=(832,575)
+[PRE_BUTTON] About to render 0001 UL button
+[POST_BUTTON] button_clicked=0 hovered=0 active=0 mouse=(832,575) rect=(358,165)-(398,184) mdown=0 mclicked=0
+[PRE_EAXC_BUTTON] i=1 eaxc=0x0001 mouse=(823,564)
+[POST_EAXC_BUTTON] i=1 eaxc=0x0001 clicked=0 hovered=0 active=0 mouse=(823,564)
+[PRE_BUTTON] About to render 0001 UL button
+[POST_BUTTON] button_clicked=0 hovered=0 active=0 mouse=(823,564) rect=(358,165)-(398,184) mdown=0 mclicked=0
+[PRE_EAXC_BUTTON] i=1 eaxc=0x0001 mouse=(803,544)
+[POST_EAXC_BUTTON] i=1 eaxc=0x0001 clicked=0 hovered=0 active=0 mouse=(803,544)
+[PRE_BUTTON] About to render 0001 UL button
+[POST_BUTTON] button_clicked=0 hovered=0 active=0 mouse=(803,544) rect=(358,165)-(398,184) mdown=0 mclicked=0
+[PRE_EAXC_BUTTON] i=1 eaxc=0x0001 mouse=(786,530)
+[POST_EAXC_BUTTON] i=1 eaxc=0x0001 clicked=0 hovered=0 active=0 mouse=(786,530)
+[PRE_BUTTON] About to render 0001 UL button
+[POST_BUTTON] button_clicked=0 hovered=0 active=0 mouse=(786,530) rect=(358,165)-(398,184) mdown=0 mclicked=0
+[PRE_EAXC_BUTTON] i=1 eaxc=0x0001 mouse=(786,530)
+[POST_EAXC_BUTTON] i=1 eaxc=0x0001 clicked=0 hovered=0 active=0 mouse=(786,530)
+[PRE_BUTTON] About to render 0001 UL button
+[POST_BUTTON] button_clicked=0 hovered=0 active=0 mouse=(786,530) rect=(358,165)-(398,184) mdown=0 mclicked=0
+[PRE_EAXC_BUTTON] i=1 eaxc=0x0001 mouse=(774,520)
+[POST_EAXC_BUTTON] i=1 eaxc=0x0001 clicked=0 hovered=0 active=0 mouse=(774,520)
+[PRE_BUTTON] About to render 0001 UL button
+[POST_BUTTON] button_clicked=0 hovered=0 active=0 mouse=(774,520) rect=(358,165)-(398,184) mdown=0 mclicked=0
+[PRE_EAXC_BUTTON] i=1 eaxc=0x0001 mouse=(759,509)
+[POST_EAXC_BUTTON] i=1 eaxc=0x0001 clicked=0 hovered=0 active=0 mouse=(759,509)
+[PRE_BUTTON] About to render 0001 UL button
+[POST_BUTTON] button_clicked=0 hovered=0 active=0 mouse=(759,509) rect=(358,165)-(398,184) mdown=0 mclicked=0
+[PRE_EAXC_BUTTON] i=1 eaxc=0x0001 mouse=(743,499)
+[POST_EAXC_BUTTON] i=1 eaxc=0x0001 clicked=0 hovered=0 active=0 mouse=(743,499)
+[PRE_BUTTON] About to render 0001 UL button
+[POST_BUTTON] button_clicked=0 hovered=0 active=0 mouse=(743,499) rect=(358,165)-(398,184) mdown=0 mclicked=0
+[PRE_EAXC_BUTTON] i=1 eaxc=0x0001 mouse=(726,486)
+[POST_EAXC_BUTTON] i=1 eaxc=0x0001 clicked=0 hovered=0 active=0 mouse=(726,486)
+[PRE_BUTTON] About to render 0001 UL button
+[POST_BUTTON] button_clicked=0 hovered=0 active=0 mouse=(726,486) rect=(358,165)-(398,184) mdown=0 mclicked=0
+[PRE_EAXC_BUTTON] i=1 eaxc=0x0001 mouse=(711,476)
+[POST_EAXC_BUTTON] i=1 eaxc=0x0001 clicked=0 hovered=0 active=0 mouse=(711,476)
+[PRE_BUTTON] About to render 0001 UL button
+[POST_BUTTON] button_clicked=0 hovered=0 active=0 mouse=(711,476) rect=(358,165)-(398,184) mdown=0 mclicked=0
+[PRE_EAXC_BUTTON] i=1 eaxc=0x0001 mouse=(694,463)
+[POST_EAXC_BUTTON] i=1 eaxc=0x0001 clicked=0 hovered=0 active=0 mouse=(694,463)
+[PRE_BUTTON] About to render 0001 UL button
+[POST_BUTTON] button_clicked=0 hovered=0 active=0 mouse=(694,463) rect=(358,165)-(398,184) mdown=0 mclicked=0
+[PRE_EAXC_BUTTON] i=1 eaxc=0x0001 mouse=(676,450)
+[POST_EAXC_BUTTON] i=1 eaxc=0x0001 clicked=0 hovered=0 active=0 mouse=(676,450)
+[PRE_BUTTON] About to render 0001 UL button
+[POST_BUTTON] button_clicked=0 hovered=0 active=0 mouse=(676,450) rect=(358,165)-(398,184) mdown=0 mclicked=0
