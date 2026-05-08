@@ -8,8 +8,6 @@
 #include <string.h>
 #include <time.h>
 
-#define FH_LOOPBACK_FILTER_EAXC_ID 0x0000u
-
 enum fh_pcap_linktype {
     FH_DLT_NULL = 0,
     FH_DLT_EN10MB = 1,
@@ -29,6 +27,17 @@ struct ecpri_common_header {
     uint8_t e_bit : 1;
 } __attribute__((packed));
 
+struct oran_iq_radio_app_header {
+    uint8_t filter_index : 4;
+    uint8_t payload_version : 3;
+    uint8_t data_direction : 1;
+    uint8_t frame_id;
+    uint8_t slot_id_first : 4;
+    uint8_t subframe_id : 4;
+    uint8_t start_symbol_id : 6;
+    uint8_t slot_id_last : 2;
+} __attribute__((packed));
+
 struct fh_packet_payload_view {
     const uint8_t* payload;
     size_t payload_len;
@@ -41,6 +50,7 @@ static int write_err(char* errbuf, size_t errbuf_len, const char* msg) {
     return -1;
 }
 
+// Extract the eCPRI payload pointer & length depending on the datalink framing.
 static int get_packet_payload_view(const u_char* packet_data, size_t caplen, int datalink, struct fh_packet_payload_view* view) {
     if (packet_data == NULL || view == NULL) {
         return 0;
@@ -52,67 +62,74 @@ static int get_packet_payload_view(const u_char* packet_data, size_t caplen, int
 
     switch (datalink) {
         case FH_DLT_EN10MB:
-            if (caplen < 14) {
-                return 0;
-            }
+            if (caplen < 14) return 0;
             offset = 14;
             memcpy(&ethertype, packet + 12, sizeof(ethertype));
             ethertype = ntohs(ethertype);
             break;
         case FH_DLT_LINUX_SLL:
-            if (caplen < 16) {
-                return 0;
-            }
+            if (caplen < 16) return 0;
             offset = 16;
             memcpy(&ethertype, packet + 14, sizeof(ethertype));
             ethertype = ntohs(ethertype);
             break;
         case FH_DLT_LINUX_SLL2:
-            if (caplen < 20) {
-                return 0;
-            }
+            if (caplen < 20) return 0;
             offset = 20;
-            memcpy(&ethertype, packet + 0, sizeof(ethertype));
+            memcpy(&ethertype, packet + offset - 2, sizeof(ethertype));
             ethertype = ntohs(ethertype);
+            break;
+        case FH_DLT_NULL:
+            // DLT_NULL: first 4 bytes are AF_*; treat as IPv4/IPv6 passthrough
+            if (caplen < 4) return 0;
+            offset = 4;
+            ethertype = 0; // not used
             break;
         default:
             return 0;
     }
 
-    while (ethertype == 0x8100 || ethertype == 0x88A8) {
-        if (caplen < offset + 4) {
-            return 0;
-        }
+    // Skip VLAN tags
+    while ((ethertype == 0x8100 || ethertype == 0x88A8) && caplen >= offset + 4) {
         offset += 4;
         memcpy(&ethertype, packet + offset - 2, sizeof(ethertype));
         ethertype = ntohs(ethertype);
     }
 
-    if (ethertype != 0xAEFE) {
-        return 0;
+    // eCPRI EtherType check (0xAEFE) unless DLT_NULL path
+    if (datalink != FH_DLT_NULL) {
+        if (ethertype != 0xAEFE) return 0;
     }
 
-    if (caplen < offset + sizeof(struct ecpri_common_header)) {
-        return 0;
-    }
+    if (caplen < offset + sizeof(struct ecpri_common_header)) return 0;
 
     view->payload = packet + offset;
     view->payload_len = caplen - offset;
     return 1;
 }
 
-static int packet_matches_loopback_filter(const u_char* packet_data, size_t caplen, int datalink) {
+// Return non-zero if the packet matches the optional filters supplied in options.
+static int packet_matches_loopback_filter(const u_char* packet_data, size_t caplen, int datalink, const fh_capture_loopback_options_t* options) {
     struct fh_packet_payload_view view;
-    if (!get_packet_payload_view(packet_data, caplen, datalink, &view)) {
-        return 0;
-    }
-
-    if (view.payload_len < sizeof(struct ecpri_common_header)) {
-        return 0;
-    }
+    if (!get_packet_payload_view(packet_data, caplen, datalink, &view)) return 0;
+    if (view.payload_len < sizeof(struct ecpri_common_header)) return 0;
 
     const struct ecpri_common_header* ecpri = (const struct ecpri_common_header*)view.payload;
-    return ntohs(ecpri->eaxc_id) == FH_LOOPBACK_FILTER_EAXC_ID;
+
+    // Optional eAxC filter
+    if (options != NULL && options->filter_has_eaxc) {
+        if (ntohs(ecpri->eaxc_id) != options->filter_eaxc) return 0;
+    }
+
+    // If direction filtering not requested, accept now
+    if (options == NULL || !options->filter_has_direction) return 1;
+
+    // Require IQ Data (U-Plane) message type
+    if (ecpri->message_type != 0x00) return 0;
+    if (view.payload_len < sizeof(struct ecpri_common_header) + sizeof(struct oran_iq_radio_app_header)) return 0;
+
+    const struct oran_iq_radio_app_header* oran = (const struct oran_iq_radio_app_header*)(view.payload + sizeof(struct ecpri_common_header));
+    return (int)oran->data_direction == options->filter_direction;
 }
 
 int fh_capture_loopback_run(
@@ -122,46 +139,38 @@ int fh_capture_loopback_run(
     const volatile sig_atomic_t* stop_flag,
     char* errbuf,
     size_t errbuf_len) {
-    
-    // Validate inputs
+
     if (options == NULL || on_packet == NULL || stop_flag == NULL) {
         return write_err(errbuf, errbuf_len, "invalid loopback capture arguments");
     }
-
     if (options->interface_name == NULL || options->interface_name[0] == '\0') {
         return write_err(errbuf, errbuf_len, "interface_name is required");
     }
 
-    // Use libpcap to open the interface live (works for loopback via kernel's packet tapping)
     char pcap_errbuf[PCAP_ERRBUF_SIZE];
     memset(pcap_errbuf, 0, sizeof(pcap_errbuf));
-    
+
     pcap_t* pcap_handle = pcap_open_live(
         options->interface_name,
         options->snaplen,
-        1,  // promisc=1 for promiscuous mode (may help capture loopback)
+        1,
         options->timeout_ms,
         pcap_errbuf);
-    
+
     if (pcap_handle == NULL) {
-        return write_err(errbuf, errbuf_len, 
-                        pcap_errbuf[0] != '\0' ? pcap_errbuf : "failed to open pcap on interface");
+        return write_err(errbuf, errbuf_len, pcap_errbuf[0] != '\0' ? pcap_errbuf : "failed to open pcap on interface");
     }
 
     const int datalink = pcap_datalink(pcap_handle);
 
-    // Main capture loop
     while (*stop_flag == 0) {
         struct pcap_pkthdr* header = NULL;
         const u_char* packet_data = NULL;
         const int rc = pcap_next_ex(pcap_handle, &header, &packet_data);
 
         if (rc == 1) {
-            if (!packet_matches_loopback_filter(packet_data, (size_t)header->caplen, datalink)) {
-                continue;
-            }
+            if (!packet_matches_loopback_filter(packet_data, (size_t)header->caplen, datalink, options)) continue;
 
-            // Got a packet
             fh_packet_t pkt;
             memset(&pkt, 0, sizeof(pkt));
             pkt.timestamp.tv_sec = (time_t)header->ts.tv_sec;
@@ -171,23 +180,17 @@ int fh_capture_loopback_run(
             (void)snprintf(pkt.ingress_if, sizeof(pkt.ingress_if), "%s", options->interface_name);
             pkt.data = (uint8_t*)packet_data;
 
-            if (on_packet(&pkt, user_ctx) != 0) {
-                break;
-            }
+            if (on_packet(&pkt, user_ctx) != 0) break;
         } else if (rc == 0) {
-            // Timeout, check stop_flag and retry
             continue;
         } else if (rc == -1) {
-            // Error reading from pcap stream
             pcap_close(pcap_handle);
             return write_err(errbuf, errbuf_len, pcap_geterr(pcap_handle));
         } else if (rc == -2) {
-            // End of file (shouldn't happen with live capture, but just in case)
             break;
         }
     }
 
-    // Cleanup
     pcap_close(pcap_handle);
     return 0;
 }

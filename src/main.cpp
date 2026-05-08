@@ -19,6 +19,7 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+#include <algorithm>
 
 // The memory key structs are defined in the GUI interface header
 // and used here in the main program
@@ -34,6 +35,7 @@ void print_usage(const char* argv0) {
     std::cout
         << "Usage: " << argv0 << " [options]\n"
         << "  --iface <name>                        Interface name (default: lo)\n"
+        << "  --channel <eAxC_ID> <data_direction>  eAxC_ID (uint16) and data direction (UL/DL) to filter network capture before queue\n"
         << "  --snaplen <bytes>                     Max captured bytes per packet (default: 65535)\n"
         << "  --timeout-ms <ms>                     Read timeout in milliseconds (default: 100)\n"
         << "  --queue-packets <count>               Max packets buffered before processing (default: 4096)\n"
@@ -122,6 +124,10 @@ int main(int argc, char** argv) {
     int demo_pcap_speed = 25;
 
     std::size_t memory_symbols = 2800;
+    bool channel_has_eaxc = false;
+    uint16_t channel_eaxc = 0;
+    bool channel_has_direction = false;
+    int channel_direction = -1; // 0 = UL, 1 = DL
 
     // Parse CLI options so the capture backend and queue can be tuned without recompiling.
     for (int i = 1; i < argc; ++i) {
@@ -135,6 +141,52 @@ int main(int argc, char** argv) {
 
         if (arg == "--iface") {
             iface = next_arg("--iface");
+        } else if (arg == "--channel") {
+            // Accept up to two tokens after --channel in any order: <eAxC_ID> <UL|DL>
+            std::string token1, token2;
+            if (i + 1 < argc) {
+                std::string peek = argv[i + 1];
+                if (!peek.empty() && peek.rfind("--", 0) != 0) token1 = argv[++i];
+            }
+            if (i + 1 < argc) {
+                std::string peek = argv[i + 1];
+                if (!peek.empty() && peek.rfind("--", 0) != 0) token2 = argv[++i];
+            }
+            if (token1.empty() && token2.empty()) {
+                throw std::invalid_argument("--channel requires at least one argument");
+            }
+
+            auto up = [](std::string s){ std::transform(s.begin(), s.end(), s.begin(), ::toupper); return s; };
+            auto parse_eaxc = [&](const std::string &s)->uint16_t {
+                // parse as hex (allows strings like 0001 or 0x1)
+                unsigned long v = std::stoul(s, nullptr, 16);
+                return static_cast<uint16_t>(v & 0xFFFFu);
+            };
+
+            // Determine which token is direction vs eaxc
+            if (!token1.empty()) {
+                std::string u1 = up(token1);
+                if (u1 == "UL" || u1 == "DL") {
+                    channel_has_direction = true;
+                    channel_direction = (u1 == "DL") ? 1 : 0;
+                    if (!token2.empty()) {
+                        channel_has_eaxc = true;
+                        channel_eaxc = parse_eaxc(token2);
+                    }
+                } else {
+                    channel_has_eaxc = true;
+                    channel_eaxc = parse_eaxc(token1);
+                    if (!token2.empty()) {
+                        std::string u2 = up(token2);
+                        if (u2 == "UL" || u2 == "DL") {
+                            channel_has_direction = true;
+                            channel_direction = (u2 == "DL") ? 1 : 0;
+                        } else {
+                            throw std::invalid_argument("invalid --channel second argument: expected UL or DL");
+                        }
+                    }
+                }
+            }
         } else if (arg == "--snaplen") {
             capture_options.snaplen = std::stoi(next_arg("--snaplen"));
         } else if (arg == "--timeout-ms") {
@@ -245,6 +297,11 @@ int main(int argc, char** argv) {
                 loopback_options.interface_name = iface.c_str();
                 loopback_options.snaplen = capture_options.snaplen;
                 loopback_options.timeout_ms = capture_options.timeout_ms;
+                // Apply CLI channel filters if provided
+                loopback_options.filter_has_eaxc = channel_has_eaxc ? 1 : 0;
+                loopback_options.filter_eaxc = channel_eaxc;
+                loopback_options.filter_has_direction = channel_has_direction ? 1 : 0;
+                loopback_options.filter_direction = channel_direction;
                 rc = fh_capture_loopback_run(
                     &loopback_options,
                     queue_callback,

@@ -11,6 +11,7 @@
 
 struct imgui_visualizer_state {
     bool initialized;
+    bool selection_initialized;
     int selected_eaxc_id_index;
     uint8_t selected_data_direction;
     uint8_t prev_data_direction;
@@ -35,6 +36,7 @@ imgui_visualizer_state_t* imgui_visualizer_init(int window_width, int window_hei
 
     memset(state, 0, sizeof(*state));
     state->initialized = true;
+    state->selection_initialized = false;
     state->selected_eaxc_id_index = 0;
     state->selected_data_direction = 0;  // Default to UL
     state->prev_data_direction = 0;
@@ -134,6 +136,43 @@ fh_oran_memory_t* imgui_visualizer_render(
     // Ensure selected index is valid
     if (state->selected_eaxc_id_index >= num_unique_streams) {
         state->selected_eaxc_id_index = 0;
+    }
+
+    // On first display, sync the highlighted selection to the memory that is
+    // already being shown in the main heatmap so the active UL/DL state matches.
+    if (!state->selection_initialized && current_display_memory != nullptr) {
+        bool synced = false;
+
+        for (size_t i = 0; i < num_keys && !synced; i++) {
+            if (memory_ptrs == nullptr || memory_ptrs[i] != current_display_memory) {
+                continue;
+            }
+
+            const uint16_t target_eaxc = keys[i].eaxc_id;
+            const uint8_t target_direction = keys[i].data_direction;
+
+            for (int j = 0; j < num_unique_streams; j++) {
+                if (streams[j].eaxc_id == target_eaxc) {
+                    state->selected_eaxc_id_index = j;
+                    state->selected_data_direction = target_direction;
+                    synced = true;
+                    break;
+                }
+            }
+        }
+
+        // If we couldn't map the current memory pointer, choose a stable first
+        // visible direction instead of leaving the stale default UL selection.
+        if (!synced && num_unique_streams > 0) {
+            state->selected_eaxc_id_index = 0;
+            if (streams[0].has_dl && !streams[0].has_ul) {
+                state->selected_data_direction = 1;
+            } else if (streams[0].has_ul && !streams[0].has_dl) {
+                state->selected_data_direction = 0;
+            }
+        }
+
+        state->selection_initialized = true;
     }
 
     // Display stream list
