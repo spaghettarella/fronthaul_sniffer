@@ -83,7 +83,11 @@ fh_oran_memory_t* imgui_visualizer_render(
     io.DisplaySize = ImVec2(static_cast<float>(window_width), static_cast<float>(window_height));
 
     // Create stream selection window
-    ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_FirstUseEver);
+    // Center on first appearance so the selector doesn't open partially off-screen.
+    ImGui::SetNextWindowPos(
+        ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f),
+        ImGuiCond_Appearing,
+        ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(300, 200), ImGuiCond_FirstUseEver);
 
     ImGui::Begin("Stream Selection", nullptr, ImGuiWindowFlags_AlwaysAutoResize);

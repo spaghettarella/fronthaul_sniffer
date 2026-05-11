@@ -43,6 +43,8 @@ typedef struct fh_packet {
     uint8_t* data;
     size_t caplen;
     size_t len;
+    void (*release_cb)(void* release_ctx, struct fh_packet* pkt);
+    void* release_ctx;
 } fh_packet_t;
 
 int fh_decode_packet(const fh_packet_t* raw_pkt, fh_decoded_packet_t* decoded_pkt, bool ud_comp_hdr_present, int ud_iq_width, int ud_iq_width_decompressed, const char *ud_comp_method);

@@ -12,6 +12,8 @@ extern "C" {
 typedef struct fh_packet_queue fh_packet_queue_t;
 
 typedef struct fh_queue_stats {
+    size_t total_packets;
+    size_t processed_packets;
     size_t dropped_packets;
     size_t dropped_bytes;
     size_t queued_packets;

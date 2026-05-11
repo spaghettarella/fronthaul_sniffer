@@ -13,8 +13,9 @@ typedef struct fh_oran_memory fh_oran_memory_t;
 typedef struct opengl_visualizer opengl_visualizer_t;
 
 // Create and initialize an OpenGL visualizer window
+// texture_height controls how many symbol rows are rendered in the waterfall
 // Returns NULL on failure (e.g., GLFW/OpenGL init failed)
-opengl_visualizer_t* visualizer_create(int width, int height);
+opengl_visualizer_t* visualizer_create(int width, int height, int texture_height);
 
 // Main render loop—call this in a dedicated thread
 // Runs until window closure or error

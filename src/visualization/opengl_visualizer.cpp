@@ -22,6 +22,7 @@ typedef struct opengl_visualizer {
     int height;
     int tex_height; // number of symbol rows in the texture
     int tex_max_height; // maximum texture height supported by GL
+    int tex_requested_height; // CLI-configurable requested height before clamping
     int is_running;
     uint8_t* texture_data;  // RGBA framebuffer
 } opengl_visualizer_t;
@@ -81,7 +82,7 @@ static void magnitude_to_rgb(float magnitude, float max_magnitude, uint8_t* r, u
     }
 }
 
-opengl_visualizer_t* visualizer_create(int width, int height) {
+opengl_visualizer_t* visualizer_create(int width, int height, int texture_height) {
     if (!glfwInit()) {
         fprintf(stderr, "Failed to initialize GLFW\n");
         return NULL;
@@ -111,13 +112,14 @@ opengl_visualizer_t* visualizer_create(int width, int height) {
     vis->window = window;
     vis->width = width;
     vis->height = height;
+    vis->tex_requested_height = (texture_height > 0) ? texture_height : HEATMAP_DEFAULT_TEXTURE_HEIGHT;
         // Query GL maximum texture size (applies to width/height); use it to bound our texture height
         GLint max_tex_size = 0;
         glGetIntegerv(GL_MAX_TEXTURE_SIZE, &max_tex_size);
         if (max_tex_size <= 0) {
             max_tex_size = 4096; // fallback conservative default
         }
-        vis->tex_height = HEATMAP_DEFAULT_TEXTURE_HEIGHT;
+        vis->tex_height = vis->tex_requested_height;
         if (vis->tex_height > max_tex_size) vis->tex_height = max_tex_size;
         vis->tex_max_height = max_tex_size;
     vis->is_running = 1;
@@ -156,14 +158,16 @@ static void update_heatmap_texture(opengl_visualizer_t* vis, const fh_oran_memor
         return;
     }
     
-    // Ensure texture size matches memory size (dynamic height)
-    int desired_height = vis->tex_height;
-    if (memory && memory->max_symbols > 0) {
-        // Prefer to match memory size, but clamp to GL max texture size
-        int mem_h = (int)memory->max_symbols;
-        int cap = vis->tex_max_height > 0 ? vis->tex_max_height : 4096;
-        desired_height = (mem_h > cap) ? cap : mem_h;
-        if (desired_height <= 0) desired_height = HEATMAP_DEFAULT_TEXTURE_HEIGHT;
+    // Render only a sliding window of the most recent symbols.
+    // Keeping the texture height bounded prevents the visualizer from
+    // dominating CPU time on large memories.
+    int desired_height = vis->tex_requested_height > 0 ? vis->tex_requested_height : HEATMAP_DEFAULT_TEXTURE_HEIGHT;
+    if (memory->max_symbols > 0 && memory->max_symbols < (size_t)desired_height) {
+        desired_height = (int)memory->max_symbols;
+    }
+    int cap = vis->tex_max_height > 0 ? vis->tex_max_height : 4096;
+    if (desired_height > cap) {
+        desired_height = cap;
     }
 
     if (desired_height != vis->tex_height) {

@@ -17,6 +17,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <mutex>
 #include <unordered_map>
 #include <vector>
 #include <algorithm>
@@ -26,6 +27,8 @@
 
 namespace {
 volatile sig_atomic_t g_stop = 0;
+std::mutex g_memories_mutex;  // Protects memories map structure only
+std::mutex g_memory_data_mutex;  // Global lock for per-packet save operations
 
 void on_signal(int) {
     g_stop = 1;
@@ -39,7 +42,9 @@ void print_usage(const char* argv0) {
         << "  --snaplen <bytes>                     Max captured bytes per packet (default: 65535)\n"
         << "  --timeout-ms <ms>                     Read timeout in milliseconds (default: 100)\n"
         << "  --queue-packets <count>               Max packets buffered before processing (default: 4096)\n"
-        << "  --queue-bytes <bytes>                 Max bytes buffered before processing (default: 32MiB)\n"
+        << "  --queue-bytes <bytes>                 Max bytes per packet slot in queue (default: 8000)\n"
+        << "  --decode-threads <count>              Number of parallel decode worker threads (default: 1)\n"
+        << "  --texture-height <rows>               Heatmap texture height in symbol rows (default: 200)\n"
         << "  --memory-size <symbols>               Max symbols buffered per eAxC_ID and Direction (max: 573440; default: 2800)\n"
         << "  --ud-comp-hdr-present <bool>          Whether user data compression header is present (default: false)\n"
         << "  --ud-iq-width <bits>                  Width of user data IQ samples (default: 9)\n"
@@ -66,38 +71,47 @@ int fh_memory_manage(
     bool ud_comp_hdr_present,
     int ud_iq_width,
     int ud_iq_width_decompressed,
-    const char* ud_comp_method) {
+    const char* ud_comp_method,
+    std::mutex& memories_mutex,
+    std::mutex& memory_data_mutex) {
     if (pkt == nullptr) {
         return -1;
     }
 
-    // Decode once, then route the packet to the memory buffer that matches
+    // Decode once
     fh_decoded_packet_t decoded{};
     int rc = fh_decode_packet(pkt, &decoded, ud_comp_hdr_present, ud_iq_width, ud_iq_width_decompressed, ud_comp_method);
     if (rc == 0 && decoded.section_count > 0 && decoded.sections != nullptr) {
         const fh_memory_key_t key{decoded.sections[0].eaxc_id, decoded.sections[0].data_direction};
-        auto it = memories.find(key);
-        if (it == memories.end()) {
-            // Create a new ring buffer the first time we see a new stream key.
-            fh_oran_memory_t* new_memory = fh_oran_memory_create(memory_symbols);
-            if (new_memory != nullptr) {
-                memories.emplace(key, new_memory);
-                discovered_keys.push_back(key);
-                if (display_memory == nullptr) {
-                    // Keep the first discovered memory as the default visualizer target.
-                    display_memory = new_memory;
+        
+        fh_oran_memory_t* memory_buffer = nullptr;
+        
+        // Acquire map lock just for lookup/insert
+        {
+            std::lock_guard<std::mutex> lock(memories_mutex);
+            auto it = memories.find(key);
+            if (it == memories.end()) {
+                fh_oran_memory_t* new_memory = fh_oran_memory_create(memory_symbols);
+                if (new_memory != nullptr) {
+                    memories[key] = new_memory;
+                    discovered_keys.push_back(key);
+                    if (display_memory == nullptr) {
+                        display_memory = new_memory;
+                    }
+                    memory_buffer = new_memory;
                 }
-                it = memories.find(key);
+            } else {
+                memory_buffer = it->second;
             }
         }
-
-        if (it != memories.end() && it->second != nullptr) {
-            // Store the decoded symbols into the memory that matches this packet stream.
-            fh_oran_memory_save(it->second, &decoded, scs_khz);
+        
+        // Save with global data lock
+        if (memory_buffer != nullptr) {
+            std::lock_guard<std::mutex> lock(memory_data_mutex);
+            fh_oran_memory_save(memory_buffer, &decoded, scs_khz);
         }
     }
 
-    // Ownership of the raw packet and decoded packet ends here.
     fh_decoded_packet_free(&decoded);
     fh_packet_release(pkt);
     return rc;
@@ -112,7 +126,8 @@ int main(int argc, char** argv) {
     capture_options.timeout_ms = 100;
 
     std::size_t queue_packets = 4096;
-    std::size_t queue_bytes = 32u * 1024u * 1024u;
+    std::size_t queue_bytes = 10000u;
+    std::size_t texture_height = 200;
 
     bool ud_comp_hdr_present = false;
     int ud_iq_width = 9;
@@ -124,6 +139,7 @@ int main(int argc, char** argv) {
     int demo_pcap_speed = 25;
 
     std::size_t memory_symbols = 2800;
+    std::size_t decode_threads = 1;
     bool channel_has_eaxc = false;
     uint16_t channel_eaxc = 0;
     bool channel_has_direction = false;
@@ -195,6 +211,16 @@ int main(int argc, char** argv) {
             queue_packets = static_cast<std::size_t>(std::stoull(next_arg("--queue-packets")));
         } else if (arg == "--queue-bytes") {
             queue_bytes = static_cast<std::size_t>(std::stoull(next_arg("--queue-bytes")));
+        } else if (arg == "--decode-threads") {
+            decode_threads = static_cast<std::size_t>(std::stoull(next_arg("--decode-threads")));
+            if (decode_threads < 1) {
+                throw std::invalid_argument("--decode-threads must be >= 1");
+            }
+        } else if (arg == "--texture-height") {
+            texture_height = static_cast<std::size_t>(std::stoull(next_arg("--texture-height")));
+            if (texture_height < 1) {
+                throw std::invalid_argument("--texture-height must be >= 1");
+            }
         } else if (arg == "--memory-size") {
             memory_symbols = static_cast<std::size_t>(std::stoull(next_arg("--memory-size")));
         } else if (arg == "--ud-comp-hdr-present") {
@@ -262,7 +288,7 @@ int main(int argc, char** argv) {
         fh_oran_memory_t* display_memory = nullptr;
 
         // Create visualizer window for heatmap display (must be done on main thread)
-        opengl_visualizer_t* visualizer = visualizer_create(800, 600);
+        opengl_visualizer_t* visualizer = visualizer_create(800, 600, static_cast<int>(texture_height));
         if (visualizer == nullptr) {
             std::cerr << "warning: failed to create visualizer, continuing without display\n";
         }
@@ -325,13 +351,37 @@ int main(int argc, char** argv) {
             fh_packet_queue_notify_all(queue);
         });
 
-        // Run packet decode on a background thread.
+        // Run packet decode on background threads (multiple workers for throughput).
         // The same helper is used both during normal operation and during shutdown draining
         // so that packet handling stays in one place.
-        std::thread decode_thread([&] {
-            while (g_stop == 0) {
-                fh_packet_t pkt{};
-                if (fh_packet_queue_pop(queue, &pkt, &g_stop) > 0) {
+        std::vector<std::thread> decode_workers;
+        for (std::size_t w = 0; w < decode_threads; ++w) {
+            decode_workers.emplace_back([&] {
+                while (g_stop == 0) {
+                    fh_packet_t pkt{};
+                    if (fh_packet_queue_pop(queue, &pkt, &g_stop) > 0) {
+                        fh_memory_manage(
+                            &pkt,
+                            memories,
+                            discovered_keys,
+                            display_memory,
+                            memory_symbols,
+                            scs_khz,
+                            ud_comp_hdr_present,
+                            ud_iq_width,
+                            ud_iq_width_decompressed,
+                            ud_comp_method,
+                            g_memories_mutex,
+                            g_memory_data_mutex);
+                    }
+                }
+                
+                // Drain any remaining packets after shutdown
+                for (;;) {
+                    fh_packet_t pkt{};
+                    if (fh_packet_queue_pop(queue, &pkt, &g_stop) <= 0) {
+                        break;
+                    }
                     fh_memory_manage(
                         &pkt,
                         memories,
@@ -342,51 +392,39 @@ int main(int argc, char** argv) {
                         ud_comp_hdr_present,
                         ud_iq_width,
                         ud_iq_width_decompressed,
-                        ud_comp_method);
+                        ud_comp_method,
+                        g_memories_mutex,
+                        g_memory_data_mutex);
                 }
-            }
-            
-            // Drain any remaining packets after shutdown
-            for (;;) {
-                fh_packet_t pkt{};
-                if (fh_packet_queue_pop(queue, &pkt, &g_stop) <= 0) {
-                    break;
-                }
-                fh_memory_manage(
-                    &pkt,
-                    memories,
-                    discovered_keys,
-                    display_memory,
-                    memory_symbols,
-                    scs_khz,
-                    ud_comp_hdr_present,
-                    ud_iq_width,
-                    ud_iq_width_decompressed,
-                    ud_comp_method);
-            }
-        });
+            });
+        }
 
         // Main thread runs visualizer render loop with OpenGL calls
         int render_result = 0;
         if (visualizer != nullptr) {
             while (visualizer_is_running(visualizer) && g_stop == 0) {
-                // Build array of memory pointers for ImGui interface
+                // Build array of memory pointers for ImGui interface (protected by mutex)
                 std::vector<fh_oran_memory_t*> memory_ptrs;
-                for (const auto& key : discovered_keys) {
-                    auto it = memories.find(key);
-                    if (it != memories.end()) {
-                        memory_ptrs.push_back(it->second);
-                    } else {
-                        memory_ptrs.push_back(nullptr);
+                std::vector<fh_memory_key_t> keys_snapshot;
+                {
+                    std::lock_guard<std::mutex> lock(g_memories_mutex);
+                    keys_snapshot = discovered_keys;
+                    for (const auto& key : keys_snapshot) {
+                        auto it = memories.find(key);
+                        if (it != memories.end()) {
+                            memory_ptrs.push_back(it->second);
+                        } else {
+                            memory_ptrs.push_back(nullptr);
+                        }
                     }
                 }
 
                 // Render ImGui stream selection interface
-                if (imgui_state != nullptr && !discovered_keys.empty()) {
+                if (imgui_state != nullptr && !keys_snapshot.empty()) {
                     display_memory = imgui_visualizer_render(
                         imgui_state,
-                        discovered_keys.data(),
-                        discovered_keys.size(),
+                        keys_snapshot.data(),
+                        keys_snapshot.size(),
                         memory_ptrs.data(),
                         display_memory,
                         800,
@@ -394,6 +432,7 @@ int main(int argc, char** argv) {
                 }
 
                 // Render heatmap visualization
+                // No lock needed here since display_memory pointer doesn't change and renderer reads are safe
                 render_result = visualizer_update(visualizer, display_memory);
                 if (render_result < 0) {
                     g_stop = 1;
@@ -418,12 +457,23 @@ int main(int argc, char** argv) {
         if (capture_thread.joinable()) {
             capture_thread.join();
         }
-        if (decode_thread.joinable()) {
-            decode_thread.join();
+        for (auto& worker : decode_workers) {
+            if (worker.joinable()) {
+                worker.join();
+            }
         }
 
         // Print the queue and memory counters so the run can be inspected from the terminal.
         const fh_queue_stats_t stats = fh_packet_queue_stats(queue);
+        const size_t attempted_queue_packets = stats.total_packets;
+        const double dropped_pct = (attempted_queue_packets > 0)
+            ? (100.0 * static_cast<double>(stats.dropped_packets) / static_cast<double>(attempted_queue_packets))
+            : 0.0;
+        std::cout << "[queue] attempted_queue_packets=" << attempted_queue_packets
+                  << " processed_packets=" << stats.processed_packets
+                  << " queued_packets=" << stats.queued_packets
+                  << " dropped_packets=" << stats.dropped_packets
+                  << " dropped_pct=" << dropped_pct << "%\n";
         std::cout << "[queue] dropped_packets=" << stats.dropped_packets
                   << " dropped_bytes=" << stats.dropped_bytes << '\n';
 
