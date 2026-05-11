@@ -23,6 +23,8 @@ typedef struct opengl_visualizer {
     int tex_height; // number of symbol rows in the texture
     int tex_max_height; // maximum texture height supported by GL
     int tex_requested_height; // CLI-configurable requested height before clamping
+    float magnitude_scale_ema; // Smoothed normalization to reduce per-frame color flicker
+    int magnitude_scale_initialized;
     int is_running;
     uint8_t* texture_data;  // RGBA framebuffer
 } opengl_visualizer_t;
@@ -122,6 +124,8 @@ opengl_visualizer_t* visualizer_create(int width, int height, int texture_height
         vis->tex_height = vis->tex_requested_height;
         if (vis->tex_height > max_tex_size) vis->tex_height = max_tex_size;
         vis->tex_max_height = max_tex_size;
+        vis->magnitude_scale_ema = 1e-6f;
+        vis->magnitude_scale_initialized = 0;
     vis->is_running = 1;
     
     // Allocate texture buffer (width x tex_height)
@@ -201,6 +205,9 @@ static void update_heatmap_texture(opengl_visualizer_t* vis, const fh_oran_memor
         if (memory->symbols[idx] == NULL) {
             continue;
         }
+        if (memory->row_symbol_numbers != NULL && memory->row_symbol_numbers[idx] != symbol_num) {
+            continue;
+        }
         
         for (int i = 0; i < HEATMAP_TEXTURE_WIDTH; i++) {
             // Each IQ sample at position i
@@ -216,6 +223,19 @@ static void update_heatmap_texture(opengl_visualizer_t* vis, const fh_oran_memor
         }
     }
     
+    // Smooth magnitude scaling so rapid amplitude shifts do not cause color flicker.
+    if (!vis->magnitude_scale_initialized) {
+        vis->magnitude_scale_ema = max_magnitude;
+        vis->magnitude_scale_initialized = 1;
+    } else {
+        // Follow rising peaks quickly, decay slowly for a stable visual scale.
+        const float alpha_rise = 0.35f;
+        const float alpha_fall = 0.08f;
+        const float alpha = (max_magnitude > vis->magnitude_scale_ema) ? alpha_rise : alpha_fall;
+        vis->magnitude_scale_ema = alpha * max_magnitude + (1.0f - alpha) * vis->magnitude_scale_ema;
+    }
+    const float render_scale = (vis->magnitude_scale_ema > 1e-6f) ? vis->magnitude_scale_ema : 1e-6f;
+
     // Render heatmap bottom-up (newest symbols at bottom)
     for (int sym_offset = 0; sym_offset < display_height; sym_offset++) {
         int symbol_num = memory->symbol_highest - sym_offset;
@@ -223,6 +243,9 @@ static void update_heatmap_texture(opengl_visualizer_t* vis, const fh_oran_memor
         size_t idx = (memory->index_symbol_highest + memory->max_symbols - (size_t)age) % memory->max_symbols;
         
         if (memory->symbols[idx] == NULL) {
+            continue;
+        }
+        if (memory->row_symbol_numbers != NULL && memory->row_symbol_numbers[idx] != symbol_num) {
             continue;
         }
         
@@ -240,7 +263,7 @@ static void update_heatmap_texture(opengl_visualizer_t* vis, const fh_oran_memor
             float magnitude = sqrtf(i_val * i_val + q_val * q_val);
             
             uint8_t r, g, b;
-            magnitude_to_rgb(magnitude, max_magnitude, &r, &g, &b);
+            magnitude_to_rgb(magnitude, render_scale, &r, &g, &b);
             
             size_t pixel_idx = (tex_row * HEATMAP_TEXTURE_WIDTH + col) * 4;
             vis->texture_data[pixel_idx + 0] = r;      // R

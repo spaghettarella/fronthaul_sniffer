@@ -42,17 +42,6 @@ static void clear_symbol_row(fh_oran_memory_t* mem, size_t idx) {
     memset(mem->symbols[idx], 0, 3276 * sizeof(fh_complex_t));
 }
 
-static void clear_symbol_rows(fh_oran_memory_t* mem, size_t start_idx, size_t count) {
-    if (mem == NULL || mem->symbols == NULL || mem->max_symbols == 0 || count == 0) {
-        return;
-    }
-
-    for (size_t step = 0; step < count; step++) {
-        size_t idx = (start_idx + step) % mem->max_symbols;
-        clear_symbol_row(mem, idx);
-    }
-}
-
 fh_oran_memory_t* fh_oran_memory_create(size_t max_symbols) {
     // Reject nonsensical capacity requests early.
     if (max_symbols == 0) {
@@ -79,6 +68,16 @@ fh_oran_memory_t* fh_oran_memory_create(size_t max_symbols) {
         return NULL;
     }
 
+    mem->row_symbol_numbers = (int*)malloc(max_symbols * sizeof(int));
+    if (mem->row_symbol_numbers == NULL) {
+        free(mem->symbols);
+        free(mem);
+        return NULL;
+    }
+    for (size_t i = 0; i < max_symbols; ++i) {
+        mem->row_symbol_numbers[i] = INT_MIN;
+    }
+
     // Allocate each symbol's IQ data buffer (3276 complex values per symbol).
     for (size_t i = 0; i < max_symbols; i++) {
         mem->symbols[i] = (fh_complex_t*)calloc(3276, sizeof(fh_complex_t));
@@ -87,6 +86,7 @@ fh_oran_memory_t* fh_oran_memory_create(size_t max_symbols) {
             for (size_t j = 0; j < i; j++) {
                 free(mem->symbols[j]);
             }
+            free(mem->row_symbol_numbers);
             free(mem->symbols);
             free(mem);
             return NULL;
@@ -117,6 +117,8 @@ void fh_oran_memory_destroy(fh_oran_memory_t* mem) {
         free(mem->symbols);
         mem->symbols = NULL;
     }
+    free(mem->row_symbol_numbers);
+    mem->row_symbol_numbers = NULL;
     free(mem);
 }
 
@@ -155,15 +157,6 @@ int fh_oran_memory_save(fh_oran_memory_t* mem, const fh_decoded_packet_t* pkt, i
             size_t delta = (size_t)(symbol_number - mem->symbol_highest);
             size_t old_highest_idx = mem->index_symbol_highest;
 
-            if (delta >= mem->max_symbols) {
-                // The new symbol is so far ahead that the whole window is replaced.
-                clear_symbol_rows(mem, 0, mem->max_symbols);
-            } else {
-                // Clear only the rows that are being overwritten by the new window.
-                size_t first_overwritten = (old_highest_idx + 1) % mem->max_symbols;
-                clear_symbol_rows(mem, first_overwritten, delta);
-            }
-
             mem->index_symbol_highest = (old_highest_idx + delta) % mem->max_symbols;
             mem->symbol_highest = symbol_number;
             mem->symbol_lowest = symbol_number - (int)(mem->max_symbols - 1);
@@ -189,6 +182,13 @@ int fh_oran_memory_save(fh_oran_memory_t* mem, const fh_decoded_packet_t* pkt, i
 
         size_t idx = (mem->index_symbol_highest + mem->max_symbols - (size_t)(mem->symbol_highest - symbol_number)) % mem->max_symbols;
 
+        // Row reuse is common as the ring advances. Clear only when a row starts
+        // representing a different absolute symbol to avoid eager gap clearing.
+        if (mem->row_symbol_numbers != NULL && mem->row_symbol_numbers[idx] != symbol_number) {
+            clear_symbol_row(mem, idx);
+            mem->row_symbol_numbers[idx] = symbol_number;
+        }
+
         // Copy only the requested PRB range into the correct location in the symbol buffer.
         memcpy(mem->symbols[idx] + start_iq, section->iq_data, iq_count * sizeof(fh_complex_t));
     }
@@ -206,6 +206,9 @@ int fh_oran_memory_wipe(fh_oran_memory_t* mem) {
     for (size_t i = 0; i < mem->max_symbols; i++) {
         if (mem->symbols[i] != NULL) {
             memset(mem->symbols[i], 0, 3276 * sizeof(fh_complex_t));
+        }
+        if (mem->row_symbol_numbers != NULL) {
+            mem->row_symbol_numbers[i] = INT_MIN;
         }
     }
     mem->symbol_lowest = INT_MAX;

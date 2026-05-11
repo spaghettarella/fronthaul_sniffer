@@ -18,6 +18,7 @@ extern "C" {
 
 typedef struct fh_oran_memory {
     fh_complex_t** symbols;  // 2D array: symbols[i][j] where i is symbol, j is IQ sample (0-3275)
+    int* row_symbol_numbers; // Absolute symbol number stored in each ring row (INT_MIN means empty)
     int symbol_lowest;
     int symbol_highest;
     int index_symbol_highest;

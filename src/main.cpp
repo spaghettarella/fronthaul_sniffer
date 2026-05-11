@@ -44,7 +44,6 @@ void print_usage(const char* argv0) {
         << "  --queue-packets <count>               Max packets buffered before processing (default: 4096)\n"
         << "  --queue-bytes <bytes>                 Max bytes per packet slot in queue (default: 8000)\n"
         << "  --decode-threads <count>              Number of parallel decode worker threads (default: 1)\n"
-        << "  --texture-height <rows>               Heatmap texture height in symbol rows (default: 200)\n"
         << "  --memory-size <symbols>               Max symbols buffered per eAxC_ID and Direction (max: 573440; default: 2800)\n"
         << "  --ud-comp-hdr-present <bool>          Whether user data compression header is present (default: false)\n"
         << "  --ud-iq-width <bits>                  Width of user data IQ samples (default: 9)\n"
@@ -132,7 +131,7 @@ int main(int argc, char** argv) {
     bool ud_comp_hdr_present = false;
     int ud_iq_width = 9;
     int ud_iq_width_decompressed = 16;
-    const char *ud_comp_method = "NONE";
+    std::string ud_comp_method = "NONE";
     int scs_khz = 30;
     bool demo_pcap_enabled = false;
     std::string demo_pcap_path = "../src/capture/demo.pcap";
@@ -216,11 +215,6 @@ int main(int argc, char** argv) {
             if (decode_threads < 1) {
                 throw std::invalid_argument("--decode-threads must be >= 1");
             }
-        } else if (arg == "--texture-height") {
-            texture_height = static_cast<std::size_t>(std::stoull(next_arg("--texture-height")));
-            if (texture_height < 1) {
-                throw std::invalid_argument("--texture-height must be >= 1");
-            }
         } else if (arg == "--memory-size") {
             memory_symbols = static_cast<std::size_t>(std::stoull(next_arg("--memory-size")));
         } else if (arg == "--ud-comp-hdr-present") {
@@ -230,7 +224,7 @@ int main(int argc, char** argv) {
         } else if (arg == "--ud-iq-width-decompressed") {
             ud_iq_width_decompressed = std::stoi(next_arg("--ud-iq-width-decompressed"));
         } else if (arg == "--ud-comp-method") {
-            ud_comp_method = next_arg("--ud-comp-method").c_str();
+            ud_comp_method = next_arg("--ud-comp-method");
         } else if (arg == "--scs-khz") {
             scs_khz = std::stoi(next_arg("--scs-khz"));
         } else if (arg == "--demo-pcap") {
@@ -269,6 +263,9 @@ int main(int argc, char** argv) {
     // Register shutdown handlers; the worker loops watch this shared flag.
     std::signal(SIGINT, on_signal);
     std::signal(SIGTERM, on_signal);
+
+    // Keep separate variables for potential debugging, but tie both behaviors to memory-size.
+    texture_height = memory_symbols;
 
     try {
         // Rebind the interface string after parsing so the capture options keep a valid pointer.
@@ -370,7 +367,7 @@ int main(int argc, char** argv) {
                             ud_comp_hdr_present,
                             ud_iq_width,
                             ud_iq_width_decompressed,
-                            ud_comp_method,
+                            ud_comp_method.c_str(),
                             g_memories_mutex,
                             g_memory_data_mutex);
                     }
@@ -392,7 +389,7 @@ int main(int argc, char** argv) {
                         ud_comp_hdr_present,
                         ud_iq_width,
                         ud_iq_width_decompressed,
-                        ud_comp_method,
+                        ud_comp_method.c_str(),
                         g_memories_mutex,
                         g_memory_data_mutex);
                 }

@@ -183,10 +183,9 @@ int fh_decode_packet(const fh_packet_t* raw_pkt, fh_decoded_packet_t* decoded_pk
                 printf("    Start Symbol ID: %u\n", oran->start_symbol_id);
                 printf("\n");*/
 
-                int ud_comp_param_length = 0;
-                if (strcmp(ud_comp_method, "BFP") == 0) {
-                    ud_comp_param_length = 1;
-                }
+                const bool use_bfp = (strcmp(ud_comp_method, "BFP") == 0);
+                const bool use_none = (strcmp(ud_comp_method, "NONE") == 0);
+                int ud_comp_param_length = use_bfp ? 1 : 0;
 
                 // Handle Sections
                 int section_length = 0;
@@ -268,7 +267,7 @@ int fh_decode_packet(const fh_packet_t* raw_pkt, fh_decoded_packet_t* decoded_pk
                             printf("\n");*/
 
                             float i_samples[12], q_samples[12];
-                            if (strcmp(ud_comp_method, "NONE") == 0) {
+                            if (use_none) {
                                 // Convert IQ data to array
                                 int iq_result = extract_iq_samples(
                                     (const char *)(ptr_prb + ud_comp_param_length),
@@ -286,7 +285,7 @@ int fh_decode_packet(const fh_packet_t* raw_pkt, fh_decoded_packet_t* decoded_pk
                                     printf("        IQ Sample Extraction failed with error code: %d\n", iq_result);
                                 }
 
-                            } else if (strcmp(ud_comp_method, "BFP") == 0) {
+                            } else if (use_bfp) {
                                 int decomp_result = bfp_decompress_prb(
                                     (const char *)(ptr_prb + ud_comp_param_length),
                                     ud_iq_width_decompressed,
