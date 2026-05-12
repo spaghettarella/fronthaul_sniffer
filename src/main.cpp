@@ -60,10 +60,10 @@ void print_usage(const char* argv0) {
         << "Usage: " << argv0 << " [options]\n"
         << "  --iface <name>                        Interface name (default: lo)\n"
         << "  --channel <eAxC_ID> <data_direction>  eAxC_ID (uint16) and data direction (UL/DL) to filter network capture before queue\n"
-        << "  --snaplen <bytes>                     Max captured bytes per packet (default: 65535)\n"
+        << "  --snaplen <bytes>                     Max captured bytes per packet (default: 10000)\n"
         << "  --timeout-ms <ms>                     Read timeout in milliseconds (default: 100)\n"
         << "  --queue-packets <count>               Max packets buffered before processing (default: 4096)\n"
-        << "  --queue-bytes <bytes>                 Max bytes per packet slot in queue (default: 8000)\n"
+        << "  (NOTE) --snaplen will also set the queue-bytes value to the same number\n"
         << "  --decode-threads <count>              Number of parallel decode worker threads (default: 1)\n"
         << "  --memory-size <symbols>               Max symbols buffered per eAxC_ID and Direction (max: 573440; default: 2800)\n"
         << "  --ud-comp-hdr-present <bool>          Whether user data compression header is present (default: false)\n"
@@ -142,12 +142,14 @@ int main(int argc, char** argv) {
     fh_capture_socket_options_t capture_options{};
     std::string iface = "lo";
     capture_options.interface_name = iface.c_str();
-    capture_options.snaplen = 65535;
+    capture_options.snaplen = 10000;
     capture_options.timeout_ms = 100;
 
     std::size_t queue_packets = 4096;
-    std::size_t queue_bytes = 10000u;
+    std::size_t queue_bytes = static_cast<std::size_t>(capture_options.snaplen);
     std::size_t texture_height = 200;
+
+    bool timeout_specified = false;
 
     bool ud_comp_hdr_present = false;
     int ud_iq_width = 9;
@@ -225,12 +227,13 @@ int main(int argc, char** argv) {
             }
         } else if (arg == "--snaplen") {
             capture_options.snaplen = std::stoi(next_arg("--snaplen"));
+            // Combine: set queue_bytes to the same value as snaplen
+            queue_bytes = static_cast<std::size_t>(capture_options.snaplen);
         } else if (arg == "--timeout-ms") {
             capture_options.timeout_ms = std::stoi(next_arg("--timeout-ms"));
+            timeout_specified = true;
         } else if (arg == "--queue-packets") {
             queue_packets = static_cast<std::size_t>(std::stoull(next_arg("--queue-packets")));
-        } else if (arg == "--queue-bytes") {
-            queue_bytes = static_cast<std::size_t>(std::stoull(next_arg("--queue-bytes")));
         } else if (arg == "--decode-threads") {
             decode_threads = static_cast<std::size_t>(std::stoull(next_arg("--decode-threads")));
             if (decode_threads < 1) {
@@ -298,6 +301,7 @@ int main(int argc, char** argv) {
         startup_config.demo_pcap_speed = demo_pcap_speed;
         startup_config.snaplen = capture_options.snaplen;
         startup_config.timeout_ms = capture_options.timeout_ms;
+        startup_config.timeout_enabled = timeout_specified;
         startup_config.queue_packets = queue_packets;
         startup_config.queue_bytes = queue_bytes;
         startup_config.decode_threads = decode_threads;
@@ -398,7 +402,11 @@ int main(int argc, char** argv) {
             demo_pcap_path = startup_config.demo_pcap_path;
             demo_pcap_speed = startup_config.demo_pcap_speed;
             capture_options.snaplen = startup_config.snaplen;
-            capture_options.timeout_ms = startup_config.timeout_ms;
+            if (startup_config.timeout_enabled) {
+                capture_options.timeout_ms = startup_config.timeout_ms;
+            } else {
+                capture_options.timeout_ms = 0; // disable timeout
+            }
             queue_packets = static_cast<std::size_t>(startup_config.queue_packets);
             queue_bytes = static_cast<std::size_t>(startup_config.queue_bytes);
             decode_threads = static_cast<std::size_t>(startup_config.decode_threads);
@@ -441,13 +449,30 @@ int main(int argc, char** argv) {
                 fh_pcap_stream_options_t demo_options{};
                 demo_options.pcap_path = demo_pcap_path.c_str();
                 demo_options.demo_pcap_timeout = 1.0 / static_cast<double>(demo_pcap_speed);
-                rc = fh_pcap_stream_run(
-                    &demo_options,
-                    queue_callback,
-                    queue,
-                    &g_stop,
-                    errbuf,
-                    sizeof(errbuf));
+                // If timeout is disabled (capture_options.timeout_ms == 0), keep replaying the pcap
+                // instead of exiting when the file ends.
+                if (capture_options.timeout_ms == 0) {
+                    rc = 0;
+                    while (rc == 0 && *(&g_stop) == 0) {
+                        rc = fh_pcap_stream_run(
+                            &demo_options,
+                            queue_callback,
+                            queue,
+                            &g_stop,
+                            errbuf,
+                            sizeof(errbuf));
+                        if (rc != 0) break; // error - stop replaying
+                        // otherwise EOF reached; loop to restart playback
+                    }
+                } else {
+                    rc = fh_pcap_stream_run(
+                        &demo_options,
+                        queue_callback,
+                        queue,
+                        &g_stop,
+                        errbuf,
+                        sizeof(errbuf));
+                }
             } else if (iface == "lo") {
                 // Use tcpdump backend for loopback interface
                 fh_capture_loopback_options_t loopback_options{};
@@ -477,8 +502,11 @@ int main(int argc, char** argv) {
             }
             if (rc != 0) {
                 std::cerr << "capture error: " << errbuf << '\n';
+                g_stop = 1;
+            } else if (capture_options.timeout_ms != 0) {
+                // If not in looping mode for pcap replay, stop when capture finishes cleanly.
+                g_stop = 1;
             }
-            g_stop = 1;
             fh_packet_queue_notify_all(queue);
         });
 

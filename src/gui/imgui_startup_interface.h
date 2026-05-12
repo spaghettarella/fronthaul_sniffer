@@ -9,8 +9,9 @@ struct fh_startup_config_t {
     std::string iface = "lo";
     std::string demo_pcap_path = "../src/capture/demo.pcap";
     int demo_pcap_speed = 25;
-    int snaplen = 65535;
+    int snaplen = 10000;
     int timeout_ms = 100;
+    bool timeout_enabled = false;
     unsigned long long queue_packets = 4096;
     unsigned long long queue_bytes = 10000;
     unsigned long long decode_threads = 8;

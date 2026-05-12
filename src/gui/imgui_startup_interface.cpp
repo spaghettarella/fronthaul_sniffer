@@ -227,19 +227,21 @@ bool imgui_startup_render(
         ImGui::PopID();
 
         config->demo_pcap_path = state->demo_pcap_path_buffer.data();
-        ImGui::InputInt("PCAP speed", &config->demo_pcap_speed);
+        ImGui::InputInt("PCAP speed (packets/sec)", &config->demo_pcap_speed);
         clamp_int(config->demo_pcap_speed, 1, 1000000);
         ImGui::SameLine();
-        ImGui::TextDisabled("packets/sec");
+        ImGui::TextDisabled("replay speed for pcap interface");
     }
 
     ImGui::Spacing();
     ImGui::SeparatorText("Capture");
-    ImGui::InputInt("Snaplen", &config->snaplen, 1, 1000);
+    ImGui::InputInt("Snaplen (bytes)", &config->snaplen, 1, 1000);
     clamp_int(config->snaplen, 1, 1000000);
 
-    ImGui::InputInt("Timeout (ms)", &config->timeout_ms, 1, 1000);
-    clamp_int(config->timeout_ms, 1, 1000000);
+    // Keep queue_bytes in code but combine in the GUI: set queue_bytes to snaplen
+    config->queue_bytes = static_cast<unsigned long long>(config->snaplen);
+
+    // GUI exposes only Snaplen; Queue bytes follows Snaplen automatically.
 
     const unsigned long long queue_packets_step = 1ULL;
     const unsigned long long queue_packets_step_fast = 100ULL;
@@ -248,12 +250,7 @@ bool imgui_startup_render(
         config->queue_packets = 1ULL;
     }
 
-    const unsigned long long queue_bytes_step = 1ULL;
-    const unsigned long long queue_bytes_step_fast = 1000ULL;
-    ImGui::InputScalar("Queue bytes", ImGuiDataType_U64, &config->queue_bytes, &queue_bytes_step, &queue_bytes_step_fast, "%llu");
-    if (config->queue_bytes < 1ULL) {
-        config->queue_bytes = 1ULL;
-    }
+    // GUI exposes only Snaplen; Queue bytes follows Snaplen automatically.
 
     const unsigned long long decode_threads_step = 1ULL;
     const unsigned long long decode_threads_step_fast = 4ULL;
@@ -264,9 +261,17 @@ bool imgui_startup_render(
 
     const unsigned long long memory_size_step = 1ULL;
     const unsigned long long memory_size_step_fast = 100ULL;
-    ImGui::InputScalar("Memory size", ImGuiDataType_U64, &config->memory_symbols, &memory_size_step, &memory_size_step_fast, "%llu");
+    ImGui::InputScalar("Memory size (symbols)", ImGuiDataType_U64, &config->memory_symbols, &memory_size_step, &memory_size_step_fast, "%llu");
     if (config->memory_symbols < 1ULL) {
         config->memory_symbols = 1ULL;
+    }
+
+    // Place timeout control at the bottom of the Capture section
+    ImGui::Spacing();
+    ImGui::Checkbox("Enable timeout", &config->timeout_enabled);
+    if (config->timeout_enabled) {
+        ImGui::InputInt("Timeout (ms)", &config->timeout_ms, 1, 1000);
+        clamp_int(config->timeout_ms, 1, 1000000);
     }
 
     ImGui::Spacing();
@@ -286,17 +291,17 @@ bool imgui_startup_render(
         ImGui::EndCombo();
     }
 
-    ImGui::InputInt("ud-iq-width", &config->ud_iq_width);
+    ImGui::InputInt("UD IQ-Width (bits)", &config->ud_iq_width);
     ImGui::SameLine();
     ImGui::TextDisabled("default 9, range 1-16");
     clamp_int(config->ud_iq_width, 1, 16);
 
-    ImGui::InputInt("ud-iq-width-decompressed", &config->ud_iq_width_decompressed);
+    ImGui::InputInt("UD IQ-Width Decompressed (bits)", &config->ud_iq_width_decompressed);
     ImGui::SameLine();
     ImGui::TextDisabled("default 16, range 1-16");
     clamp_int(config->ud_iq_width_decompressed, 1, 16);
 
-    if (ImGui::BeginCombo("scs-khz", std::to_string(config->scs_khz).c_str())) {
+    if (ImGui::BeginCombo("SCS (kHz)", std::to_string(config->scs_khz).c_str())) {
         for (int scs : kScsValues) {
             const bool is_selected = (config->scs_khz == scs);
             const std::string label = std::to_string(scs);
