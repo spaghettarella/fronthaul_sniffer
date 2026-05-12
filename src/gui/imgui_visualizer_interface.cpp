@@ -1,5 +1,6 @@
 #include "imgui_visualizer_interface.h"
 #include "core/c_oran_memory.h"
+#include "pipeline/c_packet_queue.h"
 
 #include <imgui.h>
 #include <imgui_impl_glfw.h>
@@ -67,7 +68,8 @@ fh_oran_memory_t* imgui_visualizer_render(
     fh_oran_memory_t** memory_ptrs,
     fh_oran_memory_t* current_display_memory,
     int window_width,
-    int window_height) {
+    int window_height,
+    fh_queue_stats_t stats) {
     
     if (!state || !state->initialized || num_keys == 0) {
         return current_display_memory;
@@ -89,6 +91,17 @@ fh_oran_memory_t* imgui_visualizer_render(
         ImGuiCond_Appearing,
         ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(300, 200), ImGuiCond_FirstUseEver);
+
+    // Apply startup-specific theme: purple background, green accents
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.4f, 0.2f, 0.5f, 0.95f));       // Purple
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.2f, 0.9f, 0.2f, 1.0f));             // Green text
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.7f, 0.2f, 0.8f));           // Green button
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.3f, 0.9f, 0.3f, 1.0f));    // Bright green hover
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.1f, 0.6f, 0.1f, 1.0f));     // Dark green active
+    ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0.2f, 0.6f, 0.2f, 0.8f));           // Green header
+    ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0.3f, 0.8f, 0.3f, 0.9f));    // Bright green header hover
+    ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.15f, 0.15f, 0.2f, 0.8f));        // Dark frame
+    ImGui::PushStyleColor(ImGuiCol_CheckMark, ImVec4(0.3f, 0.9f, 0.3f, 1.0f));        // Green checkmark
 
     ImGui::Begin("Stream Selection", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
 
@@ -265,6 +278,21 @@ fh_oran_memory_t* imgui_visualizer_render(
     }
 
     ImGui::End();
+
+    // Statistics window: live packet drop rate (inside the same frame)
+    double dropped_pct = (stats.total_packets > 0)
+        ? (100.0 * static_cast<double>(stats.dropped_packets) / static_cast<double>(stats.total_packets))
+        : 0.0;
+
+    ImGui::Begin("Live Statistics", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
+    ImGui::Text("Packet drop rate: %.2f%%", dropped_pct);
+    ImGui::Text("Total packets: %llu", static_cast<unsigned long long>(stats.total_packets));
+    ImGui::Text("Dropped packets: %llu", static_cast<unsigned long long>(stats.dropped_packets));
+    ImGui::Text("Queued packets: %llu", static_cast<unsigned long long>(stats.queued_packets));
+    ImGui::End();
+
+    // Pop the theme colors
+    ImGui::PopStyleColor(9);
 
     // Finalize the frame so the caller can submit draw data after the heatmap pass.
     ImGui::Render();

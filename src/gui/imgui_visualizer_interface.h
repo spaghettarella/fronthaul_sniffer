@@ -4,6 +4,8 @@
 #include <cstdint>
 #include <functional>
 
+#include "pipeline/c_packet_queue.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -67,7 +69,8 @@ struct fh_oran_memory* imgui_visualizer_render(
     struct fh_oran_memory** memory_ptrs,
     struct fh_oran_memory* current_display_memory,
     int window_width,
-    int window_height);
+    int window_height,
+    fh_queue_stats_t stats);
 
 // Shutdown ImGui and release resources
 void imgui_visualizer_shutdown(imgui_visualizer_state_t* state);

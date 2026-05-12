@@ -5,7 +5,10 @@
 #include "core/c_oran_memory.h"
 #include "pipeline/c_packet_queue.h"
 #include "visualization/opengl_visualizer.h"
+#include "gui/imgui_startup_interface.h"
 #include "gui/imgui_visualizer_interface.h"
+
+#include <GL/gl.h>
 
 #include <chrono>
 #include <csignal>
@@ -21,6 +24,24 @@
 #include <unordered_map>
 #include <vector>
 #include <algorithm>
+
+namespace {
+struct startup_eaxc_fields_t {
+    int du_port_id;
+    int band_sector_id;
+    int cc_id;
+    int ru_port_id;
+};
+
+startup_eaxc_fields_t unpack_startup_eaxc(uint16_t eaxc_id) {
+    return {
+        static_cast<int>((eaxc_id >> 14) & 0x3u),
+        static_cast<int>((eaxc_id >> 8) & 0x3Fu),
+        static_cast<int>((eaxc_id >> 4) & 0xFu),
+        static_cast<int>(eaxc_id & 0xFu),
+    };
+}
+}  // namespace
 
 // The memory key structs are defined in the GUI interface header
 // and used here in the main program
@@ -131,14 +152,14 @@ int main(int argc, char** argv) {
     bool ud_comp_hdr_present = false;
     int ud_iq_width = 9;
     int ud_iq_width_decompressed = 16;
-    std::string ud_comp_method = "NONE";
+    std::string ud_comp_method = "BFP";
     int scs_khz = 30;
     bool demo_pcap_enabled = false;
     std::string demo_pcap_path = "../src/capture/demo.pcap";
     int demo_pcap_speed = 25;
 
-    std::size_t memory_symbols = 2800;
-    std::size_t decode_threads = 1;
+    std::size_t memory_symbols = 1120;
+    std::size_t decode_threads = 8;
     bool channel_has_eaxc = false;
     uint16_t channel_eaxc = 0;
     bool channel_has_direction = false;
@@ -271,11 +292,31 @@ int main(int argc, char** argv) {
         // Rebind the interface string after parsing so the capture options keep a valid pointer.
         capture_options.interface_name = iface.c_str();
 
-        // Build the bounded packet queue and decoded-packet storage used by the pipeline.
-        fh_packet_queue_t* queue = fh_packet_queue_create(queue_packets, queue_bytes);
-        if (queue == nullptr) {
-            throw std::runtime_error("failed to create packet queue");
+        fh_startup_config_t startup_config{};
+        startup_config.iface = iface;
+        startup_config.demo_pcap_path = demo_pcap_path;
+        startup_config.demo_pcap_speed = demo_pcap_speed;
+        startup_config.snaplen = capture_options.snaplen;
+        startup_config.timeout_ms = capture_options.timeout_ms;
+        startup_config.queue_packets = queue_packets;
+        startup_config.queue_bytes = queue_bytes;
+        startup_config.decode_threads = decode_threads;
+        startup_config.memory_symbols = memory_symbols;
+        startup_config.ud_comp_hdr_present = ud_comp_hdr_present;
+        startup_config.ud_iq_width = ud_iq_width;
+        startup_config.ud_iq_width_decompressed = ud_iq_width_decompressed;
+        startup_config.ud_comp_method = ud_comp_method;
+        startup_config.scs_khz = scs_khz;
+        startup_config.channel_has_eaxc = channel_has_eaxc;
+        if (channel_has_eaxc) {
+            const startup_eaxc_fields_t channel_fields = unpack_startup_eaxc(channel_eaxc);
+            startup_config.channel_eaxc = channel_eaxc;
+            startup_config.channel_du_port_id = channel_fields.du_port_id;
+            startup_config.channel_band_sector_id = channel_fields.band_sector_id;
+            startup_config.channel_cc_id = channel_fields.cc_id;
+            startup_config.channel_ru_port_id = channel_fields.ru_port_id;
         }
+        startup_config.channel_direction = (channel_direction >= 0) ? channel_direction : 0;
 
         // Per-stream memory buffers keyed by (eAxC_ID, data_direction).
         std::unordered_map<fh_memory_key_t, fh_oran_memory_t*> memories;
@@ -299,11 +340,104 @@ int main(int argc, char** argv) {
             }
         }
 
+        fh_startup_interface_state_t* startup_state = nullptr;
+        if (argc == 1) {
+            startup_state = imgui_startup_init(&startup_config);
+            if (startup_state == nullptr) {
+                std::cerr << "warning: failed to initialize startup configuration UI, continuing with defaults\n";
+            }
+
+            if (visualizer != nullptr && imgui_state != nullptr && startup_state != nullptr) {
+                bool startup_complete = false;
+                while (visualizer_is_running(visualizer) && g_stop == 0 && !startup_complete) {
+                    if (visualizer_update(visualizer, nullptr) < 0) {
+                        g_stop = 1;
+                        break;
+                    }
+
+                    // Draw orange background behind the ImGui startup window
+                    glMatrixMode(GL_PROJECTION);
+                    glPushMatrix();
+                    glLoadIdentity();
+                    glOrtho(0, 800, 600, 0, -1, 1);
+                    glMatrixMode(GL_MODELVIEW);
+                    glPushMatrix();
+                    glLoadIdentity();
+                    
+                    glDisable(GL_TEXTURE_2D);
+                    glBegin(GL_QUADS);
+                    glColor3f(1.0f, 0.5f, 0.0f);
+                    glVertex2f(0, 0);
+                    glVertex2f(800, 0);
+                    glVertex2f(800, 600);
+                    glVertex2f(0, 600);
+                    glEnd();
+                    
+                    glMatrixMode(GL_PROJECTION);
+                    glPopMatrix();
+                    glMatrixMode(GL_MODELVIEW);
+                    glPopMatrix();
+                    glColor3f(1.0f, 1.0f, 1.0f);
+
+                    startup_complete = imgui_startup_render(startup_state, &startup_config, 800, 600);
+                    imgui_visualizer_present();
+                    visualizer_present(visualizer);
+                }
+
+                if (!startup_complete && g_stop == 0) {
+                    throw std::runtime_error("startup window closed before configuration was confirmed");
+                }
+                
+                // Reset to default black background for main visualization
+                glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+            }
+
+            imgui_startup_shutdown(startup_state);
+
+            iface = startup_config.iface;
+            demo_pcap_path = startup_config.demo_pcap_path;
+            demo_pcap_speed = startup_config.demo_pcap_speed;
+            capture_options.snaplen = startup_config.snaplen;
+            capture_options.timeout_ms = startup_config.timeout_ms;
+            queue_packets = static_cast<std::size_t>(startup_config.queue_packets);
+            queue_bytes = static_cast<std::size_t>(startup_config.queue_bytes);
+            decode_threads = static_cast<std::size_t>(startup_config.decode_threads);
+            if (decode_threads < 1) {
+                decode_threads = 1;
+            }
+            memory_symbols = static_cast<std::size_t>(startup_config.memory_symbols);
+            ud_comp_hdr_present = startup_config.ud_comp_hdr_present;
+            ud_iq_width = startup_config.ud_iq_width;
+            ud_iq_width_decompressed = startup_config.ud_iq_width_decompressed;
+            ud_comp_method = startup_config.ud_comp_method;
+            scs_khz = startup_config.scs_khz;
+            channel_has_eaxc = startup_config.channel_has_eaxc;
+            channel_has_direction = startup_config.channel_has_direction;
+            if (channel_has_eaxc) {
+                channel_eaxc = startup_config.channel_eaxc;
+            } else {
+                channel_eaxc = 0;
+            }
+            if (channel_has_direction) {
+                channel_direction = startup_config.channel_direction;
+            } else {
+                channel_direction = -1;
+            }
+            texture_height = memory_symbols;
+            capture_options.interface_name = iface.c_str();
+        }
+
+        // Build the bounded packet queue and decoded-packet storage used by the pipeline.
+        fh_packet_queue_t* queue = fh_packet_queue_create(queue_packets, queue_bytes);
+        if (queue == nullptr) {
+            throw std::runtime_error("failed to create packet queue");
+        }
+
         // Run packet capture on a background thread (just network I/O/file replay, no OpenGL)
         std::thread capture_thread([&] {
             char errbuf[256] = {0};
             int rc = 0;
-            if (demo_pcap_enabled) {
+            if (demo_pcap_enabled || iface == "pcap") {
                 fh_pcap_stream_options_t demo_options{};
                 demo_options.pcap_path = demo_pcap_path.c_str();
                 demo_options.demo_pcap_timeout = 1.0 / static_cast<double>(demo_pcap_speed);
@@ -416,6 +550,9 @@ int main(int argc, char** argv) {
                     }
                 }
 
+                // Update and obtain live queue stats for UI
+                fh_queue_stats_t stats = fh_packet_queue_stats(queue);
+
                 // Render ImGui stream selection interface
                 if (imgui_state != nullptr && !keys_snapshot.empty()) {
                     display_memory = imgui_visualizer_render(
@@ -425,7 +562,8 @@ int main(int argc, char** argv) {
                         memory_ptrs.data(),
                         display_memory,
                         800,
-                        600);
+                        600,
+                        stats);
                 }
 
                 // Render heatmap visualization

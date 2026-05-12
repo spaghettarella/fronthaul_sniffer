@@ -25,6 +25,7 @@ add_executable(fronthaul_sniffer
     src/core/bfp_decompress.c
     src/core/c_oran_memory.c
     src/visualization/opengl_visualizer.cpp
+    src/gui/imgui_startup_interface.cpp
     src/gui/imgui_visualizer_interface.cpp
     ${imgui_SOURCE_DIR}/imgui.cpp
     ${imgui_SOURCE_DIR}/imgui_demo.cpp
