@@ -34,6 +34,16 @@ static int compute_symbol_number(uint64_t frame_counter, const fh_section_t* sec
     return (int)sym;
 }
 
+static int clamp_symbol_number(int64_t value) {
+    if (value > (int64_t)INT_MAX) {
+        return INT_MAX;
+    }
+    if (value < (int64_t)INT_MIN) {
+        return INT_MIN;
+    }
+    return (int)value;
+}
+
 static void clear_symbol_row(fh_oran_memory_t* mem, size_t idx) {
     if (mem == NULL || mem->symbols == NULL || idx >= mem->max_symbols || mem->symbols[idx] == NULL) {
         return;
@@ -62,6 +72,9 @@ fh_oran_memory_t* fh_oran_memory_create(size_t max_symbols) {
     mem->symbol_highest = INT_MIN;
     mem->index_symbol_highest = 0;
     mem->max_symbols = max_symbols;
+    mem->replay_symbol_offset = 0;
+    mem->loop_first_symbol = INT_MIN;
+    mem->loop_last_symbol = INT_MIN;
     mem->symbols = (fh_complex_t**)malloc(max_symbols * sizeof(fh_complex_t*));
     if (mem->symbols == NULL) {
         free(mem);
@@ -138,10 +151,19 @@ int fh_oran_memory_save(fh_oran_memory_t* mem, const fh_decoded_packet_t* pkt, i
         }
         mem->last_frame_id = section->frame_id;
 
-        int symbol_number = compute_symbol_number(mem->frame_counter, section, scs_khz);
-        if (symbol_number < 0) {
+        int raw_symbol_number = compute_symbol_number(mem->frame_counter, section, scs_khz);
+        if (raw_symbol_number < 0) {
             continue;
         }
+
+        if (mem->loop_first_symbol == INT_MIN || raw_symbol_number < mem->loop_first_symbol) {
+            mem->loop_first_symbol = raw_symbol_number;
+        }
+        if (mem->loop_last_symbol == INT_MIN || raw_symbol_number > mem->loop_last_symbol) {
+            mem->loop_last_symbol = raw_symbol_number;
+        }
+
+        int symbol_number = clamp_symbol_number(mem->replay_symbol_offset + (int64_t)raw_symbol_number);
 
         if (mem->symbol_highest == INT_MIN) {
             // First symbol defines the initial ring position.
@@ -213,6 +235,9 @@ int fh_oran_memory_wipe(fh_oran_memory_t* mem) {
     }
     mem->symbol_lowest = INT_MAX;
     mem->symbol_highest = INT_MIN;
+    mem->replay_symbol_offset = 0;
+    mem->loop_first_symbol = INT_MIN;
+    mem->loop_last_symbol = INT_MIN;
     mem->frame_counter = 0;
     mem->last_frame_id = 0;
 
@@ -232,4 +257,23 @@ fh_oran_memory_stats_t fh_oran_memory_stats(const fh_oran_memory_t* mem) {
     }
 
     return stats;
+}
+
+void fh_oran_memory_advance_loop(fh_oran_memory_t* mem) {
+    if (mem == NULL) {
+        return;
+    }
+
+    if (mem->loop_first_symbol != INT_MIN && mem->loop_last_symbol != INT_MIN) {
+        int64_t loop_span = (int64_t)mem->loop_last_symbol - (int64_t)mem->loop_first_symbol + 1;
+        if (loop_span < 1) {
+            loop_span = 1;
+        }
+        mem->replay_symbol_offset += loop_span;
+    }
+
+    mem->loop_first_symbol = INT_MIN;
+    mem->loop_last_symbol = INT_MIN;
+    mem->frame_counter = 0;
+    mem->last_frame_id = 0;
 }

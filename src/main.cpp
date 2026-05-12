@@ -51,6 +51,23 @@ volatile sig_atomic_t g_stop = 0;
 std::mutex g_memories_mutex;  // Protects memories map structure only
 std::mutex g_memory_data_mutex;  // Global lock for per-packet save operations
 
+void wait_for_queue_drain(fh_packet_queue_t* queue) {
+    while (queue != nullptr && fh_packet_queue_stats(queue).queued_packets != 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
+
+void advance_all_memory_loops(
+    std::unordered_map<fh_memory_key_t, fh_oran_memory_t*>& memories,
+    std::mutex& memories_mutex) {
+    std::lock_guard<std::mutex> lock(memories_mutex);
+    for (auto& entry : memories) {
+        if (entry.second != nullptr) {
+            fh_oran_memory_advance_loop(entry.second);
+        }
+    }
+}
+
 void on_signal(int) {
     g_stop = 1;
 }
@@ -453,7 +470,7 @@ int main(int argc, char** argv) {
                 // instead of exiting when the file ends.
                 if (capture_options.timeout_ms == 0) {
                     rc = 0;
-                    while (rc == 0 && *(&g_stop) == 0) {
+                    while (rc == 0 && g_stop == 0) {
                         rc = fh_pcap_stream_run(
                             &demo_options,
                             queue_callback,
@@ -462,7 +479,11 @@ int main(int argc, char** argv) {
                             errbuf,
                             sizeof(errbuf));
                         if (rc != 0) break; // error - stop replaying
-                        // otherwise EOF reached; loop to restart playback
+
+                        // EOF reached: wait for all packets from this pass to finish decoding,
+                        // then advance every tracked stream's replay base before restarting.
+                        wait_for_queue_drain(queue);
+                        advance_all_memory_loops(memories, g_memories_mutex);
                     }
                 } else {
                     rc = fh_pcap_stream_run(

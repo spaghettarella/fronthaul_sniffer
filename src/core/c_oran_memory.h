@@ -3,6 +3,7 @@
 #include "c_fronthaul_decoder.h"
 
 #include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 #include <complex>
@@ -25,6 +26,9 @@ typedef struct fh_oran_memory {
     size_t max_symbols;
     uint64_t frame_counter;  // Continuous frame counter (tracks wraparounds of 8-bit frame_id)
     uint8_t last_frame_id;   // Previous frame_id; used to detect wraparound
+    int64_t replay_symbol_offset;  // Per-stream offset added on each pcap replay loop
+    int loop_first_symbol;         // First raw symbol number seen in the current replay loop
+    int loop_last_symbol;          // Last raw symbol number seen in the current replay loop
 } fh_oran_memory_t;
 
 typedef struct fh_oran_memory_stats {
@@ -38,6 +42,7 @@ void fh_oran_memory_destroy(fh_oran_memory_t* mem);
 
 int fh_oran_memory_save(fh_oran_memory_t* mem, const fh_decoded_packet_t* pkt, int scs_khz);
 int fh_oran_memory_wipe(fh_oran_memory_t* mem);
+void fh_oran_memory_advance_loop(fh_oran_memory_t* mem);
 
 fh_oran_memory_stats_t fh_oran_memory_stats(const fh_oran_memory_t* mem);
 
