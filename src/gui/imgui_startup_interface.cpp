@@ -175,7 +175,7 @@ bool imgui_startup_render(
         viewport_center,
         ImGuiCond_Always,
         ImVec2(0.5f, 0.5f));
-    ImGui::SetNextWindowSize(ImVec2(740.0f, 0.0f), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(900.0f, 0.0f), ImGuiCond_Always);
 
     // Apply startup-specific theme: purple background, green accents
     ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.4f, 0.2f, 0.5f, 0.95f));       // Purple
@@ -208,6 +208,8 @@ bool imgui_startup_render(
         }
         ImGui::EndCombo();
     }
+    ImGui::SameLine();
+    ImGui::TextDisabled("select 'pcap' to replay from a pcap file");
 
     config->iface = state->interfaces[state->selected_interface_index];
 
@@ -241,6 +243,8 @@ bool imgui_startup_render(
     ImGui::SeparatorText("Capture");
     ImGui::InputInt("Snaplen (bytes)", &config->snaplen, 1, 1000);
     clamp_int(config->snaplen, 1, 1000000);
+    ImGui::SameLine();
+    ImGui::TextDisabled("bytes reserved for each packet (>9000 for Jumbo Frames)");
 
     // Keep queue_bytes in code but combine in the GUI: set queue_bytes to snaplen
     config->queue_bytes = static_cast<unsigned long long>(config->snaplen);
@@ -253,6 +257,8 @@ bool imgui_startup_render(
     if (config->queue_packets < 1ULL) {
         config->queue_packets = 1ULL;
     }
+    ImGui::SameLine();
+    ImGui::TextDisabled("capture buffer before processing");
 
     // GUI exposes only Snaplen; Queue bytes follows Snaplen automatically.
 
@@ -262,6 +268,8 @@ bool imgui_startup_render(
     if (config->decode_threads < 1ULL) {
         config->decode_threads = 1ULL;
     }
+    ImGui::SameLine();
+    ImGui::TextDisabled("number of threads for packet decoding (increase for high packet rates)");
 
     const unsigned long long memory_size_step = 1ULL;
     const unsigned long long memory_size_step_fast = 100ULL;
@@ -269,6 +277,8 @@ bool imgui_startup_render(
     if (config->memory_symbols < 1ULL) {
         config->memory_symbols = 1ULL;
     }
+    ImGui::SameLine();
+    ImGui::TextDisabled("number of symbols to keep in memory (vertical resolution)");
 
     // Place timeout control at the bottom of the Capture section
     ImGui::Spacing();
@@ -277,12 +287,17 @@ bool imgui_startup_render(
         ImGui::InputInt("Timeout (ms)", &config->timeout_ms, 1, 1000);
         clamp_int(config->timeout_ms, 1, 1000000);
     }
+    ImGui::SameLine();
+    ImGui::TextDisabled("timeout for packet capture (shut down if stream stops)");
 
     ImGui::Spacing();
     ImGui::SeparatorText("Decoder");
-    ImGui::Checkbox("User data compression header present", &config->ud_comp_hdr_present);
+    ImGui::Checkbox("User Data Compression Header present", &config->ud_comp_hdr_present);
+    // TODO: implement compression header parsing
+    ImGui::SameLine();
+    ImGui::TextDisabled("ud_comp_hdr parsing not supported yet");
 
-    if (ImGui::BeginCombo("Compression method", config->ud_comp_method.c_str())) {
+    if (ImGui::BeginCombo("Compression Method", config->ud_comp_method.c_str())) {
         for (const char* method : kCompMethods) {
             const bool is_selected = (config->ud_comp_method == method);
             if (ImGui::Selectable(method, is_selected)) {
@@ -294,6 +309,8 @@ bool imgui_startup_render(
         }
         ImGui::EndCombo();
     }
+    ImGui::SameLine();
+    ImGui::TextDisabled("for now only 'BFP' or 'NONE' (uncompressed) supported");
 
     ImGui::InputInt("UD IQ-Width (bits)", &config->ud_iq_width);
     ImGui::SameLine();
@@ -319,11 +336,14 @@ bool imgui_startup_render(
         ImGui::EndCombo();
     }
     ImGui::SameLine();
-    ImGui::TextDisabled("default 30, values 15/30/60/120/240");
+    ImGui::TextDisabled("subcarrier spacing (default 30, values 15/30/60/120/240)");
 
     ImGui::Spacing();
     ImGui::SeparatorText("Channel filter");
     ImGui::Checkbox("Filter by eAxC ID", &config->channel_has_eaxc);
+    ImGui::SameLine();
+    ImGui::TextDisabled("aka PC_ID (other formats only in CLI supported)");
+
     if (config->channel_has_eaxc) {
         ImGui::SetNextItemWidth(180.0f);
         ImGui::InputInt("DU Port ID (2 bits)", &config->channel_du_port_id, 1, 1);
@@ -350,7 +370,9 @@ bool imgui_startup_render(
         ImGui::TextDisabled("eAxC_ID preview: 0x%04X", config->channel_eaxc);
     }
 
-    ImGui::Checkbox("Filter by data direction", &config->channel_has_direction);
+    ImGui::Checkbox("Filter by Data Direction", &config->channel_has_direction);
+    ImGui::SameLine();
+    ImGui::TextDisabled("'UL' (uplink) / 'DL' (downlink)");
     if (config->channel_has_direction) {
         int direction_index = config->channel_direction;
         if (ImGui::BeginCombo("##direction_combo", kDirections[direction_index])) {

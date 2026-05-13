@@ -353,7 +353,7 @@ int main(int argc, char** argv) {
         fh_oran_memory_t* display_memory = nullptr;
 
         // Create visualizer window for heatmap display (must be done on main thread)
-        opengl_visualizer_t* visualizer = visualizer_create(800, 600, static_cast<int>(texture_height));
+        opengl_visualizer_t* visualizer = visualizer_create(1000, 800, static_cast<int>(texture_height));
         if (visualizer == nullptr) {
             std::cerr << "warning: failed to create visualizer, continuing without display\n";
         }
@@ -361,7 +361,7 @@ int main(int argc, char** argv) {
         // Initialize ImGui for stream selection interface
         imgui_visualizer_state_t* imgui_state = nullptr;
         if (visualizer != nullptr) {
-            imgui_state = imgui_visualizer_init(800, 600);
+            imgui_state = imgui_visualizer_init(1000, 800);
             if (imgui_state == nullptr) {
                 std::cerr << "warning: failed to initialize ImGui, continuing without stream selector\n";
             }
@@ -490,7 +490,7 @@ int main(int argc, char** argv) {
                         glMatrixMode(GL_PROJECTION);
                         glPushMatrix();
                         glLoadIdentity();
-                        glOrtho(0, 800, 600, 0, -1, 1);
+                        glOrtho(0, 1000, 800, 0, -1, 1);
                         glMatrixMode(GL_MODELVIEW);
                         glPushMatrix();
                         glLoadIdentity();
@@ -499,9 +499,9 @@ int main(int argc, char** argv) {
                         glBegin(GL_QUADS);
                         glColor3f(1.0f, 0.5f, 0.0f);
                         glVertex2f(0, 0);
-                        glVertex2f(800, 0);
-                        glVertex2f(800, 600);
-                        glVertex2f(0, 600);
+                        glVertex2f(1000, 0);
+                        glVertex2f(1000, 800);
+                        glVertex2f(0, 800);
                         glEnd();
 
                         glMatrixMode(GL_PROJECTION);
@@ -511,7 +511,7 @@ int main(int argc, char** argv) {
                         glColor3f(1.0f, 1.0f, 1.0f);
                     }
 
-                    startup_complete = imgui_startup_render(startup_state, &startup_config, 800, 600);
+                    startup_complete = imgui_startup_render(startup_state, &startup_config, 1000, 800);
                     imgui_visualizer_present();
                     visualizer_present(visualizer);
                 }
@@ -744,8 +744,8 @@ int main(int argc, char** argv) {
                         keys_snapshot.size(),
                         memory_ptrs.data(),
                         display_memory,
+                        1000,
                         800,
-                        600,
                         stats);
                 }
 
