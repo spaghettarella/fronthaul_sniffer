@@ -231,6 +231,10 @@ bool imgui_startup_render(
         clamp_int(config->demo_pcap_speed, 1, 1000000);
         ImGui::SameLine();
         ImGui::TextDisabled("replay speed for pcap interface");
+
+        ImGui::Checkbox("Loop PCAP playback", &config->demo_pcap_loop);
+        ImGui::SameLine();
+        ImGui::TextDisabled("enabled by default");
     }
 
     ImGui::Spacing();

@@ -24,6 +24,7 @@
 #include <unordered_map>
 #include <vector>
 #include <algorithm>
+#include <filesystem>
 
 namespace {
 struct startup_eaxc_fields_t {
@@ -81,6 +82,7 @@ void print_usage(const char* argv0) {
         << "  --timeout-ms <ms>                     Read timeout in milliseconds (default: 100)\n"
         << "  --queue-packets <count>               Max packets buffered before processing (default: 4096)\n"
         << "  (NOTE) --snaplen will also set the queue-bytes value to the same number\n"
+        << "  --pcap-loop <bool>                    Loop demo pcap playback (default: true)\n"
         << "  --decode-threads <count>              Number of parallel decode worker threads (default: 1)\n"
         << "  --memory-size <symbols>               Max symbols buffered per eAxC_ID and Direction (max: 573440; default: 2800)\n"
         << "  --ud-comp-hdr-present <bool>          Whether user data compression header is present (default: false)\n"
@@ -176,6 +178,7 @@ int main(int argc, char** argv) {
     bool demo_pcap_enabled = false;
     std::string demo_pcap_path = "../src/capture/demo.pcap";
     int demo_pcap_speed = 25;
+    bool demo_pcap_loop = true;
 
     std::size_t memory_symbols = 1120;
     std::size_t decode_threads = 8;
@@ -249,6 +252,8 @@ int main(int argc, char** argv) {
         } else if (arg == "--timeout-ms") {
             capture_options.timeout_ms = std::stoi(next_arg("--timeout-ms"));
             timeout_specified = true;
+        } else if (arg == "--pcap-loop") {
+            demo_pcap_loop = (next_arg("--pcap-loop") == "true");
         } else if (arg == "--queue-packets") {
             queue_packets = static_cast<std::size_t>(std::stoull(next_arg("--queue-packets")));
         } else if (arg == "--decode-threads") {
@@ -316,6 +321,7 @@ int main(int argc, char** argv) {
         startup_config.iface = iface;
         startup_config.demo_pcap_path = demo_pcap_path;
         startup_config.demo_pcap_speed = demo_pcap_speed;
+        startup_config.demo_pcap_loop = demo_pcap_loop;
         startup_config.snaplen = capture_options.snaplen;
         startup_config.timeout_ms = capture_options.timeout_ms;
         startup_config.timeout_enabled = timeout_specified;
@@ -361,6 +367,102 @@ int main(int argc, char** argv) {
             }
         }
 
+        struct startup_background_replay_t {
+            bool enabled = false;
+            volatile sig_atomic_t stop_flag = 0;
+            fh_packet_queue_t* queue = nullptr;
+            std::unordered_map<fh_memory_key_t, fh_oran_memory_t*> memories;
+            std::vector<fh_memory_key_t> discovered_keys;
+            fh_oran_memory_t* display_memory = nullptr;
+            std::mutex memories_mutex;
+            std::mutex memory_data_mutex;
+        } startup_background;
+
+        const std::string startup_background_pcap_path = "../src/capture/KlarweinXP.pcap";
+        if (visualizer != nullptr && std::filesystem::exists(startup_background_pcap_path)) {
+            startup_background.enabled = true;
+            startup_background.queue = fh_packet_queue_create(queue_packets, queue_bytes);
+            if (startup_background.queue == nullptr) {
+                startup_background.enabled = false;
+            }
+        }
+
+        std::thread startup_background_capture_thread;
+        std::vector<std::thread> startup_background_decode_workers;
+
+        if (startup_background.enabled) {
+            startup_background_capture_thread = std::thread([&] {
+                char errbuf[256] = {0};
+                int rc = 0;
+                fh_pcap_stream_options_t bg_options{};
+                bg_options.pcap_path = startup_background_pcap_path.c_str();
+                bg_options.demo_pcap_timeout = 1.0 / 100.0;
+
+                while (rc == 0 && startup_background.stop_flag == 0) {
+                    rc = fh_pcap_stream_run(
+                        &bg_options,
+                        queue_callback,
+                        startup_background.queue,
+                        &startup_background.stop_flag,
+                        errbuf,
+                        sizeof(errbuf));
+                    if (rc != 0) {
+                        break;
+                    }
+
+                    wait_for_queue_drain(startup_background.queue);
+                    advance_all_memory_loops(startup_background.memories, startup_background.memories_mutex);
+                }
+
+                if (rc != 0) {
+                    std::cerr << "startup background capture error: " << errbuf << '\n';
+                }
+                startup_background.stop_flag = 1;
+                fh_packet_queue_notify_all(startup_background.queue);
+            });
+
+            startup_background_decode_workers.emplace_back([&] {
+                while (startup_background.stop_flag == 0) {
+                    fh_packet_t pkt{};
+                    if (fh_packet_queue_pop(startup_background.queue, &pkt, &startup_background.stop_flag) > 0) {
+                        fh_memory_manage(
+                            &pkt,
+                            startup_background.memories,
+                            startup_background.discovered_keys,
+                            startup_background.display_memory,
+                            memory_symbols,
+                            scs_khz,
+                            false,
+                            9,
+                            16,
+                            "NONE",
+                            startup_background.memories_mutex,
+                            startup_background.memory_data_mutex);
+                    }
+                }
+
+                for (;;) {
+                    fh_packet_t pkt{};
+                    if (fh_packet_queue_pop(startup_background.queue, &pkt, &startup_background.stop_flag) <= 0) {
+                        break;
+                    }
+                    fh_memory_manage(
+                        &pkt,
+                        startup_background.memories,
+                        startup_background.discovered_keys,
+                        startup_background.display_memory,
+                        memory_symbols,
+                        scs_khz,
+                        false,
+                        9,
+                        16,
+                        "NONE",
+                        startup_background.memories_mutex,
+                        startup_background.memory_data_mutex);
+                }
+            });
+        }
+
         fh_startup_interface_state_t* startup_state = nullptr;
         if (argc == 1) {
             startup_state = imgui_startup_init(&startup_config);
@@ -369,36 +471,45 @@ int main(int argc, char** argv) {
             }
 
             if (visualizer != nullptr && imgui_state != nullptr && startup_state != nullptr) {
+                int startup_render_result = 0;
                 bool startup_complete = false;
                 while (visualizer_is_running(visualizer) && g_stop == 0 && !startup_complete) {
-                    if (visualizer_update(visualizer, nullptr) < 0) {
-                        g_stop = 1;
-                        break;
-                    }
+                    if (startup_background.enabled && startup_background.display_memory != nullptr) {
+                        startup_render_result = visualizer_update(visualizer, startup_background.display_memory);
+                        if (startup_render_result < 0) {
+                            g_stop = 1;
+                            break;
+                        }
+                    } else {
+                        if (visualizer_update(visualizer, nullptr) < 0) {
+                            g_stop = 1;
+                            break;
+                        }
 
-                    // Draw orange background behind the ImGui startup window
-                    glMatrixMode(GL_PROJECTION);
-                    glPushMatrix();
-                    glLoadIdentity();
-                    glOrtho(0, 800, 600, 0, -1, 1);
-                    glMatrixMode(GL_MODELVIEW);
-                    glPushMatrix();
-                    glLoadIdentity();
-                    
-                    glDisable(GL_TEXTURE_2D);
-                    glBegin(GL_QUADS);
-                    glColor3f(1.0f, 0.5f, 0.0f);
-                    glVertex2f(0, 0);
-                    glVertex2f(800, 0);
-                    glVertex2f(800, 600);
-                    glVertex2f(0, 600);
-                    glEnd();
-                    
-                    glMatrixMode(GL_PROJECTION);
-                    glPopMatrix();
-                    glMatrixMode(GL_MODELVIEW);
-                    glPopMatrix();
-                    glColor3f(1.0f, 1.0f, 1.0f);
+                        // Draw orange background behind the ImGui startup window
+                        glMatrixMode(GL_PROJECTION);
+                        glPushMatrix();
+                        glLoadIdentity();
+                        glOrtho(0, 800, 600, 0, -1, 1);
+                        glMatrixMode(GL_MODELVIEW);
+                        glPushMatrix();
+                        glLoadIdentity();
+
+                        glDisable(GL_TEXTURE_2D);
+                        glBegin(GL_QUADS);
+                        glColor3f(1.0f, 0.5f, 0.0f);
+                        glVertex2f(0, 0);
+                        glVertex2f(800, 0);
+                        glVertex2f(800, 600);
+                        glVertex2f(0, 600);
+                        glEnd();
+
+                        glMatrixMode(GL_PROJECTION);
+                        glPopMatrix();
+                        glMatrixMode(GL_MODELVIEW);
+                        glPopMatrix();
+                        glColor3f(1.0f, 1.0f, 1.0f);
+                    }
 
                     startup_complete = imgui_startup_render(startup_state, &startup_config, 800, 600);
                     imgui_visualizer_present();
@@ -413,11 +524,35 @@ int main(int argc, char** argv) {
                 glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
             }
 
+            if (startup_background.enabled) {
+                startup_background.stop_flag = 1;
+                fh_packet_queue_notify_all(startup_background.queue);
+                if (startup_background_capture_thread.joinable()) {
+                    startup_background_capture_thread.join();
+                }
+                for (auto& worker : startup_background_decode_workers) {
+                    if (worker.joinable()) {
+                        worker.join();
+                    }
+                }
+                for (auto& entry : startup_background.memories) {
+                    if (entry.second != nullptr) {
+                        fh_oran_memory_destroy(entry.second);
+                        entry.second = nullptr;
+                    }
+                }
+                if (startup_background.queue != nullptr) {
+                    fh_packet_queue_destroy(startup_background.queue);
+                    startup_background.queue = nullptr;
+                }
+            }
+
             imgui_startup_shutdown(startup_state);
 
             iface = startup_config.iface;
             demo_pcap_path = startup_config.demo_pcap_path;
             demo_pcap_speed = startup_config.demo_pcap_speed;
+            demo_pcap_loop = startup_config.demo_pcap_loop;
             capture_options.snaplen = startup_config.snaplen;
             if (startup_config.timeout_enabled) {
                 capture_options.timeout_ms = startup_config.timeout_ms;
@@ -466,9 +601,8 @@ int main(int argc, char** argv) {
                 fh_pcap_stream_options_t demo_options{};
                 demo_options.pcap_path = demo_pcap_path.c_str();
                 demo_options.demo_pcap_timeout = 1.0 / static_cast<double>(demo_pcap_speed);
-                // If timeout is disabled (capture_options.timeout_ms == 0), keep replaying the pcap
-                // instead of exiting when the file ends.
-                if (capture_options.timeout_ms == 0) {
+                // Looping is controlled by the demo_pcap_loop flag.
+                if (demo_pcap_loop) {
                     rc = 0;
                     while (rc == 0 && g_stop == 0) {
                         rc = fh_pcap_stream_run(
@@ -524,7 +658,7 @@ int main(int argc, char** argv) {
             if (rc != 0) {
                 std::cerr << "capture error: " << errbuf << '\n';
                 g_stop = 1;
-            } else if (capture_options.timeout_ms != 0) {
+            } else if (!demo_pcap_loop) {
                 // If not in looping mode for pcap replay, stop when capture finishes cleanly.
                 g_stop = 1;
             }
