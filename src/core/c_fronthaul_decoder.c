@@ -11,6 +11,27 @@
 
 #include "bfp_decompress.h"
 
+enum {
+    FH_PHY_TAP_PACKET_MAGIC = 0x46505450u,
+};
+
+struct fh_phy_tap_packet_header {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t reserved;
+    uint32_t eaxc_id;
+    uint32_t frame_id;
+    uint32_t subframe_id;
+    uint32_t slot_id;
+    uint32_t symbol_id;
+    uint32_t numerology;
+    uint32_t stream_index;
+    uint32_t sample_count;
+    uint32_t start_prbu;
+    uint32_t num_prbu;
+    uint64_t timestamp_ns;
+} __attribute__((packed));
+
 struct ecpri_common_header {
     uint8_t concat_ind : 1;
     uint8_t reserved : 3;
@@ -72,6 +93,68 @@ int fh_decode_packet(const fh_packet_t* raw_pkt, fh_decoded_packet_t* decoded_pk
     decoded_pkt->section_count = 0;
 
     if (raw_pkt->data != NULL && raw_pkt->caplen > 0) {
+        if (raw_pkt->caplen >= sizeof(struct fh_phy_tap_packet_header)) {
+            const struct fh_phy_tap_packet_header* phy_tap = (const struct fh_phy_tap_packet_header*)raw_pkt->data;
+            if (phy_tap->magic == FH_PHY_TAP_PACKET_MAGIC && phy_tap->version == 1) {
+                const size_t iq_pairs = (size_t)phy_tap->sample_count;
+                const size_t iq_bytes = iq_pairs * sizeof(uint16_t) * 2U;
+                const size_t expected_bytes = sizeof(struct fh_phy_tap_packet_header) + iq_bytes;
+                if (raw_pkt->caplen < expected_bytes) {
+                    return -1;
+                }
+
+                decoded_pkt->sections = calloc(1, sizeof(*decoded_pkt->sections));
+                if (decoded_pkt->sections == NULL) {
+                    return -1;
+                }
+
+                size_t prb_count = (size_t)phy_tap->num_prbu;
+                if (prb_count == 0) {
+                    prb_count = (iq_pairs + 11U) / 12U;
+                    if (prb_count == 0) {
+                        prb_count = 1;
+                    }
+                }
+                if (prb_count > 273U) {
+                    prb_count = 273U;
+                }
+
+                const size_t iq_count = prb_count * 12U;
+                decoded_pkt->sections[0].iq_data = calloc(iq_count, sizeof(*decoded_pkt->sections[0].iq_data));
+                if (decoded_pkt->sections[0].iq_data == NULL) {
+                    free(decoded_pkt->sections);
+                    decoded_pkt->sections = NULL;
+                    return -1;
+                }
+
+                decoded_pkt->sections[0].eaxc_id = (uint16_t)(phy_tap->eaxc_id & 0xFFFFu);
+                decoded_pkt->sections[0].data_direction = 0;
+                decoded_pkt->sections[0].frame_id = (uint8_t)(phy_tap->frame_id & 0xFFu);
+                decoded_pkt->sections[0].subframe_id = (uint8_t)(phy_tap->subframe_id & 0x0Fu);
+                decoded_pkt->sections[0].slot_id = (uint8_t)(phy_tap->slot_id & 0x3Fu);
+                decoded_pkt->sections[0].start_symbol_id = (uint8_t)(phy_tap->symbol_id & 0x3Fu);
+                decoded_pkt->sections[0].start_prbu = (uint16_t)(phy_tap->start_prbu & 0x03FFu);
+                decoded_pkt->sections[0].num_prbu = (uint16_t)prb_count;
+                decoded_pkt->section_count = 1;
+
+                const uint8_t* iq_payload = raw_pkt->data + sizeof(struct fh_phy_tap_packet_header);
+                size_t samples_to_copy = iq_pairs;
+                if (samples_to_copy > iq_count) {
+                    samples_to_copy = iq_count;
+                }
+
+                for (size_t i = 0; i < samples_to_copy; ++i) {
+                    const uint16_t i_raw = (uint16_t)((uint16_t)iq_payload[i * 4 + 0] | ((uint16_t)iq_payload[i * 4 + 1] << 8));
+                    const uint16_t q_raw = (uint16_t)((uint16_t)iq_payload[i * 4 + 2] | ((uint16_t)iq_payload[i * 4 + 3] << 8));
+                    const int16_t i_s = (int16_t)i_raw;
+                    const int16_t q_s = (int16_t)q_raw;
+                    decoded_pkt->sections[0].iq_data[i] = (float)i_s + I * (float)q_s;
+                }
+
+                return 0;
+            }
+        }
+
         uint8_t *packet = raw_pkt->data;
 
         // Handle Ethernet header

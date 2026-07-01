@@ -1,6 +1,7 @@
 #include "capture/c_capture_socket_mode.h"
 #include "capture/c_pcap_demo_stream.h"
 #include "capture/c_capture_loopback_mode.h"
+#include "capture/c_capture_ocudu_phy_tap.h"
 #include "core/c_fronthaul_decoder.h"
 #include "core/c_oran_memory.h"
 #include "pipeline/c_packet_queue.h"
@@ -647,6 +648,17 @@ int main(int argc, char** argv) {
                 loopback_options.filter_direction = channel_direction;
                 rc = fh_capture_loopback_run(
                     &loopback_options,
+                    queue_callback,
+                    queue,
+                    &g_stop,
+                    errbuf,
+                    sizeof(errbuf));
+            } else if (iface == "ocudu phy tap") {
+                fh_capture_ocudu_phy_tap_options_t phy_tap_options{};
+                phy_tap_options.queue_name = ocudu_phy_tap_queue_name.c_str();
+                phy_tap_options.poll_sleep_ms = 1;
+                rc = fh_capture_ocudu_phy_tap_run(
+                    &phy_tap_options,
                     queue_callback,
                     queue,
                     &g_stop,
