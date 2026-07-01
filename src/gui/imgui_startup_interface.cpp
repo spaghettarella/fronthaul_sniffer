@@ -18,6 +18,7 @@ struct fh_startup_interface_state {
     std::vector<std::string> interfaces;
     int selected_interface_index;
     std::array<char, 512> demo_pcap_path_buffer;
+    std::array<char, 256> ocudu_phy_tap_queue_buffer;
 };
 
 namespace {
@@ -89,6 +90,7 @@ bool open_file_dialog(std::string& selected_path, const std::string& initial_pat
 std::vector<std::string> scan_interfaces() {
     std::vector<std::string> interfaces;
     interfaces.emplace_back("pcap");
+    interfaces.emplace_back("ocudu phy tap");
 
     char errbuf[PCAP_ERRBUF_SIZE] = {0};
     pcap_if_t* alldevs = nullptr;
@@ -131,9 +133,11 @@ fh_startup_interface_state_t* imgui_startup_init(const fh_startup_config_t* init
     if (initial_config != nullptr) {
         state->selected_interface_index = find_interface_index(state->interfaces, initial_config->iface);
         (void)snprintf(state->demo_pcap_path_buffer.data(), state->demo_pcap_path_buffer.size(), "%s", initial_config->demo_pcap_path.c_str());
+        (void)snprintf(state->ocudu_phy_tap_queue_buffer.data(), state->ocudu_phy_tap_queue_buffer.size(), "%s", initial_config->ocudu_phy_tap_queue_name.c_str());
     } else {
         state->selected_interface_index = 0;
         (void)snprintf(state->demo_pcap_path_buffer.data(), state->demo_pcap_path_buffer.size(), "%s", "../src/capture/demo.pcap");
+        (void)snprintf(state->ocudu_phy_tap_queue_buffer.data(), state->ocudu_phy_tap_queue_buffer.size(), "%s", "/ocudu_phy_tap_queue");
     }
 
     return state;
@@ -237,6 +241,13 @@ bool imgui_startup_render(
         ImGui::Checkbox("Loop PCAP playback", &config->demo_pcap_loop);
         ImGui::SameLine();
         ImGui::TextDisabled("enabled by default");
+        
+    } else if (config->iface == "ocudu phy tap") {
+        ImGui::SetNextItemWidth(448.0f);
+        ImGui::InputText("PHY tap queue name", state->ocudu_phy_tap_queue_buffer.data(), state->ocudu_phy_tap_queue_buffer.size());
+        config->ocudu_phy_tap_queue_name = state->ocudu_phy_tap_queue_buffer.data();
+        ImGui::SameLine();
+        ImGui::TextDisabled("shared-memory queue name");
     }
 
     ImGui::Spacing();

@@ -90,6 +90,7 @@ void print_usage(const char* argv0) {
         << "  --ud-iq-width-decompressed <bits>     Width of user data IQ samples after decompression (default: 16)\n"
         << "  --ud-comp-method <method>             Compression method for user data (NONE or BFP; default: NONE)\n"
         << "  --scs-khz <value>                     Subcarrier spacing in kHz (default: 30)\n"
+        << "  --ocudu-phy-tap-queue-name <name>     Shared-memory queue name for ocudu phy tap (default: /ocudu_phy_tap_queue)\n"
         << "  --demo-pcap <path> <speed>            Stream packets from a pcap file in <path> (instead of live capture) with <speed> packets per second\n"
         << "  --help, -h                            Show this help message\n";
 }
@@ -179,6 +180,7 @@ int main(int argc, char** argv) {
     std::string demo_pcap_path = "../src/capture/demo.pcap";
     int demo_pcap_speed = 25;
     bool demo_pcap_loop = true;
+    std::string ocudu_phy_tap_queue_name = "/ocudu_phy_tap_queue";
 
     std::size_t memory_symbols = 1120;
     std::size_t decode_threads = 8;
@@ -273,6 +275,8 @@ int main(int argc, char** argv) {
             ud_comp_method = next_arg("--ud-comp-method");
         } else if (arg == "--scs-khz") {
             scs_khz = std::stoi(next_arg("--scs-khz"));
+        } else if (arg == "--ocudu-phy-tap-queue-name") {
+            ocudu_phy_tap_queue_name = next_arg("--ocudu-phy-tap-queue-name");
         } else if (arg == "--demo-pcap") {
             // Support `--demo-pcap` with optional <path> and optional <speed>.
             // With no arguments, use the default path relative to `build/`.
@@ -322,6 +326,7 @@ int main(int argc, char** argv) {
         startup_config.demo_pcap_path = demo_pcap_path;
         startup_config.demo_pcap_speed = demo_pcap_speed;
         startup_config.demo_pcap_loop = demo_pcap_loop;
+        startup_config.ocudu_phy_tap_queue_name = ocudu_phy_tap_queue_name;
         startup_config.snaplen = capture_options.snaplen;
         startup_config.timeout_ms = capture_options.timeout_ms;
         startup_config.timeout_enabled = timeout_specified;
@@ -553,6 +558,7 @@ int main(int argc, char** argv) {
             demo_pcap_path = startup_config.demo_pcap_path;
             demo_pcap_speed = startup_config.demo_pcap_speed;
             demo_pcap_loop = startup_config.demo_pcap_loop;
+            ocudu_phy_tap_queue_name = startup_config.ocudu_phy_tap_queue_name;
             capture_options.snaplen = startup_config.snaplen;
             if (startup_config.timeout_enabled) {
                 capture_options.timeout_ms = startup_config.timeout_ms;
