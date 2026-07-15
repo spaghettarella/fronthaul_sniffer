@@ -23,7 +23,7 @@ namespace {
 struct shared_symbol_record_header
 {
   uint32_t magic        = 0x50595450;
-  uint16_t version      = 1;
+  uint16_t version      = 2;
   uint16_t reserved     = 0;
   uint32_t eaxc_id      = 0;
   uint32_t frame_id     = 0;
@@ -33,6 +33,19 @@ struct shared_symbol_record_header
   uint32_t numerology   = 0;
   uint32_t stream_index = 0;
   uint32_t sample_count = 0;
+  /// O-RAN data direction of the tapped samples. 0 = uplink, 1 = downlink (matches ocudu::ofh::data_direction). The
+  /// PHY tap only ever observes uplink symbols, so this is always 0.
+  uint8_t  data_direction     = 0;
+  /// Bit width of each I or Q component in the payload (16 for the bfloat16 samples produced by the tap).
+  uint8_t  iq_bit_width       = 16;
+  /// IQ compression method of the payload (matches ocudu::ofh::compression_type). 0 = none: samples are stored
+  /// uncompressed, as raw bfloat16 (not O-RAN BFP-compressed fixed point).
+  uint8_t  compression_method = 0;
+  uint8_t  reserved2          = 0;
+  /// First physical resource block (PRB) index covered by this record.
+  uint32_t start_prbu   = 0;
+  /// Number of PRBs covered by this record.
+  uint32_t num_prbu     = 0;
   uint64_t sequence     = 0;
   uint64_t timestamp_ns = 0;
 };
@@ -174,6 +187,11 @@ void write_line(std::ostream& out, const shared_symbol_record_header& header, ui
       << " numerology=" << header.numerology
       << " stream=" << header.stream_index
       << " samples=" << header.sample_count
+      << " direction=" << (header.data_direction == 0 ? "ul" : "dl")
+      << " start_prbu=" << header.start_prbu
+      << " num_prbu=" << header.num_prbu
+      << " iq_bit_width=" << static_cast<unsigned>(header.iq_bit_width)
+      << " compression=" << static_cast<unsigned>(header.compression_method)
       << " ts_ns=" << header.timestamp_ns
       << " dropped=" << dropped_count
       << '\n';

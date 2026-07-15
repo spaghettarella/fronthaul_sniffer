@@ -7,14 +7,14 @@ It opens the same POSIX shared-memory object that the tap producer creates via `
 ## Build
 
 ```bash
-cmake -S src/capture/ocudu_phy_tap_queue_drain -B build/ocudu_phy_tap_queue_drain
-cmake --build build/ocudu_phy_tap_queue_drain -j2
+cmake -S tools/queue_drain -B build/queue_drain
+cmake --build build/queue_drain -j2
 ```
 
 ## Run
 
 ```bash
-./build/ocudu_phy_tap_queue_drain/queue_drain --queue-name=/ocudu_phy_tap_queue --max-records=1000
+./build/queue_drain/queue_drain --queue-name=/ocudu_phy_tap_queue --max-records=1000
 ```
 
 Optional flags:

@@ -23,6 +23,7 @@ struct fh_startup_config_t {
     int ud_iq_width_decompressed = 16;
     std::string ud_comp_method = "BFP";
     int scs_khz = 30;
+    bool phy_tap_scs_override = true;
     bool channel_has_eaxc = false;
     int channel_du_port_id = 0;
     int channel_band_sector_id = 0;

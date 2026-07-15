@@ -26,6 +26,12 @@ typedef struct fh_section {
     uint8_t start_symbol_id;
     uint16_t start_prbu;
     uint16_t num_prbu;
+    /// 3GPP numerology (mu) of this section, e.g. 1 => 30 kHz SCS. Only populated when the source
+    /// capture reports it directly (currently the ocudu PHY tap); see has_numerology.
+    uint8_t numerology;
+    /// Whether numerology was reported by the source capture. Ethernet/eCPRI O-RAN frames don't
+    /// carry numerology in the U-Plane header, so this stays 0 for those.
+    uint8_t has_numerology;
     fh_complex_t *iq_data;
 } fh_section_t;
 

@@ -349,6 +349,12 @@ bool imgui_startup_render(
     ImGui::SameLine();
     ImGui::TextDisabled("subcarrier spacing (default 30, values 15/30/60/120/240)");
 
+    if (config->iface == "ocudu phy tap") {
+        ImGui::Checkbox("Override SCS from PHY tap numerology", &config->phy_tap_scs_override);
+        ImGui::SameLine();
+        ImGui::TextDisabled("use each record's own numerology instead of the SCS above");
+    }
+
     ImGui::Spacing();
     ImGui::SeparatorText("Channel filter");
     ImGui::Checkbox("Filter by eAxC ID", &config->channel_has_eaxc);

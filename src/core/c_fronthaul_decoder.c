@@ -13,6 +13,7 @@
 
 enum {
     FH_PHY_TAP_PACKET_MAGIC = 0x46505450u,
+    FH_PHY_TAP_PACKET_VERSION = 2,
 };
 
 struct fh_phy_tap_packet_header {
@@ -29,6 +30,13 @@ struct fh_phy_tap_packet_header {
     uint32_t sample_count;
     uint32_t start_prbu;
     uint32_t num_prbu;
+    /// O-RAN data direction of the tapped samples. 0 = uplink, 1 = downlink.
+    uint8_t data_direction;
+    /// Bit width of each I or Q component in the payload.
+    uint8_t iq_bit_width;
+    /// IQ compression method of the payload (matches ocudu::ofh::compression_type). 0 = none.
+    uint8_t compression_method;
+    uint8_t reserved2;
     uint64_t timestamp_ns;
 } __attribute__((packed));
 
@@ -95,11 +103,17 @@ int fh_decode_packet(const fh_packet_t* raw_pkt, fh_decoded_packet_t* decoded_pk
     if (raw_pkt->data != NULL && raw_pkt->caplen > 0) {
         if (raw_pkt->caplen >= sizeof(struct fh_phy_tap_packet_header)) {
             const struct fh_phy_tap_packet_header* phy_tap = (const struct fh_phy_tap_packet_header*)raw_pkt->data;
-            if (phy_tap->magic == FH_PHY_TAP_PACKET_MAGIC && phy_tap->version == 1) {
+            if (phy_tap->magic == FH_PHY_TAP_PACKET_MAGIC && phy_tap->version == FH_PHY_TAP_PACKET_VERSION) {
                 const size_t iq_pairs = (size_t)phy_tap->sample_count;
                 const size_t iq_bytes = iq_pairs * sizeof(uint16_t) * 2U;
                 const size_t expected_bytes = sizeof(struct fh_phy_tap_packet_header) + iq_bytes;
                 if (raw_pkt->caplen < expected_bytes) {
+                    return -1;
+                }
+                if (phy_tap->compression_method != 0 || phy_tap->iq_bit_width != 16) {
+                    // The raw sample copy below assumes uncompressed 16-bit I/Q components, matching what the
+                    // ocudu PHY tap currently produces. A different compression method or bit width would need
+                    // its own decode path (e.g. bfp_decompress_prb) rather than the raw int16 copy used here.
                     return -1;
                 }
 
@@ -128,13 +142,15 @@ int fh_decode_packet(const fh_packet_t* raw_pkt, fh_decoded_packet_t* decoded_pk
                 }
 
                 decoded_pkt->sections[0].eaxc_id = (uint16_t)(phy_tap->eaxc_id & 0xFFFFu);
-                decoded_pkt->sections[0].data_direction = 0;
+                decoded_pkt->sections[0].data_direction = phy_tap->data_direction;
                 decoded_pkt->sections[0].frame_id = (uint8_t)(phy_tap->frame_id & 0xFFu);
                 decoded_pkt->sections[0].subframe_id = (uint8_t)(phy_tap->subframe_id & 0x0Fu);
                 decoded_pkt->sections[0].slot_id = (uint8_t)(phy_tap->slot_id & 0x3Fu);
                 decoded_pkt->sections[0].start_symbol_id = (uint8_t)(phy_tap->symbol_id & 0x3Fu);
                 decoded_pkt->sections[0].start_prbu = (uint16_t)(phy_tap->start_prbu & 0x03FFu);
                 decoded_pkt->sections[0].num_prbu = (uint16_t)prb_count;
+                decoded_pkt->sections[0].numerology = (uint8_t)(phy_tap->numerology & 0xFFu);
+                decoded_pkt->sections[0].has_numerology = 1;
                 decoded_pkt->section_count = 1;
 
                 const uint8_t* iq_payload = raw_pkt->data + sizeof(struct fh_phy_tap_packet_header);

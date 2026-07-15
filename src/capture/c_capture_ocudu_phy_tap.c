@@ -14,7 +14,9 @@
 enum {
 	FH_PHY_TAP_STATE_MAGIC = 0x52534250u,
 	FH_PHY_TAP_RECORD_MAGIC = 0x50595450u,
+	FH_PHY_TAP_RECORD_VERSION = 2,
 	FH_PHY_TAP_PACKET_MAGIC = 0x46505450u,
+	FH_PHY_TAP_PACKET_VERSION = 2,
 };
 
 typedef struct fh_phy_tap_state_header {
@@ -41,6 +43,17 @@ typedef struct fh_phy_tap_record_header {
 	uint32_t numerology;
 	uint32_t stream_index;
 	uint32_t sample_count;
+	/// O-RAN data direction of the tapped samples. 0 = uplink, 1 = downlink (matches ocudu::ofh::data_direction).
+	uint8_t data_direction;
+	/// Bit width of each I or Q component in the payload.
+	uint8_t iq_bit_width;
+	/// IQ compression method of the payload (matches ocudu::ofh::compression_type). 0 = none.
+	uint8_t compression_method;
+	uint8_t reserved2;
+	/// First physical resource block (PRB) index covered by this record.
+	uint32_t start_prbu;
+	/// Number of PRBs covered by this record.
+	uint32_t num_prbu;
 	uint64_t sequence;
 	uint64_t timestamp_ns;
 } fh_phy_tap_record_header_t;
@@ -59,8 +72,12 @@ typedef struct fh_phy_tap_packet_header {
 	uint32_t sample_count;
 	uint32_t start_prbu;
 	uint32_t num_prbu;
+	uint8_t data_direction;
+	uint8_t iq_bit_width;
+	uint8_t compression_method;
+	uint8_t reserved2;
 	uint64_t timestamp_ns;
-} fh_phy_tap_packet_header_t;
+} __attribute__((packed)) fh_phy_tap_packet_header_t;
 
 typedef struct fh_mapped_queue {
 	int fd;
@@ -215,7 +232,8 @@ int fh_capture_ocudu_phy_tap_run(
 		const uint8_t* slot_address = records_base + slot_index * record_stride;
 		const fh_phy_tap_record_header_t* record = (const fh_phy_tap_record_header_t*)slot_address;
 
-		if (record->magic != FH_PHY_TAP_RECORD_MAGIC || record->sample_count != state->sample_count || record->sequence != read_seq) {
+		if (record->magic != FH_PHY_TAP_RECORD_MAGIC || record->version != FH_PHY_TAP_RECORD_VERSION ||
+			record->sample_count != state->sample_count || record->sequence != read_seq) {
 			struct timespec delay;
 			delay.tv_sec = 0;
 			delay.tv_nsec = 1000L * 1000L;
@@ -226,7 +244,7 @@ int fh_capture_ocudu_phy_tap_run(
 		fh_phy_tap_packet_header_t* out_hdr = (fh_phy_tap_packet_header_t*)packet_storage;
 		memset(out_hdr, 0, sizeof(*out_hdr));
 		out_hdr->magic = FH_PHY_TAP_PACKET_MAGIC;
-		out_hdr->version = 1;
+		out_hdr->version = FH_PHY_TAP_PACKET_VERSION;
 		out_hdr->eaxc_id = record->eaxc_id;
 		out_hdr->frame_id = record->frame_id;
 		out_hdr->subframe_id = record->subframe_id;
@@ -235,14 +253,20 @@ int fh_capture_ocudu_phy_tap_run(
 		out_hdr->numerology = record->numerology;
 		out_hdr->stream_index = record->stream_index;
 		out_hdr->sample_count = record->sample_count;
-		out_hdr->start_prbu = 0;
-		out_hdr->num_prbu = (record->sample_count + 11U) / 12U;
+		out_hdr->start_prbu = record->start_prbu;
+		out_hdr->num_prbu = record->num_prbu;
 		if (out_hdr->num_prbu == 0) {
-			out_hdr->num_prbu = 1;
+			out_hdr->num_prbu = (record->sample_count + 11U) / 12U;
+			if (out_hdr->num_prbu == 0) {
+				out_hdr->num_prbu = 1;
+			}
 		}
 		if (out_hdr->num_prbu > 273U) {
 			out_hdr->num_prbu = 273U;
 		}
+		out_hdr->data_direction = record->data_direction;
+		out_hdr->iq_bit_width = record->iq_bit_width;
+		out_hdr->compression_method = record->compression_method;
 		out_hdr->timestamp_ns = record->timestamp_ns;
 
 		memcpy(packet_storage + sizeof(*out_hdr), slot_address + sizeof(*record), iq_bytes);

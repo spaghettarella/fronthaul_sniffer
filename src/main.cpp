@@ -43,6 +43,15 @@ startup_eaxc_fields_t unpack_startup_eaxc(uint16_t eaxc_id) {
         static_cast<int>(eaxc_id & 0xFu),
     };
 }
+
+// 3GPP numerology mu => subcarrier spacing in kHz (mu 0..4 => 15..240 kHz). Returns -1 for an
+// out-of-range mu so the caller can fall back to the configured/CLI SCS instead of trusting it.
+int scs_khz_from_numerology(uint8_t numerology) {
+    if (numerology > 4) {
+        return -1;
+    }
+    return 15 << numerology;
+}
 }  // namespace
 
 // The memory key structs are defined in the GUI interface header
@@ -91,6 +100,8 @@ void print_usage(const char* argv0) {
         << "  --ud-iq-width-decompressed <bits>     Width of user data IQ samples after decompression (default: 16)\n"
         << "  --ud-comp-method <method>             Compression method for user data (NONE or BFP; default: NONE)\n"
         << "  --scs-khz <value>                     Subcarrier spacing in kHz (default: 30)\n"
+        << "  --phy-tap-scs-override <bool>         Override --scs-khz with the ocudu phy tap's per-record\n"
+        << "                                         numerology; has no effect on other capture backends (default: true)\n"
         << "  --ocudu-phy-tap-queue-name <name>     Shared-memory queue name for ocudu phy tap (default: /ocudu_phy_tap_queue)\n"
         << "  --demo-pcap <path> <speed>            Stream packets from a pcap file in <path> (instead of live capture) with <speed> packets per second\n"
         << "  --help, -h                            Show this help message\n";
@@ -109,6 +120,7 @@ int fh_memory_manage(
     fh_oran_memory_t*& display_memory,
     std::size_t memory_symbols,
     int scs_khz,
+    bool phy_tap_scs_override,
     bool ud_comp_hdr_present,
     int ud_iq_width,
     int ud_iq_width_decompressed,
@@ -124,7 +136,18 @@ int fh_memory_manage(
     int rc = fh_decode_packet(pkt, &decoded, ud_comp_hdr_present, ud_iq_width, ud_iq_width_decompressed, ud_comp_method);
     if (rc == 0 && decoded.section_count > 0 && decoded.sections != nullptr) {
         const fh_memory_key_t key{decoded.sections[0].eaxc_id, decoded.sections[0].data_direction};
-        
+
+        // The PHY tap reports the true numerology per record; prefer it over the CLI/GUI SCS
+        // unless the user disabled the override. Other capture backends never set has_numerology,
+        // so this only ever kicks in for phy-tap-sourced packets.
+        int effective_scs_khz = scs_khz;
+        if (phy_tap_scs_override && decoded.sections[0].has_numerology) {
+            const int numerology_scs_khz = scs_khz_from_numerology(decoded.sections[0].numerology);
+            if (numerology_scs_khz > 0) {
+                effective_scs_khz = numerology_scs_khz;
+            }
+        }
+
         fh_oran_memory_t* memory_buffer = nullptr;
         
         // Acquire map lock just for lookup/insert
@@ -149,7 +172,7 @@ int fh_memory_manage(
         // Save with global data lock
         if (memory_buffer != nullptr) {
             std::lock_guard<std::mutex> lock(memory_data_mutex);
-            fh_oran_memory_save(memory_buffer, &decoded, scs_khz);
+            fh_oran_memory_save(memory_buffer, &decoded, effective_scs_khz);
         }
     }
 
@@ -177,6 +200,7 @@ int main(int argc, char** argv) {
     int ud_iq_width_decompressed = 16;
     std::string ud_comp_method = "BFP";
     int scs_khz = 30;
+    bool phy_tap_scs_override = true;
     bool demo_pcap_enabled = false;
     std::string demo_pcap_path = "../src/capture/demo.pcap";
     int demo_pcap_speed = 25;
@@ -276,6 +300,8 @@ int main(int argc, char** argv) {
             ud_comp_method = next_arg("--ud-comp-method");
         } else if (arg == "--scs-khz") {
             scs_khz = std::stoi(next_arg("--scs-khz"));
+        } else if (arg == "--phy-tap-scs-override") {
+            phy_tap_scs_override = (next_arg("--phy-tap-scs-override") == "true");
         } else if (arg == "--ocudu-phy-tap-queue-name") {
             ocudu_phy_tap_queue_name = next_arg("--ocudu-phy-tap-queue-name");
         } else if (arg == "--demo-pcap") {
@@ -340,6 +366,7 @@ int main(int argc, char** argv) {
         startup_config.ud_iq_width_decompressed = ud_iq_width_decompressed;
         startup_config.ud_comp_method = ud_comp_method;
         startup_config.scs_khz = scs_khz;
+        startup_config.phy_tap_scs_override = phy_tap_scs_override;
         startup_config.channel_has_eaxc = channel_has_eaxc;
         if (channel_has_eaxc) {
             const startup_eaxc_fields_t channel_fields = unpack_startup_eaxc(channel_eaxc);
@@ -438,6 +465,7 @@ int main(int argc, char** argv) {
                             startup_background.display_memory,
                             memory_symbols,
                             scs_khz,
+                            phy_tap_scs_override,
                             false,
                             9,
                             16,
@@ -459,6 +487,7 @@ int main(int argc, char** argv) {
                         startup_background.display_memory,
                         memory_symbols,
                         scs_khz,
+                        phy_tap_scs_override,
                         false,
                         9,
                         16,
@@ -578,6 +607,7 @@ int main(int argc, char** argv) {
             ud_iq_width_decompressed = startup_config.ud_iq_width_decompressed;
             ud_comp_method = startup_config.ud_comp_method;
             scs_khz = startup_config.scs_khz;
+            phy_tap_scs_override = startup_config.phy_tap_scs_override;
             channel_has_eaxc = startup_config.channel_has_eaxc;
             channel_has_direction = startup_config.channel_has_direction;
             if (channel_has_eaxc) {
@@ -699,6 +729,7 @@ int main(int argc, char** argv) {
                             display_memory,
                             memory_symbols,
                             scs_khz,
+                            phy_tap_scs_override,
                             ud_comp_hdr_present,
                             ud_iq_width,
                             ud_iq_width_decompressed,
@@ -721,6 +752,7 @@ int main(int argc, char** argv) {
                         display_memory,
                         memory_symbols,
                         scs_khz,
+                        phy_tap_scs_override,
                         ud_comp_hdr_present,
                         ud_iq_width,
                         ud_iq_width_decompressed,
