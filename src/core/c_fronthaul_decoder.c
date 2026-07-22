@@ -110,10 +110,35 @@ int fh_decode_packet(const fh_packet_t* raw_pkt, fh_decoded_packet_t* decoded_pk
                 if (raw_pkt->caplen < expected_bytes) {
                     return -1;
                 }
-                if (phy_tap->compression_method != 0 || phy_tap->iq_bit_width != 16) {
-                    // The raw sample copy below assumes uncompressed 16-bit I/Q components, matching what the
-                    // ocudu PHY tap currently produces. A different compression method or bit width would need
-                    // its own decode path (e.g. bfp_decompress_prb) rather than the raw int16 copy used here.
+                if (phy_tap->compression_method != 0) {
+                    // ocudu self-reports its own compression method per record (matches
+                    // ocudu::ofh::compression_type; see fh_phy_tap_record_header_t in
+                    // c_capture_ocudu_phy_tap.c) - trust that rather than the CLI/UI's
+                    // --ud-comp-method, which describes the *fronthaul link's* compression,
+                    // not ocudu's internal tap point.
+                    //
+                    // However, the phy tap shared-memory queue always sizes its IQ payload as
+                    // a fixed sample_count * 4 bytes (2x uint16 per I/Q pair, see
+                    // c_capture_ocudu_phy_tap.c), unlike the network U-Plane path's tightly
+                    // bit-packed PRB layout, and fh_phy_tap_record_header_t has no dedicated
+                    // per-PRB exponent field. The actual compressed wire layout (exponent
+                    // placement, mantissa packing) is therefore not known here, so reject
+                    // rather than guess at a layout that could silently produce wrong IQ
+                    // values. Once the real layout is confirmed, this is where to call
+                    // bfp_decompress_prb, mirroring the network U-Plane path below.
+                    static int warned = 0;
+                    if (!warned) {
+                        fprintf(stderr,
+                                "Warning: phy tap reports compression_method=%u (iq_bit_width=%u); "
+                                "decoding this format is not yet implemented, dropping packet(s)\n",
+                                (unsigned)phy_tap->compression_method, (unsigned)phy_tap->iq_bit_width);
+                        warned = 1;
+                    }
+                    return -1;
+                }
+                if (phy_tap->iq_bit_width != 16) {
+                    // Raw/uncompressed phy tap samples are only supported at their native
+                    // 16-bit width; a different width would need its own unpacking logic.
                     return -1;
                 }
 

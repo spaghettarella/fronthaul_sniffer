@@ -1,6 +1,7 @@
 #include "imgui_visualizer_interface.h"
 #include "core/c_oran_memory.h"
 #include "pipeline/c_packet_queue.h"
+#include "visualization/opengl_visualizer.h"
 
 #include <imgui.h>
 #include <imgui_impl_glfw.h>
@@ -69,8 +70,9 @@ fh_oran_memory_t* imgui_visualizer_render(
     fh_oran_memory_t* current_display_memory,
     int window_width,
     int window_height,
-    fh_queue_stats_t stats) {
-    
+    fh_queue_stats_t stats,
+    opengl_visualizer_t* visualizer) {
+
     if (!state || !state->initialized || num_keys == 0) {
         return current_display_memory;
     }
@@ -290,6 +292,35 @@ fh_oran_memory_t* imgui_visualizer_render(
     ImGui::Text("Dropped packets: %llu", static_cast<unsigned long long>(stats.dropped_packets));
     ImGui::Text("Queued packets: %llu", static_cast<unsigned long long>(stats.queued_packets));
     ImGui::End();
+
+    // Rolling-mean persistence controls for the waterfall
+    if (visualizer != nullptr) {
+        ImGui::Begin("Waterfall Persistence", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
+
+        bool persist_enabled = visualizer_get_persistence_enabled(visualizer) != 0;
+        if (ImGui::Checkbox("Rolling mean (persistence)", &persist_enabled)) {
+            visualizer_set_persistence_enabled(visualizer, persist_enabled ? 1 : 0);
+        }
+
+        int period = visualizer_get_persistence_period(visualizer);
+        if (ImGui::InputInt("Averaging period (symbols)", &period)) {
+            visualizer_set_persistence_period(visualizer, period);
+        }
+
+        int n = visualizer_get_persistence_n(visualizer);
+        if (ImGui::InputInt("n (periods to average)", &n)) {
+            visualizer_set_persistence_n(visualizer, n);
+        }
+
+        if (ImGui::Button("Reset")) {
+            visualizer_reset_persistence(visualizer);
+        }
+
+        ImGui::TextDisabled("Tip: multiples of 14 align to slot boundaries");
+        ImGui::TextDisabled("(also multiples of slots/subframe*14, or *10 for frames)");
+
+        ImGui::End();
+    }
 
     // Pop the theme colors
     ImGui::PopStyleColor(9);

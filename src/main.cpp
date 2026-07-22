@@ -88,7 +88,7 @@ void print_usage(const char* argv0) {
         << "Usage: " << argv0 << " [options]\n"
         << "  --iface <name>                        Interface name (default: lo)\n"
         << "  --channel <eAxC_ID> <data_direction>  eAxC_ID (uint16) and data direction (UL/DL) to filter network capture before queue\n"
-        << "  --snaplen <bytes>                     Max captured bytes per packet (default: 10000)\n"
+        << "  --snaplen <bytes>                     Max captured bytes per packet for Jumbo Frames >9000 for Phy Tap no upper limit (default: 10000)\n"
         << "  --timeout-ms <ms>                     Read timeout in milliseconds (default: 100)\n"
         << "  --queue-packets <count>               Max packets buffered before processing (default: 4096)\n"
         << "  (NOTE) --snaplen will also set the queue-bytes value to the same number\n"
@@ -98,7 +98,7 @@ void print_usage(const char* argv0) {
         << "  --ud-comp-hdr-present <bool>          Whether user data compression header is present (default: false)\n"
         << "  --ud-iq-width <bits>                  Width of user data IQ samples (default: 9)\n"
         << "  --ud-iq-width-decompressed <bits>     Width of user data IQ samples after decompression (default: 16)\n"
-        << "  --ud-comp-method <method>             Compression method for user data (NONE or BFP; default: NONE)\n"
+        << "  --ud-comp-method <method>             Compression method for user data (NONE or BFP; default: BFP)\n"
         << "  --scs-khz <value>                     Subcarrier spacing in kHz (default: 30)\n"
         << "  --phy-tap-scs-override <bool>         Override --scs-khz with the ocudu phy tap's per-record\n"
         << "                                         numerology; has no effect on other capture backends (default: true)\n"
@@ -186,7 +186,7 @@ int main(int argc, char** argv) {
     fh_capture_socket_options_t capture_options{};
     std::string iface = "lo";
     capture_options.interface_name = iface.c_str();
-    capture_options.snaplen = 10000;
+    capture_options.snaplen = 20000;
     capture_options.timeout_ms = 100;
 
     std::size_t queue_packets = 4096;
@@ -788,6 +788,7 @@ int main(int argc, char** argv) {
 
                 // Render ImGui stream selection interface
                 if (imgui_state != nullptr && !keys_snapshot.empty()) {
+                    fh_oran_memory_t* previous_display_memory = display_memory;
                     display_memory = imgui_visualizer_render(
                         imgui_state,
                         keys_snapshot.data(),
@@ -796,7 +797,14 @@ int main(int argc, char** argv) {
                         display_memory,
                         1000,
                         800,
-                        stats);
+                        stats,
+                        visualizer);
+
+                    // A different eAxC/direction stream means accumulated
+                    // persistence averages no longer correspond to what's shown.
+                    if (display_memory != previous_display_memory) {
+                        visualizer_reset_persistence(visualizer);
+                    }
                 }
 
                 // Render heatmap visualization

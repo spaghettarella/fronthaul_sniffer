@@ -12,6 +12,7 @@ extern "C" {
 
 // Forward declarations
 struct fh_oran_memory;
+typedef struct opengl_visualizer opengl_visualizer_t;
 
 typedef struct fh_memory_key {
     uint16_t eaxc_id;
@@ -70,7 +71,8 @@ struct fh_oran_memory* imgui_visualizer_render(
     struct fh_oran_memory* current_display_memory,
     int window_width,
     int window_height,
-    fh_queue_stats_t stats);
+    fh_queue_stats_t stats,
+    opengl_visualizer_t* visualizer);
 
 // Shutdown ImGui and release resources
 void imgui_visualizer_shutdown(imgui_visualizer_state_t* state);

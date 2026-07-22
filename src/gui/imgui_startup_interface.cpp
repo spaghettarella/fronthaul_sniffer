@@ -255,7 +255,7 @@ bool imgui_startup_render(
     ImGui::InputInt("Snaplen (bytes)", &config->snaplen, 1, 1000);
     clamp_int(config->snaplen, 1, 1000000);
     ImGui::SameLine();
-    ImGui::TextDisabled("bytes reserved for each packet (>9000 for Jumbo Frames)");
+    ImGui::TextDisabled("bytes reserved for each packet (>9000 for Jumbo Frames, >20000 for PHY tap)");
 
     // Keep queue_bytes in code but combine in the GUI: set queue_bytes to snaplen
     config->queue_bytes = static_cast<unsigned long long>(config->snaplen);
