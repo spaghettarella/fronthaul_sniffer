@@ -17,6 +17,15 @@ struct imgui_visualizer_state {
     int selected_eaxc_id_index;
     uint8_t selected_data_direction;
     uint8_t prev_data_direction;
+
+    // Frame timing. The wire frame_id is only 8 bits, so it wraps every 256
+    // frames; the memory pairs it with a wraparound count. Accumulating the
+    // advance between samples here keeps a total that survives both that
+    // wrap and the counter being reset (which pcap replay does on each loop).
+    bool frame_tracking_initialized;
+    const void* frame_tracking_memory;
+    uint64_t last_absolute_frame;
+    uint64_t frames_since_start;
 };
 
 const char* data_direction_to_string(uint8_t data_direction) {
@@ -42,6 +51,10 @@ imgui_visualizer_state_t* imgui_visualizer_init(int window_width, int window_hei
     state->selected_eaxc_id_index = 0;
     state->selected_data_direction = 0;  // Default to UL
     state->prev_data_direction = 0;
+    state->frame_tracking_initialized = false;
+    state->frame_tracking_memory = nullptr;
+    state->last_absolute_frame = 0;
+    state->frames_since_start = 0;
 
     // Setup ImGui context
     IMGUI_CHECKVERSION();
@@ -286,40 +299,281 @@ fh_oran_memory_t* imgui_visualizer_render(
         ? (100.0 * static_cast<double>(stats.dropped_packets) / static_cast<double>(stats.total_packets))
         : 0.0;
 
+    // Sample the newest frame decoded for the stream on screen, and fold its
+    // advance into a running total. Reading these without the data lock
+    // matches how the renderer already samples the same memory each frame.
+    uint8_t current_frame_id = 0;
+    bool have_frame_info = false;
+    if (current_display_memory != nullptr) {
+        const fh_oran_memory_t* mem = current_display_memory;
+        current_frame_id = mem->last_frame_id;
+        have_frame_info = true;
+
+        const uint64_t absolute_frame = mem->frame_counter * 256ULL + static_cast<uint64_t>(mem->last_frame_id);
+        if (!state->frame_tracking_initialized || state->frame_tracking_memory != mem) {
+            // First sample, or the selection changed: re-baseline against the
+            // new stream's own numbering rather than counting the difference
+            // between two unrelated counters as elapsed frames.
+            state->frame_tracking_memory = mem;
+            state->frame_tracking_initialized = true;
+        } else if (absolute_frame > state->last_absolute_frame) {
+            state->frames_since_start += absolute_frame - state->last_absolute_frame;
+        }
+        // A decrease means the counter restarted (pcap replay loops reset it);
+        // adopt the new value without letting the total go backwards.
+        state->last_absolute_frame = absolute_frame;
+    }
+
     ImGui::Begin("Live Statistics", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
-    ImGui::Text("Packet drop rate: %.2f%%", dropped_pct);
-    ImGui::Text("Total packets: %llu", static_cast<unsigned long long>(stats.total_packets));
-    ImGui::Text("Dropped packets: %llu", static_cast<unsigned long long>(stats.dropped_packets));
-    ImGui::Text("Queued packets: %llu", static_cast<unsigned long long>(stats.queued_packets));
+
+    if (ImGui::CollapsingHeader("Data Query", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::Text("Packet drop rate: %.2f%%", dropped_pct);
+        ImGui::Text("Total packets: %llu", static_cast<unsigned long long>(stats.total_packets));
+        ImGui::Text("Dropped packets: %llu", static_cast<unsigned long long>(stats.dropped_packets));
+        ImGui::Text("Queued packets: %llu", static_cast<unsigned long long>(stats.queued_packets));
+    }
+
+    if (ImGui::CollapsingHeader("Timing Info", ImGuiTreeNodeFlags_DefaultOpen)) {
+        if (have_frame_info) {
+            ImGui::Text("Frame number: %u", static_cast<unsigned>(current_frame_id));
+            ImGui::Text("Frames since start: %llu",
+                        static_cast<unsigned long long>(state->frames_since_start));
+            ImGui::TextDisabled("Frame number wraps at 256; the total does not.");
+        } else {
+            ImGui::TextDisabled("No stream selected");
+        }
+    }
+
     ImGui::End();
 
-    // Rolling-mean persistence controls for the waterfall
+    // View mode selector, and the persistence window matching whichever view is active
     if (visualizer != nullptr) {
-        ImGui::Begin("Waterfall Persistence", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
+        ImGui::Begin("View Mode", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
 
-        bool persist_enabled = visualizer_get_persistence_enabled(visualizer) != 0;
-        if (ImGui::Checkbox("Rolling mean (persistence)", &persist_enabled)) {
-            visualizer_set_persistence_enabled(visualizer, persist_enabled ? 1 : 0);
+        visualizer_view_mode_t view_mode = visualizer_get_view_mode(visualizer);
+        int mode_int = (int)view_mode;
+        ImGui::RadioButton("Waterfall", &mode_int, VIEW_MODE_WATERFALL);
+        ImGui::SameLine();
+        ImGui::RadioButton("Curve", &mode_int, VIEW_MODE_CURVE);
+        if (mode_int != (int)view_mode) {
+            visualizer_set_view_mode(visualizer, (visualizer_view_mode_t)mode_int);
+            view_mode = (visualizer_view_mode_t)mode_int;
         }
-
-        int period = visualizer_get_persistence_period(visualizer);
-        if (ImGui::InputInt("Averaging period (symbols)", &period)) {
-            visualizer_set_persistence_period(visualizer, period);
-        }
-
-        int n = visualizer_get_persistence_n(visualizer);
-        if (ImGui::InputInt("n (periods to average)", &n)) {
-            visualizer_set_persistence_n(visualizer, n);
-        }
-
-        if (ImGui::Button("Reset")) {
-            visualizer_reset_persistence(visualizer);
-        }
-
-        ImGui::TextDisabled("Tip: multiples of 14 align to slot boundaries");
-        ImGui::TextDisabled("(also multiples of slots/subframe*14, or *10 for frames)");
 
         ImGui::End();
+
+        if (view_mode == VIEW_MODE_WATERFALL) {
+            ImGui::Begin("Waterfall Settings", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
+
+            bool persist_enabled = visualizer_get_persistence_enabled(visualizer) != 0;
+            if (ImGui::Checkbox("Rolling mean (persistence)", &persist_enabled)) {
+                visualizer_set_persistence_enabled(visualizer, persist_enabled ? 1 : 0);
+            }
+
+            int period = visualizer_get_persistence_period(visualizer);
+            if (ImGui::InputInt("Averaging period (symbols)", &period)) {
+                visualizer_set_persistence_period(visualizer, period);
+            }
+
+            int n = visualizer_get_persistence_n(visualizer);
+            if (ImGui::InputInt("n (periods to average)", &n)) {
+                visualizer_set_persistence_n(visualizer, n);
+            }
+
+            if (ImGui::Button("Reset")) {
+                visualizer_reset_persistence(visualizer);
+            }
+
+            ImGui::TextDisabled("Tip: multiples of 14 align to slot boundaries");
+            ImGui::TextDisabled("(also multiples of slots/subframe*14, or *10 for frames)");
+
+            ImGui::Separator();
+            ImGui::TextUnformatted("Trigger");
+            if (persist_enabled) {
+                ImGui::TextDisabled("Rolling mean is on: triggering on averaged rows");
+            }
+
+            visualizer_trigger_mode_t trigger_mode = visualizer_get_trigger_mode(visualizer);
+            int trigger_mode_int = (int)trigger_mode;
+            ImGui::RadioButton("Off", &trigger_mode_int, TRIGGER_OFF);
+            ImGui::SameLine();
+            ImGui::RadioButton("Repeat", &trigger_mode_int, TRIGGER_REPEAT);
+            ImGui::SameLine();
+            ImGui::RadioButton("Single", &trigger_mode_int, TRIGGER_SINGLE);
+            if (trigger_mode_int != (int)trigger_mode) {
+                visualizer_set_trigger_mode(visualizer, (visualizer_trigger_mode_t)trigger_mode_int);
+                trigger_mode = (visualizer_trigger_mode_t)trigger_mode_int;
+            }
+
+            visualizer_trigger_edge_t trigger_edge = visualizer_get_trigger_edge(visualizer);
+            int trigger_edge_int = (int)trigger_edge;
+            ImGui::RadioButton("Rising edge", &trigger_edge_int, TRIGGER_EDGE_RISING);
+            ImGui::SameLine();
+            ImGui::RadioButton("Falling edge", &trigger_edge_int, TRIGGER_EDGE_FALLING);
+            if (trigger_edge_int != (int)trigger_edge) {
+                visualizer_set_trigger_edge(visualizer, (visualizer_trigger_edge_t)trigger_edge_int);
+            }
+
+            float trigger_level_pct = visualizer_get_trigger_level_pct(visualizer);
+            if (ImGui::InputFloat("Trigger level (% of baseline)", &trigger_level_pct, 5.0f, 25.0f, "%.1f")) {
+                visualizer_set_trigger_level_pct(visualizer, trigger_level_pct);
+            }
+            ImGui::TextDisabled("100%% = as strong as a typical recent symbol. Below 100%% fires when");
+            ImGui::TextDisabled("the signal returns after a gap (start of a TDD burst); above 100%%");
+            ImGui::TextDisabled("only on unusually strong ones. Raise it far past the live peak");
+            ImGui::TextDisabled("below to stop firing entirely.");
+
+            bool hysteresis_enabled = visualizer_get_trigger_hysteresis_enabled(visualizer) != 0;
+            if (ImGui::Checkbox("Hysteresis", &hysteresis_enabled)) {
+                visualizer_set_trigger_hysteresis_enabled(visualizer, hysteresis_enabled ? 1 : 0);
+            }
+            if (!hysteresis_enabled) {
+                ImGui::BeginDisabled();
+            }
+            float trigger_reset_level_pct = visualizer_get_trigger_reset_level_pct(visualizer);
+            if (ImGui::InputFloat("Reset level (% of baseline)", &trigger_reset_level_pct, 5.0f, 25.0f, "%.1f")) {
+                visualizer_set_trigger_reset_level_pct(visualizer, trigger_reset_level_pct);
+            }
+            if (!hysteresis_enabled) {
+                ImGui::EndDisabled();
+            }
+            ImGui::TextDisabled("Must clear this level before a new crossing counts as fresh -");
+            ImGui::TextDisabled("keep it below Trigger level for rising edge, above for falling.");
+
+            int trigger_freq_start = visualizer_get_trigger_freq_start(visualizer);
+            int trigger_freq_end = visualizer_get_trigger_freq_end(visualizer);
+            bool freq_changed = false;
+            freq_changed |= ImGui::InputInt("Trigger freq. start (RE index)", &trigger_freq_start);
+            freq_changed |= ImGui::InputInt("Trigger freq. end (RE index)", &trigger_freq_end);
+            if (freq_changed) {
+                visualizer_set_trigger_freq_range(visualizer, trigger_freq_start, trigger_freq_end);
+            }
+            ImGui::TextDisabled("Restricts where triggering searches (0-3275); does not");
+            ImGui::TextDisabled("affect what's displayed once triggered.");
+
+            int trigger_capture_depth = visualizer_get_trigger_capture_depth(visualizer);
+            if (ImGui::InputInt("Trigger capture depth (symbols)", &trigger_capture_depth)) {
+                visualizer_set_trigger_capture_depth(visualizer, trigger_capture_depth);
+            }
+            ImGui::TextDisabled("Rows used by a capture (half before/half after the trigger) -");
+            ImGui::TextDisabled("keep well under Memory size, or the post-trigger wait will");
+            ImGui::TextDisabled("evict the pre-trigger half before it completes.");
+
+            if (trigger_mode == TRIGGER_OFF) {
+                ImGui::BeginDisabled();
+            }
+            if (ImGui::Button("Re-arm")) {
+                visualizer_trigger_rearm(visualizer);
+            }
+            if (trigger_mode == TRIGGER_OFF) {
+                ImGui::EndDisabled();
+            }
+
+            const char* status_text = "Off";
+            ImVec4 status_color(0.7f, 0.7f, 0.7f, 1.0f);
+            switch (visualizer_get_trigger_status(visualizer)) {
+                case TRIGGER_STATUS_ARMED:
+                    status_text = "Searching (armed)";
+                    status_color = ImVec4(0.3f, 1.0f, 0.3f, 1.0f);
+                    break;
+                case TRIGGER_STATUS_WAIT_RESET:
+                    status_text = "Not searching - waiting for signal to cross back";
+                    status_color = ImVec4(1.0f, 0.8f, 0.2f, 1.0f);
+                    break;
+                case TRIGGER_STATUS_CAPTURING:
+                    status_text = "Capturing (filling post-trigger half)";
+                    status_color = ImVec4(0.4f, 0.8f, 1.0f, 1.0f);
+                    break;
+                case TRIGGER_STATUS_HOLDING:
+                    status_text = "Holding - press Re-arm to search again";
+                    status_color = ImVec4(1.0f, 0.6f, 0.2f, 1.0f);
+                    break;
+                case TRIGGER_STATUS_WARMING_UP:
+                    status_text = "Warming up the mean before searching";
+                    status_color = ImVec4(0.6f, 0.7f, 1.0f, 1.0f);
+                    break;
+                case TRIGGER_STATUS_OFF:
+                default:
+                    break;
+            }
+            ImGui::TextColored(status_color, "Status: %s", status_text);
+            ImGui::Text("Captures: %lu", visualizer_get_trigger_fire_count(visualizer));
+
+            float live_peak = 0.0f, live_baseline = 0.0f, live_threshold = 0.0f;
+            visualizer_get_trigger_levels(visualizer, &live_peak, &live_baseline, &live_threshold);
+            ImGui::Text("Live peak: %.1f  (%.0f%% of baseline)", live_peak,
+                        (live_baseline > 1e-6f) ? (100.0f * live_peak / live_baseline) : 0.0f);
+            ImGui::Text("Baseline: %.1f   Fire threshold: %.1f", live_baseline, live_threshold);
+
+            int mean_periods = 0, mean_required = 0;
+            if (visualizer_get_trigger_mean_progress(visualizer, &mean_periods, &mean_required)) {
+                ImGui::Text("Mean periods: %d / %d", mean_periods, mean_required);
+            }
+
+            ImGui::End();
+        } else {
+            ImGui::Begin("Curve Persistence", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
+
+            ImGui::TextUnformatted("Trailing traces");
+            bool trace_enabled = visualizer_get_curve_trace_enabled(visualizer) != 0;
+            if (ImGui::Checkbox("Persistence (trailing traces)", &trace_enabled)) {
+                visualizer_set_curve_trace_enabled(visualizer, trace_enabled ? 1 : 0);
+            }
+
+            if (!trace_enabled) {
+                ImGui::BeginDisabled();
+            }
+            int trace_count = visualizer_get_curve_trace_count(visualizer);
+            if (ImGui::InputInt("Trace count", &trace_count)) {
+                visualizer_set_curve_trace_count(visualizer, trace_count);
+            }
+            if (!trace_enabled) {
+                ImGui::EndDisabled();
+            }
+
+            ImGui::Separator();
+            ImGui::TextUnformatted("Mean (rolling average)");
+            bool mean_enabled = visualizer_get_curve_mean_enabled(visualizer) != 0;
+            if (ImGui::Checkbox("Show mean curve", &mean_enabled)) {
+                visualizer_set_curve_mean_enabled(visualizer, mean_enabled ? 1 : 0);
+            }
+
+            if (!mean_enabled) {
+                ImGui::BeginDisabled();
+            }
+
+            visualizer_curve_mean_mode_t mean_mode = visualizer_get_curve_mean_mode(visualizer);
+            int mean_mode_int = (int)mean_mode;
+            const char* mean_mode_labels[] = { "Phase-locked", "Running average" };
+            if (ImGui::Combo("Mode", &mean_mode_int, mean_mode_labels, IM_ARRAYSIZE(mean_mode_labels))) {
+                visualizer_set_curve_mean_mode(visualizer, (visualizer_curve_mean_mode_t)mean_mode_int);
+                mean_mode = (visualizer_curve_mean_mode_t)mean_mode_int;
+            }
+
+            if (mean_mode == CURVE_MEAN_MODE_PHASE_LOCKED) {
+                int mean_period = visualizer_get_curve_mean_period(visualizer);
+                if (ImGui::InputInt("Averaging period (symbols)", &mean_period)) {
+                    visualizer_set_curve_mean_period(visualizer, mean_period);
+                }
+            }
+
+            int mean_n = visualizer_get_curve_mean_n(visualizer);
+            if (ImGui::InputInt("n (periods to average)", &mean_n)) {
+                visualizer_set_curve_mean_n(visualizer, mean_n);
+            }
+
+            if (ImGui::Button("Reset")) {
+                visualizer_reset_curve_mean(visualizer);
+            }
+
+            if (!mean_enabled) {
+                ImGui::EndDisabled();
+            }
+
+            ImGui::TextDisabled("Tip: multiples of 14 align to slot boundaries");
+
+            ImGui::End();
+        }
     }
 
     // Pop the theme colors
