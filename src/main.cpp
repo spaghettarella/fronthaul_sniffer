@@ -508,6 +508,11 @@ int main(int argc, char** argv) {
             if (visualizer != nullptr && imgui_state != nullptr && startup_state != nullptr) {
                 int startup_render_result = 0;
                 bool startup_complete = false;
+
+                // The demo capture behind the startup screen is a backdrop, not
+                // a plot: no axes are drawn over it, so let it fill the window
+                // instead of leaving the axis margins as black bars.
+                visualizer_set_axes_enabled(visualizer, 0);
                 while (visualizer_is_running(visualizer) && g_stop == 0 && !startup_complete) {
                     if (startup_background.enabled && startup_background.display_memory != nullptr) {
                         startup_render_result = visualizer_update(visualizer, startup_background.display_memory);
@@ -550,6 +555,9 @@ int main(int argc, char** argv) {
                     imgui_visualizer_present();
                     visualizer_present(visualizer);
                 }
+
+                // Back to the plotted view, which needs its axis margins.
+                visualizer_set_axes_enabled(visualizer, 1);
 
                 if (!startup_complete && g_stop == 0) {
                     throw std::runtime_error("startup window closed before configuration was confirmed");
@@ -789,14 +797,26 @@ int main(int argc, char** argv) {
                 // Render ImGui stream selection interface
                 if (imgui_state != nullptr && !keys_snapshot.empty()) {
                     fh_oran_memory_t* previous_display_memory = display_memory;
+                    // Hand ImGui the real framebuffer size so its coordinate
+                    // space matches the one the heatmap and axis ticks are
+                    // computed in; a fixed size would misplace both after a
+                    // window resize.
+                    int ui_width = 0;
+                    int ui_height = 0;
+                    visualizer_get_framebuffer_size(visualizer, &ui_width, &ui_height);
+                    if (ui_width <= 0 || ui_height <= 0) {
+                        ui_width = 1000;
+                        ui_height = 800;
+                    }
+
                     display_memory = imgui_visualizer_render(
                         imgui_state,
                         keys_snapshot.data(),
                         keys_snapshot.size(),
                         memory_ptrs.data(),
                         display_memory,
-                        1000,
-                        800,
+                        ui_width,
+                        ui_height,
                         stats,
                         visualizer);
 

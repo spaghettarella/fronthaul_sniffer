@@ -26,6 +26,10 @@ typedef struct fh_oran_memory {
     size_t max_symbols;
     uint64_t frame_counter;  // Continuous frame counter (tracks wraparounds of 8-bit frame_id)
     uint8_t last_frame_id;   // Previous frame_id; used to detect wraparound
+    int scs_khz;             // Subcarrier spacing this stream was last saved with. Recorded per
+                             // stream because the PHY tap can override it from each record's
+                             // numerology; consumers need it to map symbol numbers back to
+                             // frame/subframe/slot positions. 0 until the first save.
     int64_t replay_symbol_offset;  // Per-stream offset added on each pcap replay loop
     int loop_first_symbol;         // First raw symbol number seen in the current replay loop
     int loop_last_symbol;          // Last raw symbol number seen in the current replay loop

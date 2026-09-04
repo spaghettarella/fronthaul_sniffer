@@ -141,6 +141,10 @@ int fh_oran_memory_save(fh_oran_memory_t* mem, const fh_decoded_packet_t* pkt, i
         return -1;
     }
 
+    if (scs_khz > 0) {
+        mem->scs_khz = scs_khz;
+    }
+
     // Iterate through each section in the packet and place its IQ data at the correct PRB offset.
     for (int i = 0; i < pkt->section_count; i++) {
         const fh_section_t* section = &pkt->sections[i];

@@ -43,6 +43,25 @@
 // before it starts looking for crossings.
 #define TRIGGER_SEED_SYMBOLS 256
 
+// Margins reserved around the heatmap for axes. Left is wide enough for a
+// frame label carrying both the absolute and the wrapped frame id; bottom
+// fits two stacked rows of horizontal labels (PRB, then absolute RE).
+#define PLOT_MARGIN_LEFT 96.0f
+#define PLOT_MARGIN_BOTTOM 56.0f
+// Tall enough for the vertical axis title, which is drawn above the plot.
+#define PLOT_MARGIN_TOP 24.0f
+#define PLOT_MARGIN_RIGHT 12.0f
+
+// A tick is only worth drawing once its neighbours are this far apart, and
+// only worth labelling at the larger spacing. Horizontal labels need more
+// room than vertical ones because they run along the axis rather than
+// stacking across it.
+#define AXIS_MIN_TICK_PX 6.0f
+#define AXIS_MIN_LABEL_PX_Y 30.0f
+#define AXIS_MIN_LABEL_PX_X 60.0f
+
+#define SYMBOLS_PER_SLOT 14
+
 typedef struct opengl_visualizer {
     GLFWwindow* window;
     GLuint texture_id;
@@ -109,6 +128,16 @@ typedef struct opengl_visualizer {
     int trigger_baseline_initialized; // from the display's fast-adapting magnitude_scale_ema
     float trigger_last_peak;           // last evaluated symbol's peak, for UI diagnostics
     float trigger_last_fire_threshold; // and the threshold it was tested against
+
+    // What the rows currently on screen represent, captured while rendering
+    // so the axis code doesn't have to re-derive which view branch ran.
+    int axes_enabled;      // margins reserved for axes; off makes the view full-bleed
+    int axis_valid;
+    int axis_rows;         // texture rows spanning the plot height
+    int axis_phase_mode;   // rows are phases within the averaging period, not absolute symbols
+    int axis_curve_mode;   // rows are magnitude, not time
+    int axis_row0_value;   // absolute symbol (or phase) shown by row 0
+    int axis_period;       // averaging period, phase mode only
 
     // Permanent per-row capture of a triggered window, independent of the
     // live ring: once a row is seen it's locked in here and never re-read,
@@ -718,6 +747,13 @@ opengl_visualizer_t* visualizer_create(int width, int height, int texture_height
     vis->trigger_baseline_initialized = 0;
     vis->trigger_last_peak = 0.0f;
     vis->trigger_last_fire_threshold = 0.0f;
+    vis->axes_enabled = 1;
+    vis->axis_valid = 0;
+    vis->axis_rows = 0;
+    vis->axis_phase_mode = 0;
+    vis->axis_curve_mode = 0;
+    vis->axis_row0_value = 0;
+    vis->axis_period = 0;
     vis->trigger_snapshot_symbol = NULL;
     vis->trigger_snapshot_magnitude = NULL;
     trigger_snapshot_realloc(vis);
@@ -1001,9 +1037,18 @@ static void draw_curve_view(opengl_visualizer_t* vis, const fh_oran_memory_t* me
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
-    const float x_step = (vis->width > 1) ? (float)vis->width / (float)(HEATMAP_TEXTURE_WIDTH - 1) : 0.0f;
-    const float margin_y = 0.05f * (float)vis->height;
-    const float usable_y = (float)vis->height - 2.0f * margin_y;
+    float plot_x = 0.0f, plot_y = 0.0f, plot_w = 1.0f, plot_h = 1.0f;
+    visualizer_get_plot_rect(vis, &plot_x, &plot_y, &plot_w, &plot_h);
+
+    const float x_step = plot_w / (float)(HEATMAP_TEXTURE_WIDTH - 1);
+    const float margin_y = plot_y + 0.05f * plot_h;
+    const float usable_y = plot_h * 0.90f;
+
+    vis->axis_valid = 1;
+    vis->axis_rows = vis->tex_height > 0 ? vis->tex_height : 1;
+    vis->axis_phase_mode = 0;
+    vis->axis_curve_mode = 1;
+    vis->axis_period = 0;
 
     // Width now runs the opposite way from brightness/opacity: the newest
     // trace is the sharpest (thinnest) line, older ones thicken as they fade,
@@ -1066,7 +1111,7 @@ static void draw_curve_view(opengl_visualizer_t* vis, const fh_oran_memory_t* me
             if (norm > 1.0f) {
                 norm = 1.0f;
             }
-            glVertex2f((float)col * x_step, margin_y + (1.0f - norm) * usable_y);
+            glVertex2f(plot_x + (float)col * x_step, margin_y + (1.0f - norm) * usable_y);
         }
         glEnd();
     }
@@ -1084,7 +1129,7 @@ static void draw_curve_view(opengl_visualizer_t* vis, const fh_oran_memory_t* me
             if (norm > 1.0f) {
                 norm = 1.0f;
             }
-            glVertex2f((float)col * x_step, margin_y + (1.0f - norm) * usable_y);
+            glVertex2f(plot_x + (float)col * x_step, margin_y + (1.0f - norm) * usable_y);
         }
         glEnd();
     }
@@ -1452,6 +1497,391 @@ static void trigger_snapshot_capture_new_rows(opengl_visualizer_t* vis, const fh
     }
 }
 
+void visualizer_get_framebuffer_size(const opengl_visualizer_t* vis, int* out_width, int* out_height) {
+    if (out_width) {
+        *out_width = vis ? vis->width : 0;
+    }
+    if (out_height) {
+        *out_height = vis ? vis->height : 0;
+    }
+}
+
+void visualizer_set_axes_enabled(opengl_visualizer_t* vis, int enabled) {
+    if (vis) {
+        vis->axes_enabled = enabled ? 1 : 0;
+    }
+}
+
+int visualizer_get_axes_enabled(const opengl_visualizer_t* vis) {
+    return vis ? vis->axes_enabled : 0;
+}
+
+void visualizer_get_plot_rect(const opengl_visualizer_t* vis,
+                              float* out_x, float* out_y, float* out_w, float* out_h) {
+    float x = PLOT_MARGIN_LEFT;
+    float y = PLOT_MARGIN_TOP;
+    float w = 1.0f;
+    float h = 1.0f;
+    if (vis && !vis->axes_enabled) {
+        // No axes to make room for: fill the window.
+        x = 0.0f;
+        y = 0.0f;
+        w = (float)vis->width;
+        h = (float)vis->height;
+        if (w < 1.0f) {
+            w = 1.0f;
+        }
+        if (h < 1.0f) {
+            h = 1.0f;
+        }
+    } else if (vis) {
+        w = (float)vis->width - PLOT_MARGIN_LEFT - PLOT_MARGIN_RIGHT;
+        h = (float)vis->height - PLOT_MARGIN_TOP - PLOT_MARGIN_BOTTOM;
+        if (w < 1.0f) {
+            w = 1.0f;
+        }
+        if (h < 1.0f) {
+            h = 1.0f;
+        }
+    }
+    if (out_x) { *out_x = x; }
+    if (out_y) { *out_y = y; }
+    if (out_w) { *out_w = w; }
+    if (out_h) { *out_h = h; }
+}
+
+// Smallest multiplier from a round-number ladder that spreads ticks at least
+// min_px apart, so zooming out thins the axis instead of crowding it.
+static int axis_nice_multiple(float unit_px, float min_px) {
+    static const int ladder[] = { 1, 2, 5, 10, 20, 25, 50, 100, 200, 500, 1000, 2000, 5000 };
+    const int count = (int)(sizeof(ladder) / sizeof(ladder[0]));
+    for (int i = 0; i < count; i++) {
+        if (unit_px * (float)ladder[i] >= min_px) {
+            return ladder[i];
+        }
+    }
+    return ladder[count - 1];
+}
+
+void visualizer_get_axis_titles(const opengl_visualizer_t* vis,
+                                const char** out_y_title,
+                                const char** out_x_title) {
+    const char* y_title = "Symbol";
+    if (vis) {
+        if (vis->axis_curve_mode) {
+            y_title = "Magnitude";
+        } else if (vis->axis_phase_mode) {
+            y_title = "Offset in period";
+        } else {
+            y_title = "Frame / slot";
+        }
+    }
+    if (out_y_title) {
+        *out_y_title = y_title;
+    }
+    if (out_x_title) {
+        *out_x_title = "PRB / RE";
+    }
+}
+
+int visualizer_get_y_ticks(const opengl_visualizer_t* vis,
+                           const fh_oran_memory_t* memory,
+                           visualizer_axis_tick_t* out_ticks,
+                           int max_ticks) {
+    if (!vis || !out_ticks || max_ticks <= 0 || !vis->axis_valid || vis->axis_rows <= 0) {
+        return 0;
+    }
+
+    float plot_y = 0.0f, plot_h = 1.0f;
+    visualizer_get_plot_rect(vis, NULL, &plot_y, NULL, &plot_h);
+    const float px_per_row = plot_h / (float)vis->axis_rows;
+    int count = 0;
+
+    // Curve view: the vertical axis is normalised magnitude, so it just gets
+    // evenly spaced percentage gridlines.
+    if (vis->axis_curve_mode) {
+        for (int pct = 0; pct <= 100 && count < max_ticks; pct += 25) {
+            visualizer_axis_tick_t* t = &out_ticks[count++];
+            // The curve render insets its trace by 5% top and bottom.
+            const float frac = 0.05f + (1.0f - (float)pct / 100.0f) * 0.90f;
+            t->position_px = plot_y + frac * plot_h;
+            t->level = (pct == 0 || pct == 100) ? 2 : 1;
+            t->has_label = 1;
+            snprintf(t->label, sizeof(t->label), "%d%%", pct);
+            t->label2[0] = '\0';
+        }
+        return count;
+    }
+
+    if (vis->axis_phase_mode) {
+        // Rows are positions inside the averaging period. Absolute frame
+        // numbering is meaningless for an average spanning many frames, so
+        // only offsets relative to the period start are labelled.
+        const int period = vis->axis_period > 0 ? vis->axis_period : 1;
+        const int scs_khz = (memory && memory->scs_khz > 0) ? memory->scs_khz : 0;
+        const int slots_per_subframe = (scs_khz > 0 && scs_khz / 15 > 0) ? scs_khz / 15 : 0;
+        const int symbols_per_subframe = slots_per_subframe > 0 ? slots_per_subframe * SYMBOLS_PER_SLOT : 0;
+        // Subframe offsets only make sense if the period divides into whole subframes.
+        const int subframe_useful = symbols_per_subframe > 0 && (period % symbols_per_subframe) == 0;
+
+        const int label_symbol = px_per_row >= AXIS_MIN_LABEL_PX_Y;
+        const int tick_symbol = px_per_row >= AXIS_MIN_TICK_PX;
+        const float slot_px = px_per_row * (float)SYMBOLS_PER_SLOT;
+        const int label_slot = slot_px >= AXIS_MIN_LABEL_PX_Y;
+        const int tick_slot = slot_px >= AXIS_MIN_TICK_PX;
+
+        // The bottom row always carries a fully spelled-out label, so the
+        // view is never left without a position readout when it spans less
+        // than one division.
+        const int anchor_row = vis->axis_rows - 1;
+        if (anchor_row >= 0 && count < max_ticks) {
+            int phase = (vis->axis_row0_value + anchor_row) % period;
+            if (phase < 0) {
+                phase += period;
+            }
+            visualizer_axis_tick_t* t = &out_ticks[count++];
+            t->position_px = plot_y + (float)anchor_row * px_per_row;
+            t->level = 3;
+            t->has_label = 1;
+            snprintf(t->label, sizeof(t->label), "phase +%d", phase);
+            if (subframe_useful) {
+                snprintf(t->label2, sizeof(t->label2), "sf+%d sl+%d sym%d",
+                         phase / symbols_per_subframe,
+                         (phase % symbols_per_subframe) / SYMBOLS_PER_SLOT,
+                         phase % SYMBOLS_PER_SLOT);
+            } else {
+                snprintf(t->label2, sizeof(t->label2), "sl+%d sym%d",
+                         phase / SYMBOLS_PER_SLOT, phase % SYMBOLS_PER_SLOT);
+            }
+        }
+
+        for (int row = 0; row < vis->axis_rows && count < max_ticks; row++) {
+            if (row == anchor_row) {
+                continue;  // already emitted with a full label
+            }
+            int phase = (vis->axis_row0_value + row) % period;
+            if (phase < 0) {
+                phase += period;
+            }
+
+            int level;
+            int labelled;
+            if (subframe_useful && (phase % symbols_per_subframe) == 0) {
+                level = 2;
+                labelled = 1;
+            } else if ((phase % SYMBOLS_PER_SLOT) == 0) {
+                if (!tick_slot) {
+                    continue;
+                }
+                level = 1;
+                labelled = label_slot;
+            } else {
+                if (!tick_symbol) {
+                    continue;
+                }
+                level = 0;
+                labelled = label_symbol;
+            }
+
+            visualizer_axis_tick_t* t = &out_ticks[count++];
+            t->position_px = plot_y + (float)row * px_per_row;
+            t->level = level;
+            t->has_label = labelled;
+            t->label2[0] = '\0';
+            if (!labelled) {
+                t->label[0] = '\0';
+            } else if (level == 2) {
+                snprintf(t->label, sizeof(t->label), "sf+%d", phase / symbols_per_subframe);
+            } else if (level == 1) {
+                snprintf(t->label, sizeof(t->label), "sl+%d", phase / SYMBOLS_PER_SLOT);
+            } else {
+                snprintf(t->label, sizeof(t->label), "%d", phase % SYMBOLS_PER_SLOT);
+            }
+        }
+        return count;
+    }
+
+    // Live or triggered view: rows are absolute symbol numbers.
+    const int scs_khz = (memory && memory->scs_khz > 0) ? memory->scs_khz : 0;
+    int slots_per_subframe = scs_khz > 0 ? scs_khz / 15 : 0;
+    if (slots_per_subframe <= 0) {
+        slots_per_subframe = 0;  // unknown spacing: fall back to slot/symbol ticks only
+    }
+    const int symbols_per_subframe = slots_per_subframe > 0 ? slots_per_subframe * SYMBOLS_PER_SLOT : 0;
+    const int symbols_per_frame = symbols_per_subframe > 0 ? symbols_per_subframe * 10 : 0;
+
+    const int tick_symbol = px_per_row >= AXIS_MIN_TICK_PX;
+    const int label_symbol = px_per_row >= AXIS_MIN_LABEL_PX_Y;
+    const float slot_px = px_per_row * (float)SYMBOLS_PER_SLOT;
+    const int tick_slot = slot_px >= AXIS_MIN_TICK_PX;
+    const int label_slot = slot_px >= AXIS_MIN_LABEL_PX_Y;
+    const float subframe_px = symbols_per_subframe > 0 ? px_per_row * (float)symbols_per_subframe : 0.0f;
+    const int tick_subframe = symbols_per_subframe > 0 && subframe_px >= AXIS_MIN_TICK_PX;
+    const int label_subframe = symbols_per_subframe > 0 && subframe_px >= AXIS_MIN_LABEL_PX_Y;
+
+    // Frames always stay labelled; when they would crowd, step by a round
+    // number of frames instead of dropping the level entirely.
+    int frame_step = 1;
+    if (symbols_per_frame > 0) {
+        frame_step = axis_nice_multiple(px_per_row * (float)symbols_per_frame, AXIS_MIN_LABEL_PX_Y);
+    }
+
+    // The newest symbol (bottom row) always gets the complete position spelled
+    // out, so a view spanning less than a whole frame still shows which frame,
+    // subframe, slot and symbol it is looking at.
+    const int anchor_row = vis->axis_rows - 1;
+    const int anchor_symbol = vis->axis_row0_value + anchor_row;
+    if (anchor_row >= 0 && anchor_symbol >= 0 && count < max_ticks) {
+        visualizer_axis_tick_t* t = &out_ticks[count++];
+        t->position_px = plot_y + (float)anchor_row * px_per_row;
+        t->level = 3;
+        t->has_label = 1;
+        if (symbols_per_frame > 0) {
+            const unsigned long long frame = (unsigned long long)(anchor_symbol / symbols_per_frame);
+            const int in_frame = anchor_symbol % symbols_per_frame;
+            snprintf(t->label, sizeof(t->label), "F%llu (%llu)", frame, frame % 256ULL);
+            snprintf(t->label2, sizeof(t->label2), "sf%d sl%d sym%d",
+                     in_frame / symbols_per_subframe,
+                     (in_frame % symbols_per_subframe) / SYMBOLS_PER_SLOT,
+                     anchor_symbol % SYMBOLS_PER_SLOT);
+        } else {
+            // Subcarrier spacing unknown, so frame structure can't be resolved.
+            snprintf(t->label, sizeof(t->label), "sym %d", anchor_symbol);
+            snprintf(t->label2, sizeof(t->label2), "sl%d sym%d",
+                     anchor_symbol / SYMBOLS_PER_SLOT, anchor_symbol % SYMBOLS_PER_SLOT);
+        }
+    }
+
+    for (int row = 0; row < vis->axis_rows && count < max_ticks; row++) {
+        if (row == anchor_row) {
+            continue;  // already emitted with a full label
+        }
+        const int symbol = vis->axis_row0_value + row;
+        if (symbol < 0) {
+            continue;
+        }
+
+        int level;
+        int labelled;
+        if (symbols_per_frame > 0 && (symbol % symbols_per_frame) == 0 &&
+            ((symbol / symbols_per_frame) % frame_step) == 0) {
+            level = 3;
+            labelled = 1;
+        } else if (symbols_per_subframe > 0 && (symbol % symbols_per_subframe) == 0) {
+            if (!tick_subframe) {
+                continue;
+            }
+            level = 2;
+            labelled = label_subframe;
+        } else if ((symbol % SYMBOLS_PER_SLOT) == 0) {
+            if (!tick_slot) {
+                continue;
+            }
+            level = 1;
+            labelled = label_slot;
+        } else {
+            if (!tick_symbol) {
+                continue;
+            }
+            level = 0;
+            labelled = label_symbol;
+        }
+
+        visualizer_axis_tick_t* t = &out_ticks[count++];
+        t->position_px = plot_y + (float)row * px_per_row;
+        t->level = level;
+        t->has_label = labelled;
+        t->label2[0] = '\0';
+
+        if (!labelled) {
+            t->label[0] = '\0';
+        } else if (level == 3) {
+            const unsigned long long frame = (unsigned long long)(symbol / symbols_per_frame);
+            // Both numbers matter: the absolute one keeps counting, the
+            // parenthesised one is the 8-bit id actually carried on the wire.
+            snprintf(t->label, sizeof(t->label), "F%llu (%llu)", frame, frame % 256ULL);
+        } else if (level == 2) {
+            snprintf(t->label, sizeof(t->label), "sf%d",
+                     (symbol % symbols_per_frame) / symbols_per_subframe);
+        } else if (level == 1) {
+            const int in_subframe = symbols_per_subframe > 0 ? (symbol % symbols_per_subframe)
+                                                              : (symbol % SYMBOLS_PER_SLOT);
+            snprintf(t->label, sizeof(t->label), "sl%d", in_subframe / SYMBOLS_PER_SLOT);
+        } else {
+            snprintf(t->label, sizeof(t->label), "%d", symbol % SYMBOLS_PER_SLOT);
+        }
+    }
+
+    return count;
+}
+
+int visualizer_get_x_ticks(const opengl_visualizer_t* vis,
+                           visualizer_axis_tick_t* out_ticks,
+                           int max_ticks) {
+    if (!vis || !out_ticks || max_ticks <= 0) {
+        return 0;
+    }
+
+    float plot_x = 0.0f, plot_w = 1.0f;
+    visualizer_get_plot_rect(vis, &plot_x, NULL, &plot_w, NULL);
+
+    // The full grid is always in view for now; a zoom would narrow this range
+    // and everything below adapts to it.
+    const int re_first = 0;
+    const int re_count = HEATMAP_TEXTURE_WIDTH;
+    const float px_per_re = plot_w / (float)re_count;
+    const float px_per_prb = px_per_re * (float)HEATMAP_SAMPLES_PER_PRB;
+
+    int count = 0;
+
+    // Individual resource elements only get their own ticks once a PRB is
+    // wide enough to show its twelve subcarriers without them merging.
+    const int show_re = px_per_re >= AXIS_MIN_TICK_PX;
+    const int label_re = px_per_re >= 20.0f;
+
+    const int prb_step = axis_nice_multiple(px_per_prb, AXIS_MIN_LABEL_PX_X);
+    const int prb_first = re_first / HEATMAP_SAMPLES_PER_PRB;
+    const int prb_last = (re_first + re_count - 1) / HEATMAP_SAMPLES_PER_PRB;
+
+    for (int prb = prb_first; prb <= prb_last && count < max_ticks; prb++) {
+        const int on_step = (prb % prb_step) == 0;
+        if (!on_step && !show_re) {
+            continue;
+        }
+
+        const int re = prb * HEATMAP_SAMPLES_PER_PRB;
+        visualizer_axis_tick_t* t = &out_ticks[count++];
+        t->position_px = plot_x + (float)(re - re_first) * px_per_re;
+        t->level = 1;
+        t->has_label = on_step;
+        if (on_step) {
+            snprintf(t->label, sizeof(t->label), "%d", prb);
+            snprintf(t->label2, sizeof(t->label2), "%d", re);
+        } else {
+            t->label[0] = '\0';
+            t->label2[0] = '\0';
+        }
+
+        if (!show_re) {
+            continue;
+        }
+        for (int sub = 1; sub < HEATMAP_SAMPLES_PER_PRB && count < max_ticks; sub++) {
+            visualizer_axis_tick_t* st = &out_ticks[count++];
+            st->position_px = plot_x + (float)(re + sub - re_first) * px_per_re;
+            st->level = 0;
+            st->has_label = label_re;
+            st->label2[0] = '\0';
+            if (label_re) {
+                snprintf(st->label, sizeof(st->label), "%d", sub);
+            } else {
+                st->label[0] = '\0';
+            }
+        }
+    }
+
+    return count;
+}
+
 // Update heatmap texture with IQ data from ring buffer (or, in persistence
 // mode, from the rolling-mean accumulator).
 static void update_heatmap_texture(opengl_visualizer_t* vis, const fh_oran_memory_t* memory) {
@@ -1525,6 +1955,12 @@ static void update_heatmap_texture(opengl_visualizer_t* vis, const fh_oran_memor
         // period. Triggered, the same averaged rows are rotated so the phase
         // the crossing landed on sits at the middle row, under the red line -
         // the alignment is what makes the averaged picture hold still.
+        vis->axis_valid = 1;
+        vis->axis_rows = vis->tex_height;
+        vis->axis_phase_mode = 1;
+        vis->axis_curve_mode = 0;
+        vis->axis_period = period;
+
         int display_height;
         int phase_offset = 0;
         if (mean_triggered) {
@@ -1541,6 +1977,8 @@ static void update_heatmap_texture(opengl_visualizer_t* vis, const fh_oran_memor
 
         // Maps a texture row to the accumulator phase it displays.
         #define PERSIST_ROW_PHASE(row) (((((row) + phase_offset) % period) + period) % period)
+
+        vis->axis_row0_value = PERSIST_ROW_PHASE(0);
 
         // Find max magnitude for normalization
         float max_magnitude = 1e-9f;
@@ -1633,6 +2071,17 @@ static void update_heatmap_texture(opengl_visualizer_t* vis, const fh_oran_memor
 
         int symbol_count = memory->symbol_highest - memory->symbol_lowest + 1;
         int display_height = (symbol_count < vis->tex_height) ? symbol_count : vis->tex_height;
+
+        vis->axis_valid = 1;
+        vis->axis_rows = vis->tex_height;
+        vis->axis_phase_mode = 0;
+        vis->axis_curve_mode = 0;
+        vis->axis_period = 0;
+        // A triggered window is centred on the captured symbol; the live view
+        // scrolls with the newest symbol pinned to the bottom row.
+        vis->axis_row0_value = showing_triggered
+                                   ? vis->trigger_captured_symbol - (vis->trigger_capture_depth / 2)
+                                   : memory->symbol_highest - (vis->tex_height - 1);
 
         // Find max magnitude for normalization. While showing a triggered
         // window, scan its permanent snapshot instead of live ring content,
@@ -1804,24 +2253,32 @@ int visualizer_update(opengl_visualizer_t* vis, const fh_oran_memory_t* memory) 
         glEnable(GL_TEXTURE_2D);
         glBindTexture(GL_TEXTURE_2D, vis->texture_id);
 
+        // Confined to the plot rect so the surrounding margins stay clear for
+        // the axes.
+        float plot_x = 0.0f, plot_y = 0.0f, plot_w = 1.0f, plot_h = 1.0f;
+        visualizer_get_plot_rect(vis, &plot_x, &plot_y, &plot_w, &plot_h);
+
         glBegin(GL_QUADS);
-        glTexCoord2f(0, 0); glVertex2f(0, 0);
-        glTexCoord2f(1, 0); glVertex2f((float)vis->width, 0);
-        glTexCoord2f(1, 1); glVertex2f((float)vis->width, (float)vis->height);
-        glTexCoord2f(0, 1); glVertex2f(0, (float)vis->height);
+        glTexCoord2f(0, 0); glVertex2f(plot_x, plot_y);
+        glTexCoord2f(1, 0); glVertex2f(plot_x + plot_w, plot_y);
+        glTexCoord2f(1, 1); glVertex2f(plot_x + plot_w, plot_y + plot_h);
+        glTexCoord2f(0, 1); glVertex2f(plot_x, plot_y + plot_h);
         glEnd();
 
         glDisable(GL_TEXTURE_2D);
 
-        // Trigger line: marks the vertical middle once a capture has fired.
-        // Drawn in screen space (like the curve view's lines) so it stays a
-        // crisp single line regardless of the texture's own row height.
+        // Trigger line: marks the row carrying the captured symbol once a
+        // capture has fired. Drawn in screen space (like the curve view's
+        // lines) so it stays crisp regardless of the texture's row height.
         if (vis->trigger_mode != TRIGGER_OFF && vis->trigger_captured_symbol != TRIGGER_NO_SYMBOL) {
+            const int rows = vis->tex_height > 0 ? vis->tex_height : 1;
+            const int centre_row = vis->trigger_capture_depth / 2;
+            const float line_y = plot_y + ((float)centre_row + 0.5f) * (plot_h / (float)rows);
             glColor4f(1.0f, 0.0f, 0.0f, 1.0f);
             glLineWidth(1.5f);
             glBegin(GL_LINES);
-            glVertex2f(0.0f, (float)vis->height / 2.0f);
-            glVertex2f((float)vis->width, (float)vis->height / 2.0f);
+            glVertex2f(plot_x, line_y);
+            glVertex2f(plot_x + plot_w, line_y);
             glEnd();
             glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
         }

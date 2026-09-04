@@ -102,6 +102,61 @@ int visualizer_get_curve_mean_n(const opengl_visualizer_t* vis);
 // Clears the accumulated mean curve without changing settings.
 void visualizer_reset_curve_mean(opengl_visualizer_t* vis);
 
+// --- Axes ---
+// The heatmap is drawn into a plot rect inset from the window edges, leaving
+// margins for axis ticks and labels so nothing is ever drawn over the data.
+// The visualizer owns the mapping from data to pixels (which differs between
+// the live, triggered and rolling-mean views), so it decides which ticks
+// exist; the caller only draws them. Positions are in framebuffer pixels -
+// use visualizer_get_framebuffer_size() to render in the same space.
+void visualizer_get_plot_rect(const opengl_visualizer_t* vis,
+                              float* out_x, float* out_y, float* out_w, float* out_h);
+
+void visualizer_get_framebuffer_size(const opengl_visualizer_t* vis, int* out_width, int* out_height);
+
+// Turns the axis margins off so the view fills the whole window edge to
+// edge. Intended for backdrops that carry no axes of their own, such as the
+// demo capture playing behind the startup screen, where the reserved margins
+// would otherwise just show as black bars. Enabled by default.
+void visualizer_set_axes_enabled(opengl_visualizer_t* vis, int enabled);
+int visualizer_get_axes_enabled(const opengl_visualizer_t* vis);
+
+#define VISUALIZER_MAX_AXIS_TICKS 256
+
+// level orders ticks by importance, so a caller can scale tick length with
+// it. Vertical: 0=symbol, 1=slot, 2=subframe, 3=frame (or, in rolling-mean
+// and curve views, the equivalent relative divisions). Horizontal:
+// 0=resource element, 1=PRB.
+typedef struct visualizer_axis_tick {
+    float position_px;
+    int level;
+    int has_label;
+    char label[48];   // primary label
+    // Second line of the label. On the horizontal axis this is the absolute
+    // RE index; on the vertical axis it carries the remaining detail of the
+    // newest-symbol anchor. "" when unused.
+    char label2[48];
+} visualizer_axis_tick_t;
+
+// Both return the number of ticks written. Tick density adapts to how much
+// is in view, so levels that would be too crowded to read are dropped.
+// The vertical axis needs the displayed stream to resolve symbol numbering
+// and subcarrier spacing; pass the same memory being rendered.
+int visualizer_get_y_ticks(const opengl_visualizer_t* vis,
+                           const fh_oran_memory_t* memory,
+                           visualizer_axis_tick_t* out_ticks,
+                           int max_ticks);
+
+int visualizer_get_x_ticks(const opengl_visualizer_t* vis,
+                           visualizer_axis_tick_t* out_ticks,
+                           int max_ticks);
+
+// Axis titles for the current view, e.g. "Symbol" / "Slot offset" vertically
+// and "PRB" / "RE" horizontally. Either out-pointer may be NULL.
+void visualizer_get_axis_titles(const opengl_visualizer_t* vis,
+                                const char** out_y_title,
+                                const char** out_x_title);
+
 // --- Waterfall trigger ---
 // Oscilloscope-style triggering for the waterfall's raw (non-persistence)
 // view: when a new symbol's peak magnitude rises above the trigger level,

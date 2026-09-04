@@ -28,6 +28,126 @@ struct imgui_visualizer_state {
     uint64_t frames_since_start;
 };
 
+namespace {
+
+// Tick marks get longer with importance, so frame boundaries read as major
+// divisions and individual symbols as fine subdivisions.
+float axis_tick_length(int level) {
+    switch (level) {
+        case 3: return 12.0f;
+        case 2: return 9.0f;
+        case 1: return 6.0f;
+        default: return 3.0f;
+    }
+}
+
+ImU32 axis_tick_color(int level) {
+    return (level >= 2) ? IM_COL32(220, 220, 220, 255) : IM_COL32(150, 150, 150, 255);
+}
+
+void draw_plot_axes(opengl_visualizer_t* visualizer, const fh_oran_memory_t* memory) {
+    float plot_x = 0.0f, plot_y = 0.0f, plot_w = 0.0f, plot_h = 0.0f;
+    visualizer_get_plot_rect(visualizer, &plot_x, &plot_y, &plot_w, &plot_h);
+    if (plot_w <= 1.0f || plot_h <= 1.0f) {
+        return;
+    }
+
+    ImDrawList* draw = ImGui::GetBackgroundDrawList();
+    const ImU32 axis_color = IM_COL32(220, 220, 220, 255);
+    const ImU32 label_color = IM_COL32(230, 230, 230, 255);
+    const float plot_bottom = plot_y + plot_h;
+
+    draw->AddLine(ImVec2(plot_x, plot_y), ImVec2(plot_x, plot_bottom), axis_color);
+    draw->AddLine(ImVec2(plot_x, plot_bottom), ImVec2(plot_x + plot_w, plot_bottom), axis_color);
+
+    visualizer_axis_tick_t ticks[VISUALIZER_MAX_AXIS_TICKS];
+
+    // Vertical axis: ticks step left out of the plot, labels right-aligned
+    // against them so they grow into the margin rather than toward the data.
+    const int y_count = visualizer_get_y_ticks(visualizer, memory, ticks, VISUALIZER_MAX_AXIS_TICKS);
+    for (int i = 0; i < y_count; i++) {
+        const visualizer_axis_tick_t& tick = ticks[i];
+        if (tick.position_px < plot_y - 0.5f || tick.position_px > plot_bottom + 0.5f) {
+            continue;
+        }
+        const float len = axis_tick_length(tick.level);
+        draw->AddLine(ImVec2(plot_x - len, tick.position_px), ImVec2(plot_x, tick.position_px),
+                      axis_tick_color(tick.level));
+        if (!tick.has_label || tick.label[0] == '\0') {
+            continue;
+        }
+
+        // A second line means this is the fully spelled-out anchor; stack the
+        // pair and keep it inside the plot's vertical span so it can't spill
+        // into the horizontal axis below.
+        const bool two_line = tick.label2[0] != '\0';
+        const float line_h = ImGui::GetTextLineHeight();
+        const float block_h = two_line ? line_h * 2.0f : line_h;
+        float top_y = tick.position_px - block_h * 0.5f;
+        if (top_y < plot_y) {
+            top_y = plot_y;
+        }
+        if (top_y + block_h > plot_bottom) {
+            top_y = plot_bottom - block_h;
+        }
+
+        const ImU32 text_color = two_line ? IM_COL32(255, 240, 150, 255) : label_color;
+        const ImVec2 size = ImGui::CalcTextSize(tick.label);
+        float text_x = plot_x - len - 4.0f - size.x;
+        if (text_x < 2.0f) {
+            text_x = 2.0f;
+        }
+        draw->AddText(ImVec2(text_x, top_y), text_color, tick.label);
+
+        if (two_line) {
+            const ImVec2 size2 = ImGui::CalcTextSize(tick.label2);
+            float text2_x = plot_x - len - 4.0f - size2.x;
+            if (text2_x < 2.0f) {
+                text2_x = 2.0f;
+            }
+            draw->AddText(ImVec2(text2_x, top_y + line_h), text_color, tick.label2);
+        }
+    }
+
+    // Horizontal axis: two stacked label rows, PRB index above absolute RE index.
+    const int x_count = visualizer_get_x_ticks(visualizer, ticks, VISUALIZER_MAX_AXIS_TICKS);
+    for (int i = 0; i < x_count; i++) {
+        const visualizer_axis_tick_t& tick = ticks[i];
+        if (tick.position_px < plot_x - 0.5f || tick.position_px > plot_x + plot_w + 0.5f) {
+            continue;
+        }
+        const float len = axis_tick_length(tick.level);
+        draw->AddLine(ImVec2(tick.position_px, plot_bottom), ImVec2(tick.position_px, plot_bottom + len),
+                      axis_tick_color(tick.level));
+        if (!tick.has_label) {
+            continue;
+        }
+        if (tick.label[0] != '\0') {
+            const ImVec2 size = ImGui::CalcTextSize(tick.label);
+            draw->AddText(ImVec2(tick.position_px - size.x * 0.5f, plot_bottom + len + 2.0f),
+                          label_color, tick.label);
+        }
+        if (tick.label2[0] != '\0') {
+            const ImVec2 size = ImGui::CalcTextSize(tick.label2);
+            draw->AddText(ImVec2(tick.position_px - size.x * 0.5f, plot_bottom + len + 18.0f),
+                          IM_COL32(170, 170, 170, 255), tick.label2);
+        }
+    }
+
+    const char* y_title = nullptr;
+    const char* x_title = nullptr;
+    visualizer_get_axis_titles(visualizer, &y_title, &x_title);
+    if (y_title != nullptr) {
+        draw->AddText(ImVec2(4.0f, plot_y - ImGui::GetTextLineHeight() - 2.0f), label_color, y_title);
+    }
+    if (x_title != nullptr) {
+        const ImVec2 size = ImGui::CalcTextSize(x_title);
+        draw->AddText(ImVec2(plot_x + plot_w - size.x, plot_bottom + 36.0f), label_color, x_title);
+    }
+}
+
+}  // namespace
+
 const char* data_direction_to_string(uint8_t data_direction) {
     switch (data_direction) {
         case 0:
@@ -574,6 +694,13 @@ fh_oran_memory_t* imgui_visualizer_render(
 
             ImGui::End();
         }
+    }
+
+    // Axes. Drawn on the background list so they sit over the heatmap but
+    // under every panel, and entirely within the margins the visualizer
+    // reserves, so they never cover data.
+    if (visualizer != nullptr) {
+        draw_plot_axes(visualizer, current_display_memory);
     }
 
     // Pop the theme colors
