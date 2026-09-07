@@ -95,3 +95,51 @@ Queue tuning rule of thumb:
 - if latency matters more than lossless behavior, keep queue small
 
 The queue currently drops oldest packets when full to keep memory bounded.
+
+## Committing Changes
+
+GitHub rejects any single file over 100 MB, and it does so at push time — by
+which point the file is already inside a commit, and only rewriting history
+gets it back out. Packet captures are the usual culprit: a few seconds of
+100 MHz fronthaul traffic runs to hundreds of megabytes.
+
+Two guards are in place:
+
+- `.gitignore` skips `*.pcap` and `*.pcapng`, so recordings are never picked
+  up by `git add .`. The small captures already tracked under `src/capture/`
+  are unaffected — ignore rules do not apply to files git already follows.
+- `.git/hooks/pre-commit` refuses any staged file over 100 MB and names it.
+
+The hook lives in `.git/`, which is not versioned, so it protects only the
+clone it was created in. Reinstall it after cloning elsewhere.
+
+Normal workflow:
+
+```bash
+git status                  # check nothing unexpected is about to be added
+git add .
+git commit -m "message"
+git push
+```
+
+To commit a capture deliberately, override the ignore rule — but keep it
+under 100 MB:
+
+```bash
+git add -f src/capture/small_capture.pcap
+```
+
+If a large file does slip into a commit that has not been pushed yet, drop it
+from the commit rather than rewriting history. `--cached` removes it from git
+only, leaving the file on disk:
+
+```bash
+git rm --cached path/to/large.pcap
+git commit --amend --no-edit
+git push
+```
+
+Once such a commit has been pushed, or if the file is several commits back,
+this no longer works and the repository needs `git filter-repo` (or BFG)
+followed by a force push — which rewrites history for everyone. Avoiding that
+is the reason the hook exists.
