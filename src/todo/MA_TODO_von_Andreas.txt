@@ -1,0 +1,43 @@
+Polishen Fronthaul-Analyzer
+
+* Single-Shot trigger (Umschaltbar von free running): Wenn in bestimmten Frequenzbereich ein einzustellender Amplitudenwert überschritten wird, dann single-shot capture. Trigger in der Mitte des Bildschirms.
+
+* Marker in Zeit und Frequenz (evtl. mehrere)
+
+* Achsenbeschriftung: x-Achse: RE, y-Achse: OFDM Symbole #, Subframe #, Frame # 
+
+* Portieren auf MODRAN
+
+* Test mit Benetel traffic. Live gNB traffic. 
+
+* phyTAP Darstellungsproblem fixen (Amplitdue richtig darstellen) --> Ab gelich mit EthernetTap
+
+* Andi: phyTAP für DL bei SRS geplant?
+
+* phyTAP: Welche weiteren META Informationen vorhanden? (mir per email schicken)
+
+
+Integrated Sensing and Communication (ICAS) / OFDM-RADAR
+
+* DU in FDD-Mode betreiben (RU hat aber Rx & Tx LO auf gleicher Frequenz) --> Quasi Full Duplex System
+
+* mit Ethernet Tap den Downlink Traffic und den zugehörigen UL Traffic "synchronisieren"
+
+* Division von gesendeten Downlink Symbolen mit den korrespondierenden Uplink Symbolen --> Channel Frequency Response für jedes OFDM Symbol
+
+--> Darstellung über ein plotter tool --> Wenn alles korrekt, muss bei RE die belegt sind, dann immer eine 1 im Betrag
+
+* 4096-IFFT über jedes OFDM-Symbol --> für jedes OFDM-Symbol die Channel Impulse Response. 1120x4096 Matrix (1120 ist TBD). Jede Zeile ist eine CIR. Man hat jetzt die CIRs (Delay Domain) über die Zeit (time domain)
+
+--> zwischenzeitlich immer den Betrag plotten --> Beträge der CIR über die Zeit
+
+* Dann schneiden wir von der CIR etwas ab (TBD), z.B. von 4096 auf 128 Samples. 1120x128 
+
+--> zwischenzeitlich immer den Betrag plotten --> Beträge der CIR über die Zeit
+
+* 1120-FFT über Zeitachse für jeden CIR-Tap. Also 128 1120-FFTs berechnen. 
+
+--> zwischenzeitlich immer den Betrag plotten --> Range-Doppler-Matrix
+
+
+* erstaml mit .pcaps ausprobieren, die zyklisch abgespielt werden. AP-Andi: .pcap raussuchen mit voll belegten DL und UL OFDM Symbolen gleichzeitig (FDD)
