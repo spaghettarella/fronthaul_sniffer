@@ -6,6 +6,7 @@
 #include "core/c_oran_memory.h"
 #include "pipeline/c_packet_queue.h"
 #include "visualization/opengl_visualizer.h"
+#include "analysis/c_iq_analysis.h"
 #include "gui/imgui_startup_interface.h"
 #include "gui/imgui_visualizer_interface.h"
 
@@ -99,6 +100,9 @@ void print_usage(const char* argv0) {
         << "  --ud-iq-width <bits>                  Width of user data IQ samples (default: 9)\n"
         << "  --ud-iq-width-decompressed <bits>     Width of user data IQ samples after decompression (default: 16)\n"
         << "  --ud-comp-method <method>             Compression method for user data (NONE or BFP; default: BFP)\n"
+        << "  --iq-analysis <symbols>               Measure decoded IQ distribution per stream and print a\n"
+        << "                                         report on exit; <symbols> per stream (0 = off, default: 0).\n"
+        << "                                         Use to compare capture paths, e.g. phy tap versus loopback.\n"
         << "  --scs-khz <value>                     Subcarrier spacing in kHz (default: 30)\n"
         << "  --phy-tap-scs-override <bool>         Override --scs-khz with the ocudu phy tap's per-record\n"
         << "                                         numerology; has no effect on other capture backends (default: true)\n"
@@ -112,6 +116,11 @@ int queue_callback(const fh_packet_t* pkt, void* user_ctx) {
     const int rc = fh_packet_queue_push_copy(queue, pkt);
     return (rc < 0) ? -1 : 0;
 }
+
+// Set only when --iq-analysis is requested. Kept at file scope so every
+// decode path feeds the same collector without threading a parameter through
+// each call site.
+fh_iq_analysis_t* g_iq_analysis = nullptr;
 
 int fh_memory_manage(
     fh_packet_t* pkt,
@@ -173,6 +182,12 @@ int fh_memory_manage(
         if (memory_buffer != nullptr) {
             std::lock_guard<std::mutex> lock(memory_data_mutex);
             fh_oran_memory_save(memory_buffer, &decoded, effective_scs_khz);
+            if (g_iq_analysis != nullptr) {
+                // Reads settled rows straight back out of the ring, so a
+                // symbol is measured whole regardless of how it was split
+                // across packets.
+                fh_iq_analysis_observe(g_iq_analysis, key.eaxc_id, key.data_direction, memory_buffer);
+            }
         }
     }
 
@@ -195,6 +210,7 @@ int main(int argc, char** argv) {
 
     bool timeout_specified = false;
 
+    int iq_analysis_symbols = 0;  // 0 = off; see --iq-analysis
     bool ud_comp_hdr_present = false;
     int ud_iq_width = 9;
     int ud_iq_width_decompressed = 16;
@@ -290,6 +306,8 @@ int main(int argc, char** argv) {
             }
         } else if (arg == "--memory-size") {
             memory_symbols = static_cast<std::size_t>(std::stoull(next_arg("--memory-size")));
+        } else if (arg == "--iq-analysis") {
+            iq_analysis_symbols = std::stoi(next_arg("--iq-analysis"));
         } else if (arg == "--ud-comp-hdr-present") {
             ud_comp_hdr_present = (next_arg("--ud-comp-hdr-present") == "true");
         } else if (arg == "--ud-iq-width") {
@@ -567,29 +585,6 @@ int main(int argc, char** argv) {
                 glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
             }
 
-            if (startup_background.enabled) {
-                startup_background.stop_flag = 1;
-                fh_packet_queue_notify_all(startup_background.queue);
-                if (startup_background_capture_thread.joinable()) {
-                    startup_background_capture_thread.join();
-                }
-                for (auto& worker : startup_background_decode_workers) {
-                    if (worker.joinable()) {
-                        worker.join();
-                    }
-                }
-                for (auto& entry : startup_background.memories) {
-                    if (entry.second != nullptr) {
-                        fh_oran_memory_destroy(entry.second);
-                        entry.second = nullptr;
-                    }
-                }
-                if (startup_background.queue != nullptr) {
-                    fh_packet_queue_destroy(startup_background.queue);
-                    startup_background.queue = nullptr;
-                }
-            }
-
             imgui_startup_shutdown(startup_state);
 
             iface = startup_config.iface;
@@ -630,6 +625,48 @@ int main(int argc, char** argv) {
             }
             texture_height = memory_symbols;
             capture_options.interface_name = iface.c_str();
+        }
+
+        // The backdrop capture is started whenever the demo pcap is present,
+        // which is independent of whether the startup screen runs, so it has
+        // to be stopped here rather than inside that branch - otherwise its
+        // threads outlive this scope and are destroyed while still joinable.
+        if (startup_background.enabled) {
+            startup_background.stop_flag = 1;
+            fh_packet_queue_notify_all(startup_background.queue);
+            if (startup_background_capture_thread.joinable()) {
+                startup_background_capture_thread.join();
+            }
+            for (auto& worker : startup_background_decode_workers) {
+                if (worker.joinable()) {
+                    worker.join();
+                }
+            }
+            for (auto& entry : startup_background.memories) {
+                if (entry.second != nullptr) {
+                    fh_oran_memory_destroy(entry.second);
+                    entry.second = nullptr;
+                }
+            }
+            if (startup_background.queue != nullptr) {
+                fh_packet_queue_destroy(startup_background.queue);
+                startup_background.queue = nullptr;
+            }
+            startup_background.enabled = false;
+        }
+
+        // Started only once the backdrop capture has stopped: it runs through
+        // the same decode path, and folding it in would contaminate the very
+        // comparison this is here to make.
+        if (iq_analysis_symbols > 0) {
+            g_iq_analysis = fh_iq_analysis_create(iq_analysis_symbols);
+            if (g_iq_analysis == nullptr) {
+                std::cerr << "warning: could not start IQ analysis\n";
+            } else {
+                std::cout << "[iq-analysis] collecting " << iq_analysis_symbols
+                          << " symbols per stream; report prints on exit\n";
+                fh_iq_bfp_probe_enable(1);
+            }
         }
 
         // Build the bounded packet queue and decoded-packet storage used by the pipeline.
@@ -872,6 +909,14 @@ int main(int argc, char** argv) {
                   << " dropped_pct=" << dropped_pct << "%\n";
         std::cout << "[queue] dropped_packets=" << stats.dropped_packets
                   << " dropped_bytes=" << stats.dropped_bytes << '\n';
+
+        if (g_iq_analysis != nullptr) {
+            const char* source_label = demo_pcap_enabled ? demo_pcap_path.c_str() : iface.c_str();
+            fh_iq_analysis_report(g_iq_analysis, stdout, source_label);
+            fh_iq_bfp_probe_report(stdout);
+            fh_iq_analysis_destroy(g_iq_analysis);
+            g_iq_analysis = nullptr;
+        }
 
         std::cout << "[memory] tracked_streams=" << discovered_keys.size() << '\n';
         for (const auto& key : discovered_keys) {

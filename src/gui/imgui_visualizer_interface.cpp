@@ -8,6 +8,7 @@
 #include <imgui_impl_opengl2.h>
 #include <GLFW/glfw3.h>
 
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 
@@ -17,6 +18,8 @@ struct imgui_visualizer_state {
     int selected_eaxc_id_index;
     uint8_t selected_data_direction;
     uint8_t prev_data_direction;
+
+    int selected_marker;
 
     // Frame timing. The wire frame_id is only 8 bits, so it wraps every 256
     // frames; the memory pairs it with a wraparound count. Accumulating the
@@ -41,6 +44,16 @@ float axis_tick_length(int level) {
     }
 }
 
+// Extra outward offset applied to frame labels, keeping them in their own
+// column clear of the finer subframe/slot divisions.
+const float AXIS_FRAME_LABEL_GAP = 7.0f;
+
+// Right edge shared by everything in the frame-label column, so the running
+// axis and the corner readout stay aligned with each other.
+float axis_frame_label_right_edge(float plot_x) {
+    return plot_x - axis_tick_length(3) - 4.0f - AXIS_FRAME_LABEL_GAP;
+}
+
 ImU32 axis_tick_color(int level) {
     return (level >= 2) ? IM_COL32(220, 220, 220, 255) : IM_COL32(150, 150, 150, 255);
 }
@@ -61,6 +74,8 @@ void draw_plot_axes(opengl_visualizer_t* visualizer, const fh_oran_memory_t* mem
     draw->AddLine(ImVec2(plot_x, plot_bottom), ImVec2(plot_x + plot_w, plot_bottom), axis_color);
 
     visualizer_axis_tick_t ticks[VISUALIZER_MAX_AXIS_TICKS];
+    visualizer_axis_tick_t anchor_tick;
+    bool have_anchor = false;
 
     // Vertical axis: ticks step left out of the plot, labels right-aligned
     // against them so they grow into the margin rather than toward the data.
@@ -77,35 +92,94 @@ void draw_plot_axes(opengl_visualizer_t* visualizer, const fh_oran_memory_t* mem
             continue;
         }
 
-        // A second line means this is the fully spelled-out anchor; stack the
-        // pair and keep it inside the plot's vertical span so it can't spill
-        // into the horizontal axis below.
-        const bool two_line = tick.label2[0] != '\0';
+        // The newest-symbol readout is several lines tall and would crowd the
+        // regular labels where it sits, so it is drawn afterwards down in the
+        // corner beneath the horizontal axis instead.
+        if (tick.is_anchor) {
+            anchor_tick = tick;
+            have_anchor = true;
+            continue;
+        }
+
+        // Labels stack downward, each line right-aligned against the tick so
+        // the block grows into the margin rather than toward the data.
+        const char* lines[3] = { tick.label, tick.label2, tick.label3 };
+        int line_count = 0;
+        for (int l = 0; l < 3; l++) {
+            if (lines[l][0] != '\0') {
+                line_count = l + 1;
+            }
+        }
+        if (line_count == 0) {
+            continue;
+        }
+
         const float line_h = ImGui::GetTextLineHeight();
-        const float block_h = two_line ? line_h * 2.0f : line_h;
+        const float block_h = line_h * (float)line_count;
+        // Keep a little clearance below the axis title at the very top.
+        const float top_limit = plot_y + 6.0f;
         float top_y = tick.position_px - block_h * 0.5f;
-        if (top_y < plot_y) {
-            top_y = plot_y;
+        if (top_y < top_limit) {
+            top_y = top_limit;
         }
         if (top_y + block_h > plot_bottom) {
             top_y = plot_bottom - block_h;
         }
 
-        const ImU32 text_color = two_line ? IM_COL32(255, 240, 150, 255) : label_color;
-        const ImVec2 size = ImGui::CalcTextSize(tick.label);
-        float text_x = plot_x - len - 4.0f - size.x;
-        if (text_x < 2.0f) {
-            text_x = 2.0f;
-        }
-        draw->AddText(ImVec2(text_x, top_y), text_color, tick.label);
-
-        if (two_line) {
-            const ImVec2 size2 = ImGui::CalcTextSize(tick.label2);
-            float text2_x = plot_x - len - 4.0f - size2.x;
-            if (text2_x < 2.0f) {
-                text2_x = 2.0f;
+        // Frame labels sit a little further out than the finer divisions, so
+        // the two groups read as separate columns.
+        const float group_gap = (tick.level >= 3) ? AXIS_FRAME_LABEL_GAP : 0.0f;
+        for (int l = 0; l < line_count; l++) {
+            if (lines[l][0] == '\0') {
+                continue;
             }
-            draw->AddText(ImVec2(text2_x, top_y + line_h), text_color, tick.label2);
+            const ImVec2 size = ImGui::CalcTextSize(lines[l]);
+            float text_x = plot_x - len - 4.0f - group_gap - size.x;
+            if (text_x < 2.0f) {
+                text_x = 2.0f;
+            }
+            draw->AddText(ImVec2(text_x, top_y + line_h * (float)l), label_color, lines[l]);
+        }
+    }
+
+    // Anchor readout, tucked into the corner below the horizontal axis and to
+    // the left of its origin label, where it has room without competing with
+    // either axis.
+    if (have_anchor) {
+        const char* lines[3] = { anchor_tick.label, anchor_tick.label2, anchor_tick.label3 };
+        int line_count = 0;
+        for (int l = 0; l < 3; l++) {
+            if (lines[l][0] != '\0') {
+                line_count = l + 1;
+            }
+        }
+        if (line_count > 0) {
+            int fb_width = 0;
+            int fb_height = 0;
+            visualizer_get_framebuffer_size(visualizer, &fb_width, &fb_height);
+
+            const float line_h = ImGui::GetTextLineHeight();
+            float top_y = plot_bottom + 4.0f;
+            const float block_h = line_h * (float)line_count;
+            if (fb_height > 0 && top_y + block_h > (float)fb_height - 2.0f) {
+                top_y = (float)fb_height - 2.0f - block_h;
+            }
+
+            // Share the frame-label column so this lines up with the frame
+            // numbers running up the axis above it.
+            const float right_edge = axis_frame_label_right_edge(plot_x);
+            const ImU32 anchor_color = IM_COL32(255, 240, 150, 255);
+            for (int l = 0; l < line_count; l++) {
+                if (lines[l][0] == '\0') {
+                    continue;
+                }
+                const ImVec2 size = ImGui::CalcTextSize(lines[l]);
+                float text_x = right_edge - size.x;
+                if (text_x < 2.0f) {
+                    text_x = 2.0f;
+                }
+                draw->AddText(ImVec2(text_x, top_y + line_h * (float)l), anchor_color, lines[l]);
+            }
         }
     }
 
@@ -146,6 +220,92 @@ void draw_plot_axes(opengl_visualizer_t* visualizer, const fh_oran_memory_t* mem
     }
 }
 
+// Five-pointed star, drawn as a dark halo underneath a coloured outline so it
+// stays visible against both ends of the heatmap gradient.
+void draw_marker_star(ImDrawList* draw, ImVec2 centre, float radius, ImU32 color) {
+    ImVec2 points[10];
+    for (int i = 0; i < 10; i++) {
+        const float pi = 3.14159265358979323846f;
+        const float angle = -pi * 0.5f + (float)i * (pi / 5.0f);
+        const float r = (i % 2 == 0) ? radius : radius * 0.42f;
+        points[i] = ImVec2(centre.x + cosf(angle) * r, centre.y + sinf(angle) * r);
+    }
+    draw->AddPolyline(points, 10, IM_COL32(0, 0, 0, 200), ImDrawFlags_Closed, 3.5f);
+    draw->AddPolyline(points, 10, color, ImDrawFlags_Closed, 1.8f);
+}
+
+void draw_markers(opengl_visualizer_t* visualizer) {
+    const int count = visualizer_get_marker_count(visualizer);
+    if (count <= 0) {
+        return;
+    }
+
+    float plot_x = 0.0f, plot_y = 0.0f, plot_w = 0.0f, plot_h = 0.0f;
+    visualizer_get_plot_rect(visualizer, &plot_x, &plot_y, &plot_w, &plot_h);
+    if (plot_w <= 1.0f || plot_h <= 1.0f) {
+        return;
+    }
+    const float plot_right = plot_x + plot_w;
+    const float plot_bottom = plot_y + plot_h;
+
+    ImDrawList* draw = ImGui::GetBackgroundDrawList();
+
+    for (int i = 0; i < count; i++) {
+        visualizer_marker_info_t marker;
+        if (!visualizer_get_marker(visualizer, i, &marker) || !marker.on_screen) {
+            continue;
+        }
+
+        const ImU32 color = IM_COL32(marker.color[0], marker.color[1], marker.color[2], 255);
+        const ImVec2 centre(marker.screen_x, marker.screen_y);
+        draw_marker_star(draw, centre, 7.0f, color);
+
+        char line1[64];
+        char line2[64];
+        if (marker.has_value) {
+            snprintf(line1, sizeof(line1), "#%d  %.1f", i + 1, (double)marker.magnitude);
+            snprintf(line2, sizeof(line2), "%.1f%% base", (double)marker.percent_of_baseline);
+        } else {
+            snprintf(line1, sizeof(line1), "#%d", i + 1);
+            snprintf(line2, sizeof(line2), "no data");
+        }
+
+        const ImVec2 size1 = ImGui::CalcTextSize(line1);
+        const ImVec2 size2 = ImGui::CalcTextSize(line2);
+        const float pad = 4.0f;
+        const float box_w = (size1.x > size2.x ? size1.x : size2.x) + pad * 2.0f;
+        const float box_h = size1.y + size2.y + pad * 2.0f;
+
+        // Prefer the right of the star, flip to the left when that would run
+        // past the plot, then clamp so the box can never reach the axes.
+        float box_x = centre.x + 12.0f;
+        if (box_x + box_w > plot_right) {
+            box_x = centre.x - 12.0f - box_w;
+        }
+        if (box_x < plot_x) {
+            box_x = plot_x;
+        }
+        if (box_x + box_w > plot_right) {
+            box_x = plot_right - box_w;
+        }
+
+        float box_y = centre.y - box_h * 0.5f;
+        if (box_y < plot_y) {
+            box_y = plot_y;
+        }
+        if (box_y + box_h > plot_bottom) {
+            box_y = plot_bottom - box_h;
+        }
+
+        const ImVec2 box_min(box_x, box_y);
+        const ImVec2 box_max(box_x + box_w, box_y + box_h);
+        draw->AddRectFilled(box_min, box_max, IM_COL32(255, 255, 255, 240), 3.0f);
+        draw->AddRect(box_min, box_max, color, 3.0f, 0, 1.5f);
+        draw->AddText(ImVec2(box_x + pad, box_y + pad), IM_COL32(0, 0, 0, 255), line1);
+        draw->AddText(ImVec2(box_x + pad, box_y + pad + size1.y), IM_COL32(0, 0, 0, 255), line2);
+    }
+}
+
 }  // namespace
 
 const char* data_direction_to_string(uint8_t data_direction) {
@@ -171,6 +331,7 @@ imgui_visualizer_state_t* imgui_visualizer_init(int window_width, int window_hei
     state->selected_eaxc_id_index = 0;
     state->selected_data_direction = 0;  // Default to UL
     state->prev_data_direction = 0;
+    state->selected_marker = -1;
     state->frame_tracking_initialized = false;
     state->frame_tracking_memory = nullptr;
     state->last_absolute_frame = 0;
@@ -696,11 +857,115 @@ fh_oran_memory_t* imgui_visualizer_render(
         }
     }
 
-    // Axes. Drawn on the background list so they sit over the heatmap but
-    // under every panel, and entirely within the margins the visualizer
-    // reserves, so they never cover data.
+    // Marker list. Values are re-sampled by the visualizer every frame, so
+    // this only edits positions and reads back what it measured.
+    if (visualizer != nullptr) {
+        ImGui::Begin("Markers", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
+
+        ImGui::Text("Offset from: %s", visualizer_get_marker_reference_label(visualizer));
+        ImGui::TextDisabled("Positive offset = newer (further down)");
+
+        const int marker_count = visualizer_get_marker_count(visualizer);
+        if (ImGui::Button("Add marker")) {
+            const int added = visualizer_add_marker(visualizer);
+            if (added >= 0) {
+                state->selected_marker = added;
+            }
+        }
+        ImGui::SameLine();
+
+        const bool can_remove = state->selected_marker >= 0 && state->selected_marker < marker_count;
+        if (!can_remove) {
+            ImGui::BeginDisabled();
+        }
+        if (ImGui::Button("Remove selected")) {
+            visualizer_remove_marker(visualizer, state->selected_marker);
+            const int remaining = visualizer_get_marker_count(visualizer);
+            if (state->selected_marker >= remaining) {
+                state->selected_marker = remaining - 1;
+            }
+        }
+        if (!can_remove) {
+            ImGui::EndDisabled();
+        }
+
+        if (marker_count == 0) {
+            ImGui::TextDisabled("No markers yet");
+        } else if (ImGui::BeginTable("marker_table", 5,
+                                     ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_RowBg |
+                                         ImGuiTableFlags_BordersInnerV)) {
+            ImGui::TableSetupColumn("#", ImGuiTableColumnFlags_WidthFixed, 40.0f);
+            ImGui::TableSetupColumn("RE", ImGuiTableColumnFlags_WidthFixed, 76.0f);
+            ImGui::TableSetupColumn("Offset", ImGuiTableColumnFlags_WidthFixed, 76.0f);
+            ImGui::TableSetupColumn("IQ", ImGuiTableColumnFlags_WidthFixed, 76.0f);
+            ImGui::TableSetupColumn("% base", ImGuiTableColumnFlags_WidthFixed, 76.0f);
+            ImGui::TableHeadersRow();
+
+            for (int i = 0; i < marker_count; i++) {
+                visualizer_marker_info_t marker;
+                if (!visualizer_get_marker(visualizer, i, &marker)) {
+                    continue;
+                }
+
+                ImGui::TableNextRow();
+                ImGui::PushID(i);
+
+                ImGui::TableSetColumnIndex(0);
+                char id_label[16];
+                snprintf(id_label, sizeof(id_label), "#%d", i + 1);
+                ImGui::PushStyleColor(ImGuiCol_Text,
+                                      ImVec4(marker.color[0] / 255.0f, marker.color[1] / 255.0f,
+                                             marker.color[2] / 255.0f, 1.0f));
+                if (ImGui::Selectable(id_label, state->selected_marker == i)) {
+                    state->selected_marker = i;
+                }
+                ImGui::PopStyleColor();
+
+                ImGui::TableSetColumnIndex(1);
+                int re = marker.re;
+                ImGui::SetNextItemWidth(70.0f);
+                if (ImGui::InputInt("##re", &re, 0, 0)) {
+                    visualizer_set_marker(visualizer, i, re, marker.time_offset);
+                }
+
+                ImGui::TableSetColumnIndex(2);
+                int offset = marker.time_offset;
+                ImGui::SetNextItemWidth(70.0f);
+                if (ImGui::InputInt("##offset", &offset, 0, 0)) {
+                    visualizer_set_marker(visualizer, i, marker.re, offset);
+                }
+
+                ImGui::TableSetColumnIndex(3);
+                if (marker.has_value) {
+                    ImGui::Text("%.1f", static_cast<double>(marker.magnitude));
+                } else {
+                    ImGui::TextDisabled("-");
+                }
+
+                ImGui::TableSetColumnIndex(4);
+                if (marker.has_value) {
+                    ImGui::Text("%.1f%%", static_cast<double>(marker.percent_of_baseline));
+                } else {
+                    ImGui::TextDisabled("-");
+                }
+
+                ImGui::PopID();
+            }
+
+            ImGui::EndTable();
+        }
+
+        ImGui::TextDisabled("Baseline = mean magnitude currently on screen");
+
+        ImGui::End();
+    }
+
+    // Axes and markers. Drawn on the background list so they sit over the
+    // heatmap but under every panel, and entirely within the margins the
+    // visualizer reserves, so they never cover data.
     if (visualizer != nullptr) {
         draw_plot_axes(visualizer, current_display_memory);
+        draw_markers(visualizer);
     }
 
     // Pop the theme colors

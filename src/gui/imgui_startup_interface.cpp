@@ -303,10 +303,23 @@ bool imgui_startup_render(
 
     ImGui::Spacing();
     ImGui::SeparatorText("Decoder");
-    ImGui::Checkbox("User Data Compression Header present", &config->ud_comp_hdr_present);
-    // TODO: implement compression header parsing
+    ImGui::Checkbox("Force user data compression header", &config->ud_comp_hdr_present);
     ImGui::SameLine();
-    ImGui::TextDisabled("ud_comp_hdr parsing not supported yet");
+    ImGui::TextDisabled("(?)");
+    if (ImGui::IsItemHovered()) {
+        ImGui::BeginTooltip();
+        ImGui::TextUnformatted(
+            "When compression parameters travel in band, each U-Plane section header is\n"
+            "followed by a udCompHdr octet and a reserved octet, and the PRB data starts\n"
+            "two bytes later.\n\n"
+            "Leave this off to detect it automatically, separately per eAxC and direction:\n"
+            "the octets have to match the settings below several times in a row before\n"
+            "they are trusted, and a note is printed when that happens.\n\n"
+            "Tick it to skip detection and always parse them, for a sender whose header\n"
+            "does not match the configured width or method.");
+        ImGui::EndTooltip();
+    }
+    ImGui::TextDisabled("Off = detect automatically per stream");
 
     if (ImGui::BeginCombo("Compression Method", config->ud_comp_method.c_str())) {
         for (const char* method : kCompMethods) {

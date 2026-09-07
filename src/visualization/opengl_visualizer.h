@@ -131,11 +131,14 @@ typedef struct visualizer_axis_tick {
     float position_px;
     int level;
     int has_label;
-    char label[48];   // primary label
-    // Second line of the label. On the horizontal axis this is the absolute
-    // RE index; on the vertical axis it carries the remaining detail of the
-    // newest-symbol anchor. "" when unused.
+    int is_anchor;    // the always-labelled newest-symbol readout, highlighted by the caller
+    // Label lines, stacked top to bottom; later ones are "" when unused. The
+    // horizontal axis uses line 2 for the absolute RE index. The vertical
+    // axis splits the frame number from its wrapped id, and the anchor adds
+    // the subframe/slot/symbol detail on line 3.
+    char label[48];
     char label2[48];
+    char label3[48];
 } visualizer_axis_tick_t;
 
 // Both return the number of ticks written. Tick density adapts to how much
@@ -156,6 +159,42 @@ int visualizer_get_x_ticks(const opengl_visualizer_t* vis,
 void visualizer_get_axis_titles(const opengl_visualizer_t* vis,
                                 const char** out_y_title,
                                 const char** out_x_title);
+
+// --- Markers ---
+// Each marker pins a point in the view by frequency (resource element) and
+// time (an offset in symbols from a reference row). The reference is the
+// trigger point when a capture is showing, otherwise the newest symbol -
+// visualizer_get_marker_reference_label() names whichever is in force. A
+// positive offset moves toward newer data, i.e. downward on screen.
+//
+// Values are re-sampled every frame from whatever the view is currently
+// showing, so a marker reads the rolling mean in persistence mode and the
+// held snapshot in a triggered one, without the caller needing to know.
+#define VISUALIZER_MAX_MARKERS 12
+
+typedef struct visualizer_marker_info {
+    int re;                     // 0..3275
+    int time_offset;            // symbols from the reference row
+    int has_value;              // 0 when the marker falls outside the data
+    float magnitude;            // absolute IQ magnitude at the marker
+    float percent_of_baseline;  // relative to the mean magnitude on screen
+    int on_screen;              // whether screen_x/screen_y are usable
+    float screen_x;
+    float screen_y;
+    unsigned char color[3];
+} visualizer_marker_info_t;
+
+// Returns the new marker's index, or -1 when the list is full.
+int visualizer_add_marker(opengl_visualizer_t* vis);
+void visualizer_remove_marker(opengl_visualizer_t* vis, int index);
+int visualizer_get_marker_count(const opengl_visualizer_t* vis);
+
+// Returns 1 and fills out_info on success, 0 for an invalid index.
+int visualizer_get_marker(const opengl_visualizer_t* vis, int index, visualizer_marker_info_t* out_info);
+void visualizer_set_marker(opengl_visualizer_t* vis, int index, int re, int time_offset);
+
+// Names what marker offsets are measured from, for labelling the UI.
+const char* visualizer_get_marker_reference_label(const opengl_visualizer_t* vis);
 
 // --- Waterfall trigger ---
 // Oscilloscope-style triggering for the waterfall's raw (non-persistence)

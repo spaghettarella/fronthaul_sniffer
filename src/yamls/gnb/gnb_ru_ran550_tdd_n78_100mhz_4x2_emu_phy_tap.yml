@@ -1,0 +1,121 @@
+cu_cp:
+  amf:
+    addr: 127.0.0.5
+    port: 38412
+    bind_addr: 127.0.0.1
+    supported_tracking_areas:
+      - tac: 7
+        plmn_list:
+          - plmn: "00101"
+            tai_slice_support_list:
+              - sst: 1
+
+ru_ofh:
+  t1a_max_cp_dl: 535
+  t1a_min_cp_dl: 286
+  t1a_max_cp_ul: 535
+  t1a_min_cp_ul: 286
+  t1a_max_up: 390
+  t1a_min_up: 80
+  ta4_max: 500
+  ta4_min: 25
+  is_prach_cp_enabled: true
+  compr_method_ul: bfp
+  compr_bitwidth_ul: 9
+  compr_method_dl: bfp
+  compr_bitwidth_dl: 9
+  compr_method_prach: bfp
+  compr_bitwidth_prach: 9
+  enable_ul_static_compr_hdr: false
+  enable_dl_static_compr_hdr: false
+  iq_scaling: 20
+  warn_unreceived_ru_frames: always
+  cells:
+    - network_interface: lo
+      ru_mac_addr: 00:00:00:00:00:00
+      du_mac_addr: 00:00:00:00:00:00
+      #vlan_tag_cp: 2
+      #vlan_tag_up: 2
+      prach_port_id: [4, 5]
+      dl_port_id: [0, 1, 2, 3]
+      ul_port_id: [0, 1]
+      enable_promiscuous: true
+
+cell_cfg:
+  dl_arfcn: 650000
+  band: 78
+  channel_bandwidth_MHz: 100
+  common_scs: 30
+  plmn: "00101"
+  tac: 7
+  pci: 1
+  nof_antennas_dl: 4
+  nof_antennas_ul: 2
+  prach:
+    # Variant selected in the installer: short prach.
+    prach_config_index: 159
+    prach_root_sequence_index: 1
+    zero_correlation_zone: 0
+    prach_frequency_start: 0
+  tdd_ul_dl_cfg:
+    dl_ul_tx_period: 10
+    nof_dl_slots: 7
+    nof_dl_symbols: 6
+    nof_ul_slots: 2
+    nof_ul_symbols: 4
+  ssb:
+    ssb_period: 20
+    ssb_block_power_dbm: -11
+  pucch:
+    sr_period_ms: 5
+    min_k1: 2
+    p0_nominal: -90
+  csi:
+    csi_rs_period: 40
+  pdsch:
+    mcs_table: qam256
+    olla_target_bler: 0.1
+    dc_offset: center
+  pusch:
+    mcs_table: qam64
+    olla_target_bler: 0.1
+    max_rank: 2
+    min_k2: 2
+    p0_nominal_with_grant: -80
+
+expert_phy:
+  enable_phy_tap: true
+  phy_tap_arguments: enable_quiet_processing=true,log_level=debug,tap_ul_epre=tcp://127.0.0.1:5555
+  max_request_headroom_slots: 0
+  max_proc_delay: 4
+  pusch_dec_max_iterations: 10
+  pusch_channel_estimator_td_strategy: interpolate
+  pusch_channel_estimator_cfo_compensation: false
+  pusch_channel_equalizer_algorithm: mmse
+
+expert_execution:
+  threads:
+    upper_phy:
+      pdsch_processor_type: flexible
+      max_pucch_concurrency: 2
+      max_pusch_and_srs_concurrency: 4
+      max_pdsch_concurrency: 4
+      pdsch_cb_batch_length: 8
+
+metrics:
+  autostart_stdout_metrics: true
+  enable_json: true
+
+remote_control:
+  enabled: true
+  bind_addr: 0.0.0.0
+
+log:
+  filename: /tmp/gnb.log
+  all_level: info
+
+pcap:
+  mac_enable: false
+  mac_filename: /tmp/gnb_mac.pcap
+  ngap_enable: false
+  ngap_filename: /tmp/gnb_ngap.pcap

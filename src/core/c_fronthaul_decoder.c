@@ -10,6 +10,7 @@
 #include <net/ethernet.h>
 
 #include "bfp_decompress.h"
+#include "analysis/c_iq_analysis.h"
 
 enum {
     FH_PHY_TAP_PACKET_MAGIC = 0x46505450u,
@@ -87,6 +88,88 @@ struct oran_iq_section_header {
 } __attribute__((packed));
 
 int extract_iq_samples(const char *ptr_prb, int bit_width, float i_samples[12], float q_samples[12]);
+
+// When the compression parameters travel in band, an O-RAN U-Plane section
+// header is followed by a udCompHdr octet - high nibble udIqWidth, low nibble
+// udCompMeth - and then a reserved octet, so the PRB data starts two bytes
+// later. Whether a sender includes them is not something the receiver can
+// assume, and getting it wrong is silent and destructive: every PRB is then
+// read at the wrong offset, the per-PRB exponent comes out of mantissa data,
+// and each PRB gets scaled by an arbitrary power of two.
+//
+// Returns the number of bytes to skip: 2 when present, 0 when not.
+//
+// The caller's flag forces "present" when set. Otherwise the pair is checked
+// against what the configured settings imply - a fixed udCompHdr value and a
+// zero reserved octet - and has to match repeatedly before it is trusted, so
+// a chance collision with mantissa data cannot switch parsing over.
+//
+// Tracked per eAxC and direction rather than globally: senders need not agree
+// with each other, and a single shared decision would apply one stream's
+// layout to every other one. The decision latches per stream so parsing
+// cannot flip mid-capture. The table is written without locking, so with
+// several decode threads two of them may race on the same stream's streak;
+// that can only delay the latch, never corrupt the decision.
+#define UDCOMPHDR_MAX_STREAMS 16
+
+static int section_udcomphdr_length(const uint8_t* candidate, bool flag_says_present,
+                                    int configured_iq_width, int configured_comp_code,
+                                    uint16_t eaxc_id, uint8_t data_direction) {
+    if (flag_says_present) {
+        return 2;
+    }
+
+    static struct {
+        int in_use;
+        uint16_t eaxc_id;
+        uint8_t data_direction;
+        int latched;
+        int streak;
+    } streams[UDCOMPHDR_MAX_STREAMS];
+
+    int slot = -1;
+    for (int i = 0; i < UDCOMPHDR_MAX_STREAMS; i++) {
+        if (streams[i].in_use && streams[i].eaxc_id == eaxc_id &&
+            streams[i].data_direction == data_direction) {
+            slot = i;
+            break;
+        }
+        if (!streams[i].in_use) {
+            streams[i].in_use = 1;
+            streams[i].eaxc_id = eaxc_id;
+            streams[i].data_direction = data_direction;
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        return 0;  // more streams than tracked; leave the layout unchanged
+    }
+    if (streams[slot].latched) {
+        return 2;
+    }
+
+    // udIqWidth is encoded modulo 16, so a 16-bit width travels as 0.
+    const int width_nibble = (configured_iq_width >= 16) ? 0 : (configured_iq_width & 0x0F);
+    const uint8_t expected = (uint8_t)((width_nibble << 4) | (configured_comp_code & 0x0F));
+
+    if (candidate[0] == expected && candidate[1] == 0x00) {
+        streams[slot].streak++;
+        if (streams[slot].streak >= 8) {
+            streams[slot].latched = 1;
+            fprintf(stderr,
+                    "Note: udCompHdr 0x%02X + reserved octet detected on eAxC 0x%04X %s "
+                    "(iqWidth=%d, compMeth=%d); parsing them even though "
+                    "--ud-comp-hdr-present was not set\n",
+                    expected, eaxc_id, (data_direction == 0) ? "UL" : "DL",
+                    configured_iq_width, configured_comp_code & 0x0F);
+            return 2;
+        }
+    } else {
+        streams[slot].streak = 0;
+    }
+    return 0;
+}
 
 int fh_decode_packet(const fh_packet_t* raw_pkt, fh_decoded_packet_t* decoded_pkt, bool ud_comp_hdr_present, int ud_iq_width, int ud_iq_width_decompressed, const char *ud_comp_method) {
     if (raw_pkt == NULL || decoded_pkt == NULL) {
@@ -309,7 +392,8 @@ int fh_decode_packet(const fh_packet_t* raw_pkt, fh_decoded_packet_t* decoded_pk
 
                 const bool use_bfp = (strcmp(ud_comp_method, "BFP") == 0);
                 const bool use_none = (strcmp(ud_comp_method, "NONE") == 0);
-                int ud_comp_param_length = use_bfp ? 1 : 0;
+                // udCompMeth codes: 0 = no compression, 1 = block floating point.
+                const int configured_comp_code = use_bfp ? 1 : 0;
 
                 // Handle Sections
                 int section_length = 0;
@@ -329,7 +413,7 @@ int fh_decode_packet(const fh_packet_t* raw_pkt, fh_decoded_packet_t* decoded_pk
                 }
                 while (payload_left - section_length > 0) {
 
-                    if (ud_comp_hdr_present == false) {
+                    {
                         if (section_count >= MAX_SECTIONS) {
                             // avoid buffer overflow into sections array
                             break;
@@ -338,15 +422,43 @@ int fh_decode_packet(const fh_packet_t* raw_pkt, fh_decoded_packet_t* decoded_pk
                         struct oran_iq_section_header *section = (struct oran_iq_section_header *)(ptr_section);
                         uint16_t section_id = ((section->section_id_first & 0x0F) << 8) | (section->section_id_last & 0x0F);
                         uint16_t start_prbu = ((section->start_prbu_first & 0x03) << 8) | (section->start_prbu_last & 0xFF);
+
+                        // Resolve the compression parameters for this section
+                        // before any offset arithmetic: when the udCompHdr is
+                        // present it both shifts the PRB data along by a byte
+                        // and states the real width and method, which the
+                        // configured settings can disagree with.
+                        const uint8_t *ptr_after_section_hdr = ptr_section + sizeof(struct oran_iq_section_header);
+                        const int udcomphdr_length = section_udcomphdr_length(
+                            ptr_after_section_hdr, ud_comp_hdr_present, ud_iq_width, configured_comp_code,
+                            ntohs(ecpri->eaxc_id), oran->data_direction);
+
+                        int sec_iq_width = ud_iq_width;
+                        bool sec_use_bfp = use_bfp;
+                        bool sec_use_none = use_none;
+                        if (udcomphdr_length) {
+                            const int hdr_iq_width = (ptr_after_section_hdr[0] >> 4) & 0x0F;
+                            const int hdr_comp_meth = ptr_after_section_hdr[0] & 0x0F;
+                            // The wire describes itself, so prefer it over the
+                            // configured values. udIqWidth 0 means 16 bits.
+                            sec_iq_width = (hdr_iq_width == 0) ? 16 : hdr_iq_width;
+                            sec_use_bfp = (hdr_comp_meth == 1);
+                            sec_use_none = (hdr_comp_meth == 0);
+                        }
+
+                        const int ud_comp_param_length = sec_use_bfp ? 1 : 0;
+                        const int prb_stride = (sec_iq_width * 2 * 12) / 8 + ud_comp_param_length;
+                        const uint8_t *ptr_prb_area = ptr_after_section_hdr + udcomphdr_length;
+
                         int num_prbu_corrected = 0;
                         if (section->num_prbu == 0) {
                             //printf("      Warning: 0 PRBUs are to be interpreted full bandwidth (273 PRBUs).\n");
-                            section_length = sizeof(struct oran_iq_section_header) + (((ud_iq_width * 2 * 12) / 8 + ud_comp_param_length) * 273);
                             num_prbu_corrected = 273;
                         } else {
-                            section_length = sizeof(struct oran_iq_section_header) + (((ud_iq_width * 2 * 12) / 8 + ud_comp_param_length) * section->num_prbu);
                             num_prbu_corrected = section->num_prbu;
                         }
+                        section_length = (int)sizeof(struct oran_iq_section_header) + udcomphdr_length +
+                                         prb_stride * num_prbu_corrected;
                         /*printf("      ORAN IQ Section Header:\n");
                         printf("      Section ID: 0x%03x (%d)\n", section_id, section_id);
                         printf("      RB: %u\n", section->rb);
@@ -377,10 +489,34 @@ int fh_decode_packet(const fh_packet_t* raw_pkt, fh_decoded_packet_t* decoded_pk
                         }
                         decoded_pkt->section_count++;
 
+                        if (sec_use_bfp) {
+                            // Diagnostic only: records where the per-PRB
+                            // exponents appear to actually live. Inert unless
+                            // the probe was enabled. Measured from the same
+                            // place the decode below reads, so it reports on
+                            // the corrected layout rather than the old one.
+                            //
+                            // The bound is what the packet really holds, not
+                            // what the section claims, so the probe can report
+                            // sections asking for more PRBs than were captured.
+                            const uint8_t *payload_end = ptr_oran + ntohs(ecpri->payload_size);
+                            const uint8_t *capture_end = raw_pkt->data + raw_pkt->caplen;
+                            const uint8_t *limit = (payload_end < capture_end) ? payload_end : capture_end;
+                            const int available = (limit > ptr_prb_area) ? (int)(limit - ptr_prb_area) : 0;
+                            fh_iq_bfp_probe_note_section(
+                                decoded_pkt->sections[section_count].eaxc_id,
+                                decoded_pkt->sections[section_count].data_direction,
+                                ptr_after_section_hdr,
+                                udcomphdr_length,
+                                decoded_pkt->sections[section_count].num_prbu,
+                                prb_stride,
+                                available + udcomphdr_length);
+                        }
+
                         int iq_chunk_prb_idx = 0;
                         // Handle PRBs
                         for (size_t prb = 0; prb < decoded_pkt->sections[section_count].num_prbu; prb++) {
-                            const uint8_t *ptr_prb = ptr_section + sizeof(struct oran_iq_section_header) + prb * ((ud_iq_width * 2 * 12) / 8 + ud_comp_param_length);
+                            const uint8_t *ptr_prb = ptr_prb_area + prb * prb_stride;
                             /*if (strcmp(ud_comp_method, "BFP") == 0) {
                                 printf("        UD Compression Param: Reserved: %d, Exponent: %d\n", ptr_prb[0] & 0xF0, ptr_prb[0] & 0x0F);
                             }
@@ -391,11 +527,11 @@ int fh_decode_packet(const fh_packet_t* raw_pkt, fh_decoded_packet_t* decoded_pk
                             printf("\n");*/
 
                             float i_samples[12], q_samples[12];
-                            if (use_none) {
+                            if (sec_use_none) {
                                 // Convert IQ data to array
                                 int iq_result = extract_iq_samples(
                                     (const char *)(ptr_prb + ud_comp_param_length),
-                                    ud_iq_width,
+                                    sec_iq_width,
                                     i_samples, q_samples);
 
                                 if (iq_result == 0) {
@@ -409,11 +545,11 @@ int fh_decode_packet(const fh_packet_t* raw_pkt, fh_decoded_packet_t* decoded_pk
                                     printf("        IQ Sample Extraction failed with error code: %d\n", iq_result);
                                 }
 
-                            } else if (use_bfp) {
+                            } else if (sec_use_bfp) {
                                 int decomp_result = bfp_decompress_prb(
                                     (const char *)(ptr_prb + ud_comp_param_length),
                                     ud_iq_width_decompressed,
-                                    ud_iq_width,
+                                    sec_iq_width,
                                     ptr_prb[0] & 0x0F,
                                     i_samples, q_samples);
 
@@ -433,8 +569,6 @@ int fh_decode_packet(const fh_packet_t* raw_pkt, fh_decoded_packet_t* decoded_pk
                         //printf("\n");
                         //free(ptr_iq_chunk);
                         payload_left -= section_length;
-                    } else {
-                        printf("  IQ Data Compression Header parsing not implemented yet.\n");
                     }
                     section_count++;
                 }

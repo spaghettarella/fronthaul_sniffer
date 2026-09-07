@@ -131,6 +131,13 @@ typedef struct opengl_visualizer {
 
     // What the rows currently on screen represent, captured while rendering
     // so the axis code doesn't have to re-derive which view branch ran.
+    // Markers, plus the mean magnitude of whatever is on screen that their
+    // percentages are measured against.
+    visualizer_marker_info_t markers[VISUALIZER_MAX_MARKERS];
+    int marker_count;
+    float display_mean_magnitude;
+    int display_mean_valid;
+
     int axes_enabled;      // margins reserved for axes; off makes the view full-bleed
     int axis_valid;
     int axis_rows;         // texture rows spanning the plot height
@@ -162,6 +169,25 @@ static void extract_iq(fh_complex_t val, float& i_val, float& q_val) {
 
 static void error_callback(int error, const char* description) {
     fprintf(stderr, "GLFW error %d: %s\n", error, description);
+}
+
+// Advances the display's normalisation toward the level just measured.
+// Small changes are smoothed so the colours do not flicker frame to frame;
+// a large change means the previous level is simply wrong for this signal,
+// so it is taken immediately rather than eased into over many frames.
+static float magnitude_scale_step(float current, float measured) {
+    const float alpha_rise = 0.35f;
+    const float alpha_fall = 0.08f;
+    const float snap_ratio = 2.0f;  // a factor-of-two gap is a different signal, not drift
+
+    if (current <= 1e-6f) {
+        return measured;
+    }
+    if (measured > current * snap_ratio || measured < current / snap_ratio) {
+        return measured;
+    }
+    const float alpha = (measured > current) ? alpha_rise : alpha_fall;
+    return alpha * measured + (1.0f - alpha) * current;
 }
 
 // Map magnitude to RGB heatmap color (0 = dark, max = white-hot)
@@ -484,9 +510,11 @@ static void trigger_reset_state(opengl_visualizer_t* vis) {
 }
 
 void visualizer_set_trigger_mode(opengl_visualizer_t* vis, visualizer_trigger_mode_t mode) {
-    if (!vis || mode == vis->trigger_mode) {
+    if (!vis) {
         return;
     }
+    // Reset even when the mode is unchanged, so re-picking the current mode
+    // is always a way out of a stuck state rather than a no-op.
     vis->trigger_mode = mode;
     trigger_reset_state(vis);
 }
@@ -747,6 +775,9 @@ opengl_visualizer_t* visualizer_create(int width, int height, int texture_height
     vis->trigger_baseline_initialized = 0;
     vis->trigger_last_peak = 0.0f;
     vis->trigger_last_fire_threshold = 0.0f;
+    vis->marker_count = 0;
+    vis->display_mean_magnitude = 0.0f;
+    vis->display_mean_valid = 0;
     vis->axes_enabled = 1;
     vis->axis_valid = 0;
     vis->axis_rows = 0;
@@ -1023,10 +1054,7 @@ static void draw_curve_view(opengl_visualizer_t* vis, const fh_oran_memory_t* me
         vis->curve_magnitude_scale_ema = max_magnitude;
         vis->curve_magnitude_scale_initialized = 1;
     } else {
-        const float alpha_rise = 0.35f;
-        const float alpha_fall = 0.08f;
-        const float alpha = (max_magnitude > vis->curve_magnitude_scale_ema) ? alpha_rise : alpha_fall;
-        vis->curve_magnitude_scale_ema = alpha * max_magnitude + (1.0f - alpha) * vis->curve_magnitude_scale_ema;
+        vis->curve_magnitude_scale_ema = magnitude_scale_step(vis->curve_magnitude_scale_ema, max_magnitude);
     }
     const float render_scale = (vis->curve_magnitude_scale_ema > 1e-6f) ? vis->curve_magnitude_scale_ema : 1e-6f;
 
@@ -1150,6 +1178,28 @@ static void draw_curve_view(opengl_visualizer_t* vis, const fh_oran_memory_t* me
 // visualizer_trigger_edge_t, once fired it won't fire again until the signal
 // crosses back the other way first, so a sustained high (rising) or
 // sustained low (falling) doesn't repeatedly retrigger.
+// Streams number their symbols independently, so state carried over from a
+// different one leaves the scan position outside the window that actually
+// exists. Treat that as a reason to re-seed rather than trying to scan a
+// range that can never match, which would otherwise wedge the trigger.
+static int trigger_numbering_is_stale(const opengl_visualizer_t* vis, const fh_oran_memory_t* memory) {
+    if (!vis->trigger_has_last_checked) {
+        return 0;
+    }
+    if (vis->trigger_last_checked_symbol > memory->symbol_highest) {
+        return 1;
+    }
+    if (vis->trigger_last_checked_symbol < memory->symbol_lowest - TRIGGER_MAX_SCAN_SYMBOLS) {
+        return 1;
+    }
+    if (vis->trigger_captured_symbol != TRIGGER_NO_SYMBOL &&
+        (vis->trigger_captured_symbol > memory->symbol_highest ||
+         vis->trigger_captured_symbol < memory->symbol_lowest - TRIGGER_MAX_SCAN_SYMBOLS)) {
+        return 1;
+    }
+    return 0;
+}
+
 static float symbol_peak_in_range(const fh_oran_memory_t* memory, size_t idx, int col_start, int col_end) {
     float peak = 0.0f;
     for (int col = col_start; col < col_end; col++) {
@@ -1195,6 +1245,10 @@ static void trigger_scan_mean_new_symbols(opengl_visualizer_t* vis, const fh_ora
     const int col_start = vis->trigger_freq_start;
     const int col_end = (vis->trigger_freq_end <= HEATMAP_TEXTURE_WIDTH) ? vis->trigger_freq_end : HEATMAP_TEXTURE_WIDTH;
     const int period = vis->persist_period;
+
+    if (trigger_numbering_is_stale(vis, memory)) {
+        trigger_reset_state(vis);
+    }
 
     // Seed from the accumulator itself: its rows are already a settled
     // average over the warm-up, so the baseline is meaningful immediately.
@@ -1303,6 +1357,10 @@ static void trigger_scan_new_symbols(opengl_visualizer_t* vis, const fh_oran_mem
     const int col_start = vis->trigger_freq_start;
     const int col_end = (vis->trigger_freq_end <= HEATMAP_TEXTURE_WIDTH) ? vis->trigger_freq_end : HEATMAP_TEXTURE_WIDTH;
 
+    if (trigger_numbering_is_stale(vis, memory)) {
+        trigger_reset_state(vis);
+    }
+
     // A fresh arm (startup, mode change, or a channel switch) faces a ring
     // already full of history belonging to whatever was selected before.
     // Detecting across that backlog would fire on data that is already at
@@ -1374,7 +1432,15 @@ static void trigger_scan_new_symbols(opengl_visualizer_t* vis, const fh_oran_mem
     // pre-trigger half available in the ring; anything older would render
     // half-blank immediately. This replaces the old "skip the whole backlog"
     // guard with a precise constraint on *firing* rather than on scanning.
-    const int oldest_firable_symbol = memory->symbol_lowest + (vis->trigger_capture_depth / 2);
+    // Never let the margin grow past what the ring can hold, or a capture
+    // depth close to (or beyond) the memory size would put every symbol out
+    // of reach and the trigger could never fire at all.
+    int firable_margin = vis->trigger_capture_depth / 2;
+    const int window_span = memory->symbol_highest - memory->symbol_lowest;
+    if (firable_margin > window_span / 2) {
+        firable_margin = window_span / 2;
+    }
+    const int oldest_firable_symbol = memory->symbol_lowest + firable_margin;
 
     int can_start_capture = !vis->trigger_capture_active &&
                              !(vis->trigger_mode == TRIGGER_SINGLE && vis->trigger_single_done);
@@ -1506,6 +1572,82 @@ void visualizer_get_framebuffer_size(const opengl_visualizer_t* vis, int* out_wi
     }
 }
 
+// Distinct hues so adjacent markers stay tellable apart at a glance.
+static const unsigned char MARKER_PALETTE[][3] = {
+    { 255, 80, 80 },   { 80, 200, 255 },  { 120, 255, 120 }, { 255, 200, 60 },
+    { 220, 120, 255 }, { 255, 140, 40 },  { 80, 255, 220 },  { 255, 105, 180 },
+    { 160, 160, 255 }, { 200, 255, 80 },  { 255, 255, 255 }, { 150, 220, 180 },
+};
+
+int visualizer_add_marker(opengl_visualizer_t* vis) {
+    if (!vis || vis->marker_count >= VISUALIZER_MAX_MARKERS) {
+        return -1;
+    }
+    const int index = vis->marker_count++;
+    visualizer_marker_info_t* m = &vis->markers[index];
+    memset(m, 0, sizeof(*m));
+    // Drop a new marker in the middle of the grid at the reference row, so it
+    // lands somewhere visible rather than needing to be hunted for.
+    m->re = HEATMAP_TEXTURE_WIDTH / 2;
+    m->time_offset = 0;
+    const size_t palette_size = sizeof(MARKER_PALETTE) / sizeof(MARKER_PALETTE[0]);
+    m->color[0] = MARKER_PALETTE[index % palette_size][0];
+    m->color[1] = MARKER_PALETTE[index % palette_size][1];
+    m->color[2] = MARKER_PALETTE[index % palette_size][2];
+    return index;
+}
+
+void visualizer_remove_marker(opengl_visualizer_t* vis, int index) {
+    if (!vis || index < 0 || index >= vis->marker_count) {
+        return;
+    }
+    for (int i = index; i < vis->marker_count - 1; i++) {
+        vis->markers[i] = vis->markers[i + 1];
+        // Keep colours tied to list position so numbering and colour agree.
+        const size_t palette_size = sizeof(MARKER_PALETTE) / sizeof(MARKER_PALETTE[0]);
+        vis->markers[i].color[0] = MARKER_PALETTE[i % palette_size][0];
+        vis->markers[i].color[1] = MARKER_PALETTE[i % palette_size][1];
+        vis->markers[i].color[2] = MARKER_PALETTE[i % palette_size][2];
+    }
+    vis->marker_count--;
+}
+
+int visualizer_get_marker_count(const opengl_visualizer_t* vis) {
+    return vis ? vis->marker_count : 0;
+}
+
+int visualizer_get_marker(const opengl_visualizer_t* vis, int index, visualizer_marker_info_t* out_info) {
+    if (!vis || !out_info || index < 0 || index >= vis->marker_count) {
+        return 0;
+    }
+    *out_info = vis->markers[index];
+    return 1;
+}
+
+void visualizer_set_marker(opengl_visualizer_t* vis, int index, int re, int time_offset) {
+    if (!vis || index < 0 || index >= vis->marker_count) {
+        return;
+    }
+    if (re < 0) {
+        re = 0;
+    }
+    if (re >= HEATMAP_TEXTURE_WIDTH) {
+        re = HEATMAP_TEXTURE_WIDTH - 1;
+    }
+    vis->markers[index].re = re;
+    vis->markers[index].time_offset = time_offset;
+}
+
+const char* visualizer_get_marker_reference_label(const opengl_visualizer_t* vis) {
+    if (!vis) {
+        return "newest symbol";
+    }
+    if (vis->trigger_mode != TRIGGER_OFF && vis->trigger_captured_symbol != TRIGGER_NO_SYMBOL) {
+        return "trigger point";
+    }
+    return vis->persist_enabled ? "last row in period" : "newest symbol";
+}
+
 void visualizer_set_axes_enabled(opengl_visualizer_t* vis, int enabled) {
     if (vis) {
         vis->axes_enabled = enabled ? 1 : 0;
@@ -1607,8 +1749,10 @@ int visualizer_get_y_ticks(const opengl_visualizer_t* vis,
             t->position_px = plot_y + frac * plot_h;
             t->level = (pct == 0 || pct == 100) ? 2 : 1;
             t->has_label = 1;
+            t->is_anchor = 0;
             snprintf(t->label, sizeof(t->label), "%d%%", pct);
             t->label2[0] = '\0';
+            t->label3[0] = '\0';
         }
         return count;
     }
@@ -1643,16 +1787,16 @@ int visualizer_get_y_ticks(const opengl_visualizer_t* vis,
             t->position_px = plot_y + (float)anchor_row * px_per_row;
             t->level = 3;
             t->has_label = 1;
+            t->is_anchor = 1;
             snprintf(t->label, sizeof(t->label), "phase +%d", phase);
             if (subframe_useful) {
-                snprintf(t->label2, sizeof(t->label2), "sf+%d sl+%d sym%d",
+                snprintf(t->label2, sizeof(t->label2), "sf+%d sl+%d",
                          phase / symbols_per_subframe,
-                         (phase % symbols_per_subframe) / SYMBOLS_PER_SLOT,
-                         phase % SYMBOLS_PER_SLOT);
+                         (phase % symbols_per_subframe) / SYMBOLS_PER_SLOT);
             } else {
-                snprintf(t->label2, sizeof(t->label2), "sl+%d sym%d",
-                         phase / SYMBOLS_PER_SLOT, phase % SYMBOLS_PER_SLOT);
+                snprintf(t->label2, sizeof(t->label2), "sl+%d", phase / SYMBOLS_PER_SLOT);
             }
+            snprintf(t->label3, sizeof(t->label3), "sym%d", phase % SYMBOLS_PER_SLOT);
         }
 
         for (int row = 0; row < vis->axis_rows && count < max_ticks; row++) {
@@ -1687,7 +1831,9 @@ int visualizer_get_y_ticks(const opengl_visualizer_t* vis,
             t->position_px = plot_y + (float)row * px_per_row;
             t->level = level;
             t->has_label = labelled;
+            t->is_anchor = 0;
             t->label2[0] = '\0';
+            t->label3[0] = '\0';
             if (!labelled) {
                 t->label[0] = '\0';
             } else if (level == 2) {
@@ -1736,11 +1882,13 @@ int visualizer_get_y_ticks(const opengl_visualizer_t* vis,
         t->position_px = plot_y + (float)anchor_row * px_per_row;
         t->level = 3;
         t->has_label = 1;
+        t->is_anchor = 1;
         if (symbols_per_frame > 0) {
             const unsigned long long frame = (unsigned long long)(anchor_symbol / symbols_per_frame);
             const int in_frame = anchor_symbol % symbols_per_frame;
-            snprintf(t->label, sizeof(t->label), "F%llu (%llu)", frame, frame % 256ULL);
-            snprintf(t->label2, sizeof(t->label2), "sf%d sl%d sym%d",
+            snprintf(t->label, sizeof(t->label), "F%llu", frame);
+            snprintf(t->label2, sizeof(t->label2), "(%llu)", frame % 256ULL);
+            snprintf(t->label3, sizeof(t->label3), "sf%d sl%d sym%d",
                      in_frame / symbols_per_subframe,
                      (in_frame % symbols_per_subframe) / SYMBOLS_PER_SLOT,
                      anchor_symbol % SYMBOLS_PER_SLOT);
@@ -1749,6 +1897,7 @@ int visualizer_get_y_ticks(const opengl_visualizer_t* vis,
             snprintf(t->label, sizeof(t->label), "sym %d", anchor_symbol);
             snprintf(t->label2, sizeof(t->label2), "sl%d sym%d",
                      anchor_symbol / SYMBOLS_PER_SLOT, anchor_symbol % SYMBOLS_PER_SLOT);
+            t->label3[0] = '\0';
         }
     }
 
@@ -1791,7 +1940,9 @@ int visualizer_get_y_ticks(const opengl_visualizer_t* vis,
         t->position_px = plot_y + (float)row * px_per_row;
         t->level = level;
         t->has_label = labelled;
+        t->is_anchor = 0;
         t->label2[0] = '\0';
+        t->label3[0] = '\0';
 
         if (!labelled) {
             t->label[0] = '\0';
@@ -1799,7 +1950,9 @@ int visualizer_get_y_ticks(const opengl_visualizer_t* vis,
             const unsigned long long frame = (unsigned long long)(symbol / symbols_per_frame);
             // Both numbers matter: the absolute one keeps counting, the
             // parenthesised one is the 8-bit id actually carried on the wire.
-            snprintf(t->label, sizeof(t->label), "F%llu (%llu)", frame, frame % 256ULL);
+            // Stacked rather than side by side so the pair stays narrow.
+            snprintf(t->label, sizeof(t->label), "F%llu", frame);
+            snprintf(t->label2, sizeof(t->label2), "(%llu)", frame % 256ULL);
         } else if (level == 2) {
             snprintf(t->label, sizeof(t->label), "sf%d",
                      (symbol % symbols_per_frame) / symbols_per_subframe);
@@ -1854,6 +2007,8 @@ int visualizer_get_x_ticks(const opengl_visualizer_t* vis,
         t->position_px = plot_x + (float)(re - re_first) * px_per_re;
         t->level = 1;
         t->has_label = on_step;
+        t->is_anchor = 0;
+        t->label3[0] = '\0';
         if (on_step) {
             snprintf(t->label, sizeof(t->label), "%d", prb);
             snprintf(t->label2, sizeof(t->label2), "%d", re);
@@ -1870,7 +2025,9 @@ int visualizer_get_x_ticks(const opengl_visualizer_t* vis,
             st->position_px = plot_x + (float)(re + sub - re_first) * px_per_re;
             st->level = 0;
             st->has_label = label_re;
+            st->is_anchor = 0;
             st->label2[0] = '\0';
+            st->label3[0] = '\0';
             if (label_re) {
                 snprintf(st->label, sizeof(st->label), "%d", sub);
             } else {
@@ -1880,6 +2037,84 @@ int visualizer_get_x_ticks(const opengl_visualizer_t* vis,
     }
 
     return count;
+}
+
+// Re-sample every marker against the view that was just rendered, so each
+// one reports whatever that view is showing: the rolling mean in persistence
+// mode, the held snapshot in a triggered one, or the live ring otherwise.
+static void markers_evaluate(opengl_visualizer_t* vis, const fh_oran_memory_t* memory) {
+    float plot_x = 0.0f, plot_y = 0.0f, plot_w = 1.0f, plot_h = 1.0f;
+    visualizer_get_plot_rect(vis, &plot_x, &plot_y, &plot_w, &plot_h);
+
+    const int rows = vis->axis_rows > 0 ? vis->axis_rows : 1;
+    const int showing_triggered = vis->trigger_mode != TRIGGER_OFF &&
+                                   vis->trigger_captured_symbol != TRIGGER_NO_SYMBOL;
+    // Offsets are measured from the trigger row when one is held, otherwise
+    // from the bottom row, which carries the newest symbol.
+    const int reference_row = showing_triggered ? (vis->trigger_capture_depth / 2) : (rows - 1);
+
+    const float baseline = (vis->display_mean_valid && vis->display_mean_magnitude > 1e-6f)
+                                ? vis->display_mean_magnitude
+                                : 0.0f;
+
+    for (int i = 0; i < vis->marker_count; i++) {
+        visualizer_marker_info_t* m = &vis->markers[i];
+        m->has_value = 0;
+        m->on_screen = 0;
+        m->magnitude = 0.0f;
+        m->percent_of_baseline = 0.0f;
+
+        if (!vis->axis_valid || vis->axis_curve_mode) {
+            continue;  // markers describe the waterfall grid only
+        }
+
+        const int row = reference_row + m->time_offset;
+        if (row < 0 || row >= rows) {
+            continue;
+        }
+        if (m->re < 0 || m->re >= HEATMAP_TEXTURE_WIDTH) {
+            continue;
+        }
+
+        m->screen_x = plot_x + ((float)m->re + 0.5f) * (plot_w / (float)HEATMAP_TEXTURE_WIDTH);
+        m->screen_y = plot_y + ((float)row + 0.5f) * (plot_h / (float)rows);
+        m->on_screen = 1;
+
+        float magnitude = 0.0f;
+        int found = 0;
+
+        if (vis->axis_phase_mode && vis->persist_accum && vis->axis_period > 0) {
+            int phase = (vis->axis_row0_value + row) % vis->axis_period;
+            if (phase < 0) {
+                phase += vis->axis_period;
+            }
+            const float value = vis->persist_accum[(size_t)phase * HEATMAP_TEXTURE_WIDTH + m->re];
+            if (value >= 0.0f) {  // negative marks a cell that never received a symbol
+                magnitude = value;
+                found = 1;
+            }
+        } else if (showing_triggered && vis->trigger_snapshot_symbol && vis->trigger_snapshot_magnitude &&
+                   row < vis->trigger_capture_depth) {
+            if (vis->trigger_snapshot_symbol[row] != TRIGGER_NO_SYMBOL) {
+                magnitude = vis->trigger_snapshot_magnitude[(size_t)row * HEATMAP_TEXTURE_WIDTH + m->re];
+                found = 1;
+            }
+        } else if (memory && memory->symbols) {
+            size_t idx;
+            if (ring_row_for_symbol(memory, vis->axis_row0_value + row, &idx)) {
+                float i_val, q_val;
+                extract_iq(memory->symbols[idx][m->re], i_val, q_val);
+                magnitude = sqrtf(i_val * i_val + q_val * q_val);
+                found = 1;
+            }
+        }
+
+        if (found) {
+            m->has_value = 1;
+            m->magnitude = magnitude;
+            m->percent_of_baseline = (baseline > 0.0f) ? (100.0f * magnitude / baseline) : 0.0f;
+        }
+    }
 }
 
 // Update heatmap texture with IQ data from ring buffer (or, in persistence
@@ -1982,6 +2217,8 @@ static void update_heatmap_texture(opengl_visualizer_t* vis, const fh_oran_memor
 
         // Find max magnitude for normalization
         float max_magnitude = 1e-9f;
+        double mean_sum = 0.0;
+        long mean_count = 0;
         for (int row = 0; row < display_height; row++) {
             const float* accum_row = vis->persist_accum + (size_t)PERSIST_ROW_PHASE(row) * HEATMAP_TEXTURE_WIDTH;
             for (int col = 0; col < HEATMAP_TEXTURE_WIDTH; col++) {
@@ -1989,18 +2226,21 @@ static void update_heatmap_texture(opengl_visualizer_t* vis, const fh_oran_memor
                 if (magnitude > max_magnitude) {
                     max_magnitude = magnitude;
                 }
+                if (magnitude >= 0.0f) {  // skip cells that never received a symbol
+                    mean_sum += magnitude;
+                    mean_count++;
+                }
             }
         }
+        vis->display_mean_magnitude = (mean_count > 0) ? (float)(mean_sum / (double)mean_count) : 0.0f;
+        vis->display_mean_valid = mean_count > 0;
 
         // Smooth magnitude scaling so rapid amplitude shifts do not cause color flicker.
         if (!vis->magnitude_scale_initialized) {
             vis->magnitude_scale_ema = max_magnitude;
             vis->magnitude_scale_initialized = 1;
         } else {
-            const float alpha_rise = 0.35f;
-            const float alpha_fall = 0.08f;
-            const float alpha = (max_magnitude > vis->magnitude_scale_ema) ? alpha_rise : alpha_fall;
-            vis->magnitude_scale_ema = alpha * max_magnitude + (1.0f - alpha) * vis->magnitude_scale_ema;
+            vis->magnitude_scale_ema = magnitude_scale_step(vis->magnitude_scale_ema, max_magnitude);
         }
         const float render_scale = (vis->magnitude_scale_ema > 1e-6f) ? vis->magnitude_scale_ema : 1e-6f;
 
@@ -2090,6 +2330,8 @@ static void update_heatmap_texture(opengl_visualizer_t* vis, const fh_oran_memor
         // background. Otherwise (plain live scroll), scan the recent window
         // as before.
         float max_magnitude = 1e-9f;
+        double mean_sum = 0.0;
+        long mean_count = 0;
         if (showing_triggered) {
             if (vis->trigger_snapshot_symbol) {
                 for (int row = 0; row < vis->trigger_capture_depth; row++) {
@@ -2101,6 +2343,8 @@ static void update_heatmap_texture(opengl_visualizer_t* vis, const fh_oran_memor
                         if (src[col] > max_magnitude) {
                             max_magnitude = src[col];
                         }
+                        mean_sum += src[col];
+                        mean_count++;
                     }
                 }
             }
@@ -2118,20 +2362,20 @@ static void update_heatmap_texture(opengl_visualizer_t* vis, const fh_oran_memor
                     if (magnitude > max_magnitude) {
                         max_magnitude = magnitude;
                     }
+                    mean_sum += magnitude;
+                    mean_count++;
                 }
             }
         }
+        vis->display_mean_magnitude = (mean_count > 0) ? (float)(mean_sum / (double)mean_count) : 0.0f;
+        vis->display_mean_valid = mean_count > 0;
 
         // Smooth magnitude scaling so rapid amplitude shifts do not cause color flicker.
         if (!vis->magnitude_scale_initialized) {
             vis->magnitude_scale_ema = max_magnitude;
             vis->magnitude_scale_initialized = 1;
         } else {
-            // Follow rising peaks quickly, decay slowly for a stable visual scale.
-            const float alpha_rise = 0.35f;
-            const float alpha_fall = 0.08f;
-            const float alpha = (max_magnitude > vis->magnitude_scale_ema) ? alpha_rise : alpha_fall;
-            vis->magnitude_scale_ema = alpha * max_magnitude + (1.0f - alpha) * vis->magnitude_scale_ema;
+            vis->magnitude_scale_ema = magnitude_scale_step(vis->magnitude_scale_ema, max_magnitude);
         }
         const float render_scale = (vis->magnitude_scale_ema > 1e-6f) ? vis->magnitude_scale_ema : 1e-6f;
 
@@ -2189,6 +2433,8 @@ static void update_heatmap_texture(opengl_visualizer_t* vis, const fh_oran_memor
         }
     }
 
+    markers_evaluate(vis, memory);
+
     // Upload texture to GPU
     glBindTexture(GL_TEXTURE_2D, vis->texture_id);
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, HEATMAP_TEXTURE_WIDTH, vis->tex_height, GL_RGBA, GL_UNSIGNED_BYTE, vis->texture_data);
@@ -2228,8 +2474,11 @@ int visualizer_update(opengl_visualizer_t* vis, const fh_oran_memory_t* memory) 
     // averages no longer correspond to what's about to be shown. Detected
     // here (rather than requiring a signal from the caller) since this
     // function already receives the memory pointer every frame.
+    // Reset on any change of stream, including the first one seen. A frame
+    // where no stream is selected must not swallow the reset, or trigger
+    // state from the previous stream survives into the next one.
     if (memory != vis->last_seen_memory) {
-        if (vis->last_seen_memory != NULL) {
+        if (memory != NULL) {
             if (vis->persist_accum) {
                 persist_clear_values(vis);
             }
@@ -2237,6 +2486,14 @@ int visualizer_update(opengl_visualizer_t* vis, const fh_oran_memory_t* memory) 
                 curve_mean_clear_values(vis);
             }
             trigger_reset_state(vis);
+            // Drop the colour normalisation too. It only ever eases downward
+            // (slow fall, fast rise) to keep the picture stable, so carrying a
+            // previous stream's level over - including the demo playing behind
+            // the startup screen - leaves the view crawling toward the right
+            // scale for a second or more. Clearing it makes the first frame of
+            // a new stream set the scale outright.
+            vis->magnitude_scale_initialized = 0;
+            vis->curve_magnitude_scale_initialized = 0;
         }
         vis->last_seen_memory = memory;
     }
@@ -2245,6 +2502,9 @@ int visualizer_update(opengl_visualizer_t* vis, const fh_oran_memory_t* memory) 
 
     if (vis->view_mode == VIEW_MODE_CURVE) {
         draw_curve_view(vis, memory);
+        // Clears any marker readouts left over from the waterfall, which has
+        // no counterpart here.
+        markers_evaluate(vis, memory);
     } else {
         // Update texture from memory
         update_heatmap_texture(vis, memory);

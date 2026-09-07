@@ -1,3 +1,10 @@
 build/
 *.swp
 *.swo
+
+# Packet captures. Recordings are large and belong outside the repository -
+# GitHub rejects anything over 100 MB outright. The four small pcaps under
+# src/capture/ were committed before this rule and stay tracked, since
+# ignoring a path has no effect on files git already follows.
+*.pcap
+*.pcapng
