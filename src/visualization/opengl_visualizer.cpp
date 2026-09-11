@@ -138,6 +138,24 @@ typedef struct opengl_visualizer {
     float display_mean_magnitude;
     int display_mean_valid;
 
+    // Zoom: a normalized [0,1] view window per axis over the fully zoomed-out
+    // extent. Display-only - see the header. Kept as fractions rather than row
+    // or RE indices so it survives the vertical extent being resized by
+    // Memory size, averaging period or trigger capture depth.
+    float zoom_x_center;
+    float zoom_x_span;
+    float zoom_y_center;
+    float zoom_y_span;
+    // The vertical axis measures different things in the two views - symbol
+    // rows against magnitude - so each parks its own window here while the
+    // other is on screen. Without that, zooming into a band of symbols and
+    // switching to Curve would silently reinterpret those row bounds as a
+    // magnitude range. The horizontal axis is the resource-element grid in both
+    // views, so that window is shared and needs no parking. Indexed by
+    // visualizer_view_mode_t.
+    float zoom_y_parked_center[2];
+    float zoom_y_parked_span[2];
+
     int axes_enabled;      // margins reserved for axes; off makes the view full-bleed
     int axis_valid;
     int axis_rows;         // texture rows spanning the plot height
@@ -347,6 +365,19 @@ void visualizer_set_view_mode(opengl_visualizer_t* vis, visualizer_view_mode_t m
     if (!vis) {
         return;
     }
+    if (mode == vis->view_mode) {
+        return;
+    }
+
+    // Hand the vertical zoom window over to the incoming view's own, since rows
+    // and magnitude are not interchangeable; see zoom_y_parked_center.
+    const int leaving = (vis->view_mode == VIEW_MODE_CURVE) ? 1 : 0;
+    const int arriving = (mode == VIEW_MODE_CURVE) ? 1 : 0;
+    vis->zoom_y_parked_center[leaving] = vis->zoom_y_center;
+    vis->zoom_y_parked_span[leaving] = vis->zoom_y_span;
+    vis->zoom_y_center = vis->zoom_y_parked_center[arriving];
+    vis->zoom_y_span = vis->zoom_y_parked_span[arriving];
+
     vis->view_mode = mode;
 }
 
@@ -491,6 +522,31 @@ static void trigger_snapshot_realloc(opengl_visualizer_t* vis) {
         }
         return;
     }
+    trigger_snapshot_clear_values(vis);
+}
+
+// Re-seeds only the crossing detector: scan cursor and baseline. Deliberately
+// leaves the capture alone. A discontinuity in symbol numbering says the scan
+// cursor is lost, which is all this repairs - it says nothing about a capture
+// the user asked to freeze, whose rows live in trigger_snapshot_* precisely so
+// they outlive whatever the live ring does next.
+static void trigger_reseed_detection(opengl_visualizer_t* vis) {
+    vis->trigger_armed = 1;
+    vis->trigger_needs_seed = 1;
+    vis->trigger_has_last_checked = 0;
+    vis->trigger_baseline_initialized = 0;
+}
+
+// A capture still filling when the numbering jumps can never finish: the rows it
+// is waiting for do not exist under the new numbering, so it would sit in
+// Capturing for good and, in Single mode, never reach Holding. Give it up and
+// let the detector arm again. The fire count stands - it did fire.
+static void trigger_abandon_incomplete_capture(opengl_visualizer_t* vis) {
+    if (!vis->trigger_capture_active) {
+        return;
+    }
+    vis->trigger_capture_active = 0;
+    vis->trigger_captured_symbol = TRIGGER_NO_SYMBOL;
     trigger_snapshot_clear_values(vis);
 }
 
@@ -778,6 +834,7 @@ opengl_visualizer_t* visualizer_create(int width, int height, int texture_height
     vis->marker_count = 0;
     vis->display_mean_magnitude = 0.0f;
     vis->display_mean_valid = 0;
+    visualizer_reset_zoom(vis);
     vis->axes_enabled = 1;
     vis->axis_valid = 0;
     vis->axis_rows = 0;
@@ -945,6 +1002,244 @@ static void curve_mean_fold_new_symbols(opengl_visualizer_t* vis, const fh_oran_
 
 #define CURVE_TRACE_MIN_ALPHA 0.08f
 
+// --- Zoom ---
+// Everything here works in normalized data coordinates: 0..1 across the fully
+// zoomed-out extent of an axis, with y running downward so it matches both the
+// waterfall's row order and the texture's t coordinate.
+
+// Deep enough to resolve a handful of resource elements or symbol rows across
+// the whole plot, which is as far as inspecting individual cells needs.
+#define ZOOM_MIN_SPAN 0.002f
+
+// Below this many pixels per texel, linear filtering is the smoother picture;
+// above it the texels are big enough that interpolating between them invents
+// gradients that aren't in the data, so switch to nearest and let cells read
+// as the discrete samples they are.
+#define ZOOM_NEAREST_FILTER_PX 2.5f
+
+static float zoom_guard(float value, float fallback) {
+    // Rejects NaN and infinities, which would otherwise propagate into the
+    // window and blank the view with no way back short of Reset.
+    if (!(value > -1e30f && value < 1e30f)) {
+        return fallback;
+    }
+    return value;
+}
+
+// Fewest symbol rows the waterfall keeps in view. A window narrower than a
+// single row contains no row boundary, so the vertical axis has no tick to hang
+// the always-present position readout on - and there is nothing to see inside
+// less than one row anyway. This has to be a count rather than a fraction
+// because the row extent moves with Memory size, averaging period and capture
+// depth: at 14 rows, a fraction that is generous at 1120 rows works out to a
+// small part of a single row. The horizontal axis needs no equivalent, its
+// extent being a compile-time constant.
+#define ZOOM_MIN_VISIBLE_ROWS 2.0f
+
+// Smallest vertical span allowed for the view as it currently stands.
+static float zoom_y_min_span(const opengl_visualizer_t* vis) {
+    // Curve view plots magnitude vertically, not rows, so there is no row
+    // quantisation to respect and a very narrow magnitude window is legitimate.
+    if (vis->view_mode == VIEW_MODE_CURVE) {
+        return ZOOM_MIN_SPAN;
+    }
+
+    const int rows = (vis->axis_valid && vis->axis_rows > 0) ? vis->axis_rows : vis->tex_height;
+    if (rows <= 0) {
+        return ZOOM_MIN_SPAN;  // extent not established yet; first frame will re-clamp
+    }
+
+    float min_span = ZOOM_MIN_VISIBLE_ROWS / (float)rows;
+    if (min_span > 1.0f) {
+        min_span = 1.0f;  // fewer rows than the minimum: no room to zoom at all
+    }
+    if (min_span < ZOOM_MIN_SPAN) {
+        min_span = ZOOM_MIN_SPAN;
+    }
+    return min_span;
+}
+
+// Forces one axis's window to be a real sub-window of [0,1]: no wider than the
+// data, no narrower than min_span, and never hanging off either end.
+static void zoom_normalize_axis(float* center, float* span, float min_span) {
+    float s = zoom_guard(*span, 1.0f);
+    if (s < min_span) {
+        s = min_span;
+    }
+    if (s > 1.0f) {
+        s = 1.0f;
+    }
+
+    float c = zoom_guard(*center, 0.5f);
+    const float half = s * 0.5f;
+    if (c < half) {
+        c = half;
+    }
+    if (c > 1.0f - half) {
+        c = 1.0f - half;
+    }
+
+    *span = s;
+    *center = c;
+}
+
+static void zoom_normalize(opengl_visualizer_t* vis) {
+    zoom_normalize_axis(&vis->zoom_x_center, &vis->zoom_x_span, ZOOM_MIN_SPAN);
+    zoom_normalize_axis(&vis->zoom_y_center, &vis->zoom_y_span, zoom_y_min_span(vis));
+}
+
+// Leading edge of the window on each axis, i.e. the data coordinate drawn at
+// the left (x) or top (y) of the plot rect.
+static float zoom_x_origin(const opengl_visualizer_t* vis) {
+    return vis->zoom_x_center - vis->zoom_x_span * 0.5f;
+}
+
+static float zoom_y_origin(const opengl_visualizer_t* vis) {
+    return vis->zoom_y_center - vis->zoom_y_span * 0.5f;
+}
+
+// Normalized data coordinate to screen pixels. Results outside the plot rect
+// are meaningful and expected - callers either clip or skip on them.
+static float zoom_x_to_px(const opengl_visualizer_t* vis, float x_norm, float plot_x, float plot_w) {
+    const float span = vis->zoom_x_span > 1e-6f ? vis->zoom_x_span : 1e-6f;
+    return plot_x + plot_w * (x_norm - zoom_x_origin(vis)) / span;
+}
+
+static float zoom_y_to_px(const opengl_visualizer_t* vis, float y_norm, float plot_y, float plot_h) {
+    const float span = vis->zoom_y_span > 1e-6f ? vis->zoom_y_span : 1e-6f;
+    return plot_y + plot_h * (y_norm - zoom_y_origin(vis)) / span;
+}
+
+// Curve view insets its trace a little at the top and bottom so a full-scale
+// peak doesn't sit right on the frame. The inset is applied after the zoom
+// transform rather than before it, which keeps it a constant visual margin
+// instead of quietly eating into the magnitude range the zoom window asks for -
+// so the window really does show the range the UI reports.
+#define CURVE_Y_INSET 0.05f
+#define CURVE_Y_USABLE 0.90f
+
+// Normalized curve y (0 = full scale, at the top; 1 = zero magnitude, at the
+// bottom) to screen pixels.
+static float curve_y_to_px(const opengl_visualizer_t* vis, float y_norm, float plot_y, float plot_h) {
+    const float span = vis->zoom_y_span > 1e-6f ? vis->zoom_y_span : 1e-6f;
+    const float zoomed = (y_norm - zoom_y_origin(vis)) / span;
+    return plot_y + (CURVE_Y_INSET + zoomed * CURVE_Y_USABLE) * plot_h;
+}
+
+// Restricts the GL scissor box to the plot rect. Needed wherever geometry is
+// drawn from data coordinates that the zoom can push outside the plot - a line
+// strip would otherwise run straight over the axis margins. GL's scissor
+// origin is bottom-left, unlike this code's top-left screen space.
+static void zoom_push_plot_scissor(const opengl_visualizer_t* vis) {
+    float plot_x = 0.0f, plot_y = 0.0f, plot_w = 1.0f, plot_h = 1.0f;
+    visualizer_get_plot_rect(vis, &plot_x, &plot_y, &plot_w, &plot_h);
+
+    const int x = (int)plot_x;
+    const int w = (int)plot_w;
+    const int h = (int)plot_h;
+    const int y = vis->height - (int)plot_y - h;
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(x, y > 0 ? y : 0, w > 0 ? w : 1, h > 0 ? h : 1);
+}
+
+static void zoom_pop_plot_scissor(void) {
+    glDisable(GL_SCISSOR_TEST);
+}
+
+void visualizer_set_zoom(opengl_visualizer_t* vis,
+                         float x_center, float x_span,
+                         float y_center, float y_span) {
+    if (!vis) {
+        return;
+    }
+    vis->zoom_x_center = x_center;
+    vis->zoom_x_span = x_span;
+    vis->zoom_y_center = y_center;
+    vis->zoom_y_span = y_span;
+    zoom_normalize(vis);
+}
+
+void visualizer_get_zoom(const opengl_visualizer_t* vis,
+                         float* out_x_center, float* out_x_span,
+                         float* out_y_center, float* out_y_span) {
+    if (out_x_center) { *out_x_center = vis ? vis->zoom_x_center : 0.5f; }
+    if (out_x_span) { *out_x_span = vis ? vis->zoom_x_span : 1.0f; }
+    if (out_y_center) { *out_y_center = vis ? vis->zoom_y_center : 0.5f; }
+    if (out_y_span) { *out_y_span = vis ? vis->zoom_y_span : 1.0f; }
+}
+
+void visualizer_reset_zoom(opengl_visualizer_t* vis) {
+    if (!vis) {
+        return;
+    }
+    vis->zoom_x_center = 0.5f;
+    vis->zoom_x_span = 1.0f;
+    vis->zoom_y_center = 0.5f;
+    vis->zoom_y_span = 1.0f;
+    // Also clears the other view's parked window, so Reset means the full view
+    // everywhere rather than leaving a surprise behind the next mode switch.
+    for (int i = 0; i < 2; i++) {
+        vis->zoom_y_parked_center[i] = 0.5f;
+        vis->zoom_y_parked_span[i] = 1.0f;
+    }
+}
+
+int visualizer_zoom_is_active(const opengl_visualizer_t* vis) {
+    if (!vis) {
+        return 0;
+    }
+    return (vis->zoom_x_span < 0.9999f || vis->zoom_y_span < 0.9999f) ? 1 : 0;
+}
+
+void visualizer_zoom_by(opengl_visualizer_t* vis,
+                        float x_factor, float y_factor,
+                        float focus_x, float focus_y) {
+    if (!vis) {
+        return;
+    }
+
+    x_factor = zoom_guard(x_factor, 1.0f);
+    y_factor = zoom_guard(y_factor, 1.0f);
+    focus_x = zoom_guard(focus_x, 0.5f);
+    focus_y = zoom_guard(focus_y, 0.5f);
+
+    if (x_factor > 0.0f && x_factor != 1.0f) {
+        const float span = vis->zoom_x_span;
+        const float anchor = zoom_x_origin(vis) + focus_x * span;  // data under the focus point
+        const float new_span = span / x_factor;
+        vis->zoom_x_span = new_span;
+        vis->zoom_x_center = anchor - focus_x * new_span + new_span * 0.5f;
+    }
+    if (y_factor > 0.0f && y_factor != 1.0f) {
+        const float span = vis->zoom_y_span;
+        const float anchor = zoom_y_origin(vis) + focus_y * span;
+        const float new_span = span / y_factor;
+        vis->zoom_y_span = new_span;
+        vis->zoom_y_center = anchor - focus_y * new_span + new_span * 0.5f;
+    }
+
+    zoom_normalize(vis);
+}
+
+void visualizer_pan_by(opengl_visualizer_t* vis, float x_fraction, float y_fraction) {
+    if (!vis) {
+        return;
+    }
+    vis->zoom_x_center += zoom_guard(x_fraction, 0.0f) * vis->zoom_x_span;
+    vis->zoom_y_center += zoom_guard(y_fraction, 0.0f) * vis->zoom_y_span;
+    zoom_normalize(vis);
+}
+
+int visualizer_get_zoom_total_rows(const opengl_visualizer_t* vis) {
+    if (!vis) {
+        return 0;
+    }
+    if (vis->axis_valid && vis->axis_rows > 0) {
+        return vis->axis_rows;
+    }
+    return vis->tex_height > 0 ? vis->tex_height : 0;
+}
+
 // Draw the Curve view: a 2D plot of magnitude vs. resource-element index for
 // the newest symbol (or, with trailing-trace persistence on, the last N
 // symbols read live from the ring, older ones fading out), plus an optional
@@ -1068,9 +1363,22 @@ static void draw_curve_view(opengl_visualizer_t* vis, const fh_oran_memory_t* me
     float plot_x = 0.0f, plot_y = 0.0f, plot_w = 1.0f, plot_h = 1.0f;
     visualizer_get_plot_rect(vis, &plot_x, &plot_y, &plot_w, &plot_h);
 
-    const float x_step = plot_w / (float)(HEATMAP_TEXTURE_WIDTH - 1);
-    const float margin_y = plot_y + 0.05f * plot_h;
-    const float usable_y = plot_h * 0.90f;
+    // Only the columns in view need drawing, plus one either side so the line
+    // enters and leaves the plot at the right slope. Without that bound a deep
+    // zoom would push most vertices thousands of screen-widths away.
+    const float x_norm_step = 1.0f / (float)(HEATMAP_TEXTURE_WIDTH - 1);
+    int col_first = (int)floorf(zoom_x_origin(vis) / x_norm_step) - 1;
+    int col_last = (int)ceilf((zoom_x_origin(vis) + vis->zoom_x_span) / x_norm_step) + 1;
+    if (col_first < 0) {
+        col_first = 0;
+    }
+    if (col_last > HEATMAP_TEXTURE_WIDTH - 1) {
+        col_last = HEATMAP_TEXTURE_WIDTH - 1;
+    }
+
+    // Clipped to the plot rect: zoomed vertices routinely fall outside it and
+    // must not be drawn over the axis margins.
+    zoom_push_plot_scissor(vis);
 
     vis->axis_valid = 1;
     vis->axis_rows = vis->tex_height > 0 ? vis->tex_height : 1;
@@ -1123,7 +1431,7 @@ static void draw_curve_view(opengl_visualizer_t* vis, const fh_oran_memory_t* me
         glLineWidth(line_width);
         glColor4f(r, g, b, alpha);
         glBegin(GL_LINE_STRIP);
-        for (int col = 0; col < HEATMAP_TEXTURE_WIDTH; col++) {
+        for (int col = col_first; col <= col_last; col++) {
             float magnitude;
             if (show_mean_trail) {
                 magnitude = trail_mean_rows[t][col];
@@ -1139,7 +1447,8 @@ static void draw_curve_view(opengl_visualizer_t* vis, const fh_oran_memory_t* me
             if (norm > 1.0f) {
                 norm = 1.0f;
             }
-            glVertex2f(plot_x + (float)col * x_step, margin_y + (1.0f - norm) * usable_y);
+            glVertex2f(zoom_x_to_px(vis, (float)col * x_norm_step, plot_x, plot_w),
+                       curve_y_to_px(vis, 1.0f - norm, plot_y, plot_h));
         }
         glEnd();
     }
@@ -1148,7 +1457,7 @@ static void draw_curve_view(opengl_visualizer_t* vis, const fh_oran_memory_t* me
         glLineWidth(2.5f);
         glColor4f(1.00f, 0.85f, 0.25f, 1.0f);
         glBegin(GL_LINE_STRIP);
-        for (int col = 0; col < HEATMAP_TEXTURE_WIDTH; col++) {
+        for (int col = col_first; col <= col_last; col++) {
             float magnitude = single_mean_row[col];
             if (magnitude < 0.0f) {
                 magnitude = 0.0f;  // never-folded sentinel
@@ -1157,13 +1466,15 @@ static void draw_curve_view(opengl_visualizer_t* vis, const fh_oran_memory_t* me
             if (norm > 1.0f) {
                 norm = 1.0f;
             }
-            glVertex2f(plot_x + (float)col * x_step, margin_y + (1.0f - norm) * usable_y);
+            glVertex2f(zoom_x_to_px(vis, (float)col * x_norm_step, plot_x, plot_w),
+                       curve_y_to_px(vis, 1.0f - norm, plot_y, plot_h));
         }
         glEnd();
     }
 
     glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
     glDisable(GL_BLEND);
+    zoom_pop_plot_scissor();
 }
 
 // Scans newly-arrived symbols since the last check for a trigger crossing,
@@ -1192,9 +1503,18 @@ static int trigger_numbering_is_stale(const opengl_visualizer_t* vis, const fh_o
     if (vis->trigger_last_checked_symbol < memory->symbol_lowest - TRIGGER_MAX_SCAN_SYMBOLS) {
         return 1;
     }
+    // A captured symbol numbered beyond the newest one can only mean the stream
+    // restarted its numbering underneath us, which does invalidate the scan
+    // position. Deliberately no test for the captured symbol having fallen off
+    // the old end: that is just the ring moving on, which happens to every
+    // capture within a second or so of firing, and a completed capture does not
+    // depend on the ring - its rows are locked into trigger_snapshot_* for
+    // exactly this reason. Treating it as stale used to reset the trigger, and
+    // with it trigger_single_done, so a Single capture re-armed and fired again
+    // roughly every TRIGGER_MAX_SCAN_SYMBOLS + memory-size symbols instead of
+    // holding until rearmed.
     if (vis->trigger_captured_symbol != TRIGGER_NO_SYMBOL &&
-        (vis->trigger_captured_symbol > memory->symbol_highest ||
-         vis->trigger_captured_symbol < memory->symbol_lowest - TRIGGER_MAX_SCAN_SYMBOLS)) {
+        vis->trigger_captured_symbol > memory->symbol_highest) {
         return 1;
     }
     return 0;
@@ -1246,8 +1566,13 @@ static void trigger_scan_mean_new_symbols(opengl_visualizer_t* vis, const fh_ora
     const int col_end = (vis->trigger_freq_end <= HEATMAP_TEXTURE_WIDTH) ? vis->trigger_freq_end : HEATMAP_TEXTURE_WIDTH;
     const int period = vis->persist_period;
 
+    // Numbering discontinuity: repair the scan cursor without throwing away a
+    // capture. Wiping everything here is what made a held Single capture vanish
+    // and its count restart on every pcap replay loop, where the offset shifts
+    // every symbol number at once.
     if (trigger_numbering_is_stale(vis, memory)) {
-        trigger_reset_state(vis);
+        trigger_abandon_incomplete_capture(vis);
+        trigger_reseed_detection(vis);
     }
 
     // Seed from the accumulator itself: its rows are already a settled
@@ -1357,8 +1682,13 @@ static void trigger_scan_new_symbols(opengl_visualizer_t* vis, const fh_oran_mem
     const int col_start = vis->trigger_freq_start;
     const int col_end = (vis->trigger_freq_end <= HEATMAP_TEXTURE_WIDTH) ? vis->trigger_freq_end : HEATMAP_TEXTURE_WIDTH;
 
+    // Numbering discontinuity: repair the scan cursor without throwing away a
+    // capture. Wiping everything here is what made a held Single capture vanish
+    // and its count restart on every pcap replay loop, where the offset shifts
+    // every symbol number at once.
     if (trigger_numbering_is_stale(vis, memory)) {
-        trigger_reset_state(vis);
+        trigger_abandon_incomplete_capture(vis);
+        trigger_reseed_detection(vis);
     }
 
     // A fresh arm (startup, mode change, or a channel switch) faces a ring
@@ -1736,17 +2066,25 @@ int visualizer_get_y_ticks(const opengl_visualizer_t* vis,
 
     float plot_y = 0.0f, plot_h = 1.0f;
     visualizer_get_plot_rect(vis, NULL, &plot_y, NULL, &plot_h);
-    const float px_per_row = plot_h / (float)vis->axis_rows;
+    // Rows per pixel follows the zoom: a narrower window spreads the same rows
+    // further apart, which is what lets the density rules below promote finer
+    // divisions into view as you zoom in.
+    const float px_per_row = plot_h / (vis->zoom_y_span * (float)vis->axis_rows);
     int count = 0;
 
-    // Curve view: the vertical axis is normalised magnitude, so it just gets
-    // evenly spaced percentage gridlines.
+    // Curve view: the vertical axis is normalised magnitude, so it gets
+    // percentage gridlines, stepped by however fine the zoom can show.
     if (vis->axis_curve_mode) {
-        for (int pct = 0; pct <= 100 && count < max_ticks; pct += 25) {
+        const float px_per_pct = plot_h * (CURVE_Y_USABLE / 100.0f) / vis->zoom_y_span;
+        const int pct_step = axis_nice_multiple(px_per_pct, AXIS_MIN_LABEL_PX_Y);
+
+        for (int pct = 0; pct <= 100 && count < max_ticks; pct += pct_step) {
+            const float pos = curve_y_to_px(vis, 1.0f - (float)pct / 100.0f, plot_y, plot_h);
+            if (pos < plot_y - 0.5f || pos > plot_y + plot_h + 0.5f) {
+                continue;  // outside the zoom window
+            }
             visualizer_axis_tick_t* t = &out_ticks[count++];
-            // The curve render insets its trace by 5% top and bottom.
-            const float frac = 0.05f + (1.0f - (float)pct / 100.0f) * 0.90f;
-            t->position_px = plot_y + frac * plot_h;
+            t->position_px = pos;
             t->level = (pct == 0 || pct == 100) ? 2 : 1;
             t->has_label = 1;
             t->is_anchor = 0;
@@ -1755,6 +2093,41 @@ int visualizer_get_y_ticks(const opengl_visualizer_t* vis,
             t->label3[0] = '\0';
         }
         return count;
+    }
+
+    // Rows actually inside the zoom window, so the loops below neither emit
+    // ticks for rows that aren't drawn nor overflow out_ticks at deep zoom.
+    // One row of slack each side keeps a tick that is only partly on screen.
+    const float row_origin = zoom_y_origin(vis) * (float)vis->axis_rows;
+    const float row_extent = vis->zoom_y_span * (float)vis->axis_rows;
+    int visible_row_first = (int)floorf(row_origin) - 1;
+    int visible_row_last = (int)ceilf(row_origin + row_extent) + 1;
+    if (visible_row_first < 0) {
+        visible_row_first = 0;
+    }
+    if (visible_row_last > vis->axis_rows - 1) {
+        visible_row_last = vis->axis_rows - 1;
+    }
+
+    // Screen position of a row, given the zoom window.
+    const float row_to_px_scale = plot_h / (row_extent > 1e-6f ? row_extent : 1e-6f);
+    const auto row_to_px = [&](int row) {
+        return plot_y + ((float)row - row_origin) * row_to_px_scale;
+    };
+
+    // Last row that overlaps the window, which carries the always-present
+    // spelled-out readout. Deliberately not visible_row_last: that one includes
+    // a row of slack past the window edge so partially-scrolled ticks still get
+    // drawn, and a tick placed there lands below the plot rect, where the
+    // caller filters it out - which silently dropped this readout on any zoom
+    // that wasn't flush against the bottom. Taken from the window bounds
+    // instead, so its position is always strictly inside the plot.
+    int anchor_row = (int)ceilf(row_origin + row_extent) - 1;
+    if (anchor_row > vis->axis_rows - 1) {
+        anchor_row = vis->axis_rows - 1;
+    }
+    if (anchor_row < 0) {
+        anchor_row = 0;
     }
 
     if (vis->axis_phase_mode) {
@@ -1774,17 +2147,17 @@ int visualizer_get_y_ticks(const opengl_visualizer_t* vis,
         const int label_slot = slot_px >= AXIS_MIN_LABEL_PX_Y;
         const int tick_slot = slot_px >= AXIS_MIN_TICK_PX;
 
-        // The bottom row always carries a fully spelled-out label, so the
-        // view is never left without a position readout when it spans less
-        // than one division.
-        const int anchor_row = vis->axis_rows - 1;
+        // The bottom row in view always carries a fully spelled-out label, so
+        // the view is never left without a position readout when it spans less
+        // than one division. Zoomed in, that is the bottom of the window rather
+        // than the bottom of the data.
         if (anchor_row >= 0 && count < max_ticks) {
             int phase = (vis->axis_row0_value + anchor_row) % period;
             if (phase < 0) {
                 phase += period;
             }
             visualizer_axis_tick_t* t = &out_ticks[count++];
-            t->position_px = plot_y + (float)anchor_row * px_per_row;
+            t->position_px = row_to_px(anchor_row);
             t->level = 3;
             t->has_label = 1;
             t->is_anchor = 1;
@@ -1799,7 +2172,7 @@ int visualizer_get_y_ticks(const opengl_visualizer_t* vis,
             snprintf(t->label3, sizeof(t->label3), "sym%d", phase % SYMBOLS_PER_SLOT);
         }
 
-        for (int row = 0; row < vis->axis_rows && count < max_ticks; row++) {
+        for (int row = visible_row_first; row <= visible_row_last && count < max_ticks; row++) {
             if (row == anchor_row) {
                 continue;  // already emitted with a full label
             }
@@ -1828,7 +2201,7 @@ int visualizer_get_y_ticks(const opengl_visualizer_t* vis,
             }
 
             visualizer_axis_tick_t* t = &out_ticks[count++];
-            t->position_px = plot_y + (float)row * px_per_row;
+            t->position_px = row_to_px(row);
             t->level = level;
             t->has_label = labelled;
             t->is_anchor = 0;
@@ -1872,14 +2245,14 @@ int visualizer_get_y_ticks(const opengl_visualizer_t* vis,
         frame_step = axis_nice_multiple(px_per_row * (float)symbols_per_frame, AXIS_MIN_LABEL_PX_Y);
     }
 
-    // The newest symbol (bottom row) always gets the complete position spelled
-    // out, so a view spanning less than a whole frame still shows which frame,
-    // subframe, slot and symbol it is looking at.
-    const int anchor_row = vis->axis_rows - 1;
+    // The bottom row in view always gets the complete position spelled out, so
+    // a view spanning less than a whole frame still shows which frame,
+    // subframe, slot and symbol it is looking at. Zoomed in, that is the bottom
+    // of the window rather than the newest symbol.
     const int anchor_symbol = vis->axis_row0_value + anchor_row;
     if (anchor_row >= 0 && anchor_symbol >= 0 && count < max_ticks) {
         visualizer_axis_tick_t* t = &out_ticks[count++];
-        t->position_px = plot_y + (float)anchor_row * px_per_row;
+        t->position_px = row_to_px(anchor_row);
         t->level = 3;
         t->has_label = 1;
         t->is_anchor = 1;
@@ -1901,7 +2274,7 @@ int visualizer_get_y_ticks(const opengl_visualizer_t* vis,
         }
     }
 
-    for (int row = 0; row < vis->axis_rows && count < max_ticks; row++) {
+    for (int row = visible_row_first; row <= visible_row_last && count < max_ticks; row++) {
         if (row == anchor_row) {
             continue;  // already emitted with a full label
         }
@@ -1937,7 +2310,7 @@ int visualizer_get_y_ticks(const opengl_visualizer_t* vis,
         }
 
         visualizer_axis_tick_t* t = &out_ticks[count++];
-        t->position_px = plot_y + (float)row * px_per_row;
+        t->position_px = row_to_px(row);
         t->level = level;
         t->has_label = labelled;
         t->is_anchor = 0;
@@ -1978,11 +2351,21 @@ int visualizer_get_x_ticks(const opengl_visualizer_t* vis,
     float plot_x = 0.0f, plot_w = 1.0f;
     visualizer_get_plot_rect(vis, &plot_x, NULL, &plot_w, NULL);
 
-    // The full grid is always in view for now; a zoom would narrow this range
-    // and everything below adapts to it.
-    const int re_first = 0;
-    const int re_count = HEATMAP_TEXTURE_WIDTH;
-    const float px_per_re = plot_w / (float)re_count;
+    // Narrowed by the zoom, which everything below adapts to: wider spacing
+    // promotes finer divisions into view and thins out crowded ones.
+    // re_origin is fractional, so ticks stay put rather than snapping to whole
+    // resource elements as the window slides.
+    const float re_origin = zoom_x_origin(vis) * (float)HEATMAP_TEXTURE_WIDTH;
+    const float re_extent = vis->zoom_x_span * (float)HEATMAP_TEXTURE_WIDTH;
+    int re_first = (int)floorf(re_origin) - 1;
+    int re_last = (int)ceilf(re_origin + re_extent) + 1;
+    if (re_first < 0) {
+        re_first = 0;
+    }
+    if (re_last > HEATMAP_TEXTURE_WIDTH - 1) {
+        re_last = HEATMAP_TEXTURE_WIDTH - 1;
+    }
+    const float px_per_re = plot_w / (re_extent > 1e-6f ? re_extent : 1e-6f);
     const float px_per_prb = px_per_re * (float)HEATMAP_SAMPLES_PER_PRB;
 
     int count = 0;
@@ -1994,7 +2377,7 @@ int visualizer_get_x_ticks(const opengl_visualizer_t* vis,
 
     const int prb_step = axis_nice_multiple(px_per_prb, AXIS_MIN_LABEL_PX_X);
     const int prb_first = re_first / HEATMAP_SAMPLES_PER_PRB;
-    const int prb_last = (re_first + re_count - 1) / HEATMAP_SAMPLES_PER_PRB;
+    const int prb_last = re_last / HEATMAP_SAMPLES_PER_PRB;
 
     for (int prb = prb_first; prb <= prb_last && count < max_ticks; prb++) {
         const int on_step = (prb % prb_step) == 0;
@@ -2004,7 +2387,7 @@ int visualizer_get_x_ticks(const opengl_visualizer_t* vis,
 
         const int re = prb * HEATMAP_SAMPLES_PER_PRB;
         visualizer_axis_tick_t* t = &out_ticks[count++];
-        t->position_px = plot_x + (float)(re - re_first) * px_per_re;
+        t->position_px = plot_x + ((float)re - re_origin) * px_per_re;
         t->level = 1;
         t->has_label = on_step;
         t->is_anchor = 0;
@@ -2022,7 +2405,7 @@ int visualizer_get_x_ticks(const opengl_visualizer_t* vis,
         }
         for (int sub = 1; sub < HEATMAP_SAMPLES_PER_PRB && count < max_ticks; sub++) {
             visualizer_axis_tick_t* st = &out_ticks[count++];
-            st->position_px = plot_x + (float)(re + sub - re_first) * px_per_re;
+            st->position_px = plot_x + ((float)(re + sub) - re_origin) * px_per_re;
             st->level = 0;
             st->has_label = label_re;
             st->is_anchor = 0;
@@ -2042,6 +2425,66 @@ int visualizer_get_x_ticks(const opengl_visualizer_t* vis,
 // Re-sample every marker against the view that was just rendered, so each
 // one reports whatever that view is showing: the rolling mean in persistence
 // mode, the held snapshot in a triggered one, or the live ring otherwise.
+// Magnitude of one cell of whatever the waterfall is currently showing: the
+// rolling-mean accumulator in persistence mode, the held snapshot in a
+// triggered one, or the live ring otherwise. Shared by markers and the
+// value-at-cursor readout so the two can never disagree about what a cell
+// holds. Returns 1 and sets *out_magnitude when the cell carries data.
+static int display_cell_magnitude(const opengl_visualizer_t* vis,
+                                  const fh_oran_memory_t* memory,
+                                  int row,
+                                  int re,
+                                  float* out_magnitude) {
+    if (re < 0 || re >= HEATMAP_TEXTURE_WIDTH || row < 0) {
+        return 0;
+    }
+
+    const int showing_triggered = vis->trigger_mode != TRIGGER_OFF &&
+                                   vis->trigger_captured_symbol != TRIGGER_NO_SYMBOL;
+
+    if (vis->axis_phase_mode && vis->persist_accum && vis->axis_period > 0) {
+        int phase = (vis->axis_row0_value + row) % vis->axis_period;
+        if (phase < 0) {
+            phase += vis->axis_period;
+        }
+        const float value = vis->persist_accum[(size_t)phase * HEATMAP_TEXTURE_WIDTH + re];
+        if (value < 0.0f) {
+            return 0;  // negative marks a cell that never received a symbol
+        }
+        *out_magnitude = value;
+        return 1;
+    }
+
+    if (showing_triggered && vis->trigger_snapshot_symbol && vis->trigger_snapshot_magnitude &&
+        row < vis->trigger_capture_depth) {
+        if (vis->trigger_snapshot_symbol[row] == TRIGGER_NO_SYMBOL) {
+            return 0;
+        }
+        *out_magnitude = vis->trigger_snapshot_magnitude[(size_t)row * HEATMAP_TEXTURE_WIDTH + re];
+        return 1;
+    }
+
+    if (memory && memory->symbols) {
+        size_t idx;
+        if (ring_row_for_symbol(memory, vis->axis_row0_value + row, &idx)) {
+            float i_val, q_val;
+            extract_iq(memory->symbols[idx][re], i_val, q_val);
+            *out_magnitude = sqrtf(i_val * i_val + q_val * q_val);
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+// Mean magnitude of what is on screen, which marker and cursor percentages are
+// measured against. 0 when no meaningful baseline has been computed yet.
+static float display_baseline(const opengl_visualizer_t* vis) {
+    return (vis->display_mean_valid && vis->display_mean_magnitude > 1e-6f)
+               ? vis->display_mean_magnitude
+               : 0.0f;
+}
+
 static void markers_evaluate(opengl_visualizer_t* vis, const fh_oran_memory_t* memory) {
     float plot_x = 0.0f, plot_y = 0.0f, plot_w = 1.0f, plot_h = 1.0f;
     visualizer_get_plot_rect(vis, &plot_x, &plot_y, &plot_w, &plot_h);
@@ -2053,9 +2496,7 @@ static void markers_evaluate(opengl_visualizer_t* vis, const fh_oran_memory_t* m
     // from the bottom row, which carries the newest symbol.
     const int reference_row = showing_triggered ? (vis->trigger_capture_depth / 2) : (rows - 1);
 
-    const float baseline = (vis->display_mean_valid && vis->display_mean_magnitude > 1e-6f)
-                                ? vis->display_mean_magnitude
-                                : 0.0f;
+    const float baseline = display_baseline(vis);
 
     for (int i = 0; i < vis->marker_count; i++) {
         visualizer_marker_info_t* m = &vis->markers[i];
@@ -2076,38 +2517,16 @@ static void markers_evaluate(opengl_visualizer_t* vis, const fh_oran_memory_t* m
             continue;
         }
 
-        m->screen_x = plot_x + ((float)m->re + 0.5f) * (plot_w / (float)HEATMAP_TEXTURE_WIDTH);
-        m->screen_y = plot_y + ((float)row + 0.5f) * (plot_h / (float)rows);
-        m->on_screen = 1;
+        // Markers stay pinned to their data cell; the zoom only decides where
+        // that cell lands on screen, and whether it is on screen at all.
+        m->screen_x = zoom_x_to_px(vis, ((float)m->re + 0.5f) / (float)HEATMAP_TEXTURE_WIDTH,
+                                   plot_x, plot_w);
+        m->screen_y = zoom_y_to_px(vis, ((float)row + 0.5f) / (float)rows, plot_y, plot_h);
+        m->on_screen = (m->screen_x >= plot_x && m->screen_x <= plot_x + plot_w &&
+                        m->screen_y >= plot_y && m->screen_y <= plot_y + plot_h) ? 1 : 0;
 
         float magnitude = 0.0f;
-        int found = 0;
-
-        if (vis->axis_phase_mode && vis->persist_accum && vis->axis_period > 0) {
-            int phase = (vis->axis_row0_value + row) % vis->axis_period;
-            if (phase < 0) {
-                phase += vis->axis_period;
-            }
-            const float value = vis->persist_accum[(size_t)phase * HEATMAP_TEXTURE_WIDTH + m->re];
-            if (value >= 0.0f) {  // negative marks a cell that never received a symbol
-                magnitude = value;
-                found = 1;
-            }
-        } else if (showing_triggered && vis->trigger_snapshot_symbol && vis->trigger_snapshot_magnitude &&
-                   row < vis->trigger_capture_depth) {
-            if (vis->trigger_snapshot_symbol[row] != TRIGGER_NO_SYMBOL) {
-                magnitude = vis->trigger_snapshot_magnitude[(size_t)row * HEATMAP_TEXTURE_WIDTH + m->re];
-                found = 1;
-            }
-        } else if (memory && memory->symbols) {
-            size_t idx;
-            if (ring_row_for_symbol(memory, vis->axis_row0_value + row, &idx)) {
-                float i_val, q_val;
-                extract_iq(memory->symbols[idx][m->re], i_val, q_val);
-                magnitude = sqrtf(i_val * i_val + q_val * q_val);
-                found = 1;
-            }
-        }
+        const int found = display_cell_magnitude(vis, memory, row, m->re, &magnitude);
 
         if (found) {
             m->has_value = 1;
@@ -2115,6 +2534,78 @@ static void markers_evaluate(opengl_visualizer_t* vis, const fh_oran_memory_t* m
             m->percent_of_baseline = (baseline > 0.0f) ? (100.0f * magnitude / baseline) : 0.0f;
         }
     }
+}
+
+int visualizer_sample_at_screen(const opengl_visualizer_t* vis,
+                                const fh_oran_memory_t* memory,
+                                float screen_x,
+                                float screen_y,
+                                visualizer_cursor_sample_t* out_sample) {
+    if (out_sample == NULL) {
+        return 0;
+    }
+    memset(out_sample, 0, sizeof(*out_sample));
+
+    if (vis == NULL || !vis->axis_valid || vis->axis_curve_mode || vis->axis_rows <= 0) {
+        return 0;
+    }
+
+    float plot_x = 0.0f, plot_y = 0.0f, plot_w = 1.0f, plot_h = 1.0f;
+    visualizer_get_plot_rect(vis, &plot_x, &plot_y, &plot_w, &plot_h);
+    if (plot_w <= 1.0f || plot_h <= 1.0f) {
+        return 0;
+    }
+    if (screen_x < plot_x || screen_x > plot_x + plot_w ||
+        screen_y < plot_y || screen_y > plot_y + plot_h) {
+        return 0;
+    }
+
+    // Invert the zoom transform: pixels -> fraction of the plot -> normalized
+    // data coordinate -> grid cell.
+    const float x_norm = zoom_x_origin(vis) + ((screen_x - plot_x) / plot_w) * vis->zoom_x_span;
+    const float y_norm = zoom_y_origin(vis) + ((screen_y - plot_y) / plot_h) * vis->zoom_y_span;
+
+    const int rows = vis->axis_rows;
+    int re = (int)floorf(x_norm * (float)HEATMAP_TEXTURE_WIDTH);
+    int row = (int)floorf(y_norm * (float)rows);
+    // Rounding at the far edge can land one past the last cell.
+    if (re < 0) { re = 0; }
+    if (re > HEATMAP_TEXTURE_WIDTH - 1) { re = HEATMAP_TEXTURE_WIDTH - 1; }
+    if (row < 0) { row = 0; }
+    if (row > rows - 1) { row = rows - 1; }
+
+    out_sample->valid = 1;
+    out_sample->re = re;
+    out_sample->row = row;
+
+    // Same reference row markers measure their offsets from, so a cursor
+    // reading can be compared with marker offsets directly.
+    const int showing_triggered = vis->trigger_mode != TRIGGER_OFF &&
+                                   vis->trigger_captured_symbol != TRIGGER_NO_SYMBOL;
+    const int reference_row = showing_triggered ? (vis->trigger_capture_depth / 2) : (rows - 1);
+    out_sample->time_offset = row - reference_row;
+
+    if (vis->axis_phase_mode && vis->axis_period > 0) {
+        int phase = (vis->axis_row0_value + row) % vis->axis_period;
+        if (phase < 0) {
+            phase += vis->axis_period;
+        }
+        out_sample->has_phase = 1;
+        out_sample->phase = phase;
+    } else {
+        out_sample->has_symbol = 1;
+        out_sample->symbol = vis->axis_row0_value + row;
+    }
+
+    float magnitude = 0.0f;
+    if (display_cell_magnitude(vis, memory, row, re, &magnitude)) {
+        const float baseline = display_baseline(vis);
+        out_sample->has_value = 1;
+        out_sample->magnitude = magnitude;
+        out_sample->percent_of_baseline = (baseline > 0.0f) ? (100.0f * magnitude / baseline) : 0.0f;
+    }
+
+    return 1;
 }
 
 // Update heatmap texture with IQ data from ring buffer (or, in persistence
@@ -2509,6 +3000,12 @@ int visualizer_update(opengl_visualizer_t* vis, const fh_oran_memory_t* memory) 
         // Update texture from memory
         update_heatmap_texture(vis, memory);
 
+        // Re-clamp now that the row count for this frame is settled. The
+        // vertical minimum is a row count, so a window that was legal at one
+        // extent can be too narrow after Memory size, the averaging period or a
+        // trigger capture changes it - and nothing else would notice.
+        zoom_normalize(vis);
+
         // Render with immediate mode - draw fullscreen quad
         glEnable(GL_TEXTURE_2D);
         glBindTexture(GL_TEXTURE_2D, vis->texture_id);
@@ -2518,11 +3015,30 @@ int visualizer_update(opengl_visualizer_t* vis, const fh_oran_memory_t* memory) 
         float plot_x = 0.0f, plot_y = 0.0f, plot_w = 1.0f, plot_h = 1.0f;
         visualizer_get_plot_rect(vis, &plot_x, &plot_y, &plot_w, &plot_h);
 
+        // Zooming the waterfall is exactly a narrowing of the texture
+        // coordinates: the same quad fills the same plot rect, sampling a
+        // sub-rectangle of the same texture. Nothing upstream of the texture
+        // upload is involved, which is why zoom cannot perturb the pipeline.
+        const float s0 = zoom_x_origin(vis);
+        const float s1 = s0 + vis->zoom_x_span;
+        const float t0 = zoom_y_origin(vis);
+        const float t1 = t0 + vis->zoom_y_span;
+
+        // Interpolating between texels that each cover several pixels would
+        // draw gradients the data doesn't contain, so past that point show the
+        // cells as the discrete samples they are.
+        const float px_per_texel_x = plot_w / ((s1 - s0) * (float)HEATMAP_TEXTURE_WIDTH);
+        const int rows = vis->tex_height > 0 ? vis->tex_height : 1;
+        const float px_per_texel_y = plot_h / ((t1 - t0) * (float)rows);
+        const int want_nearest = (px_per_texel_x >= ZOOM_NEAREST_FILTER_PX ||
+                                  px_per_texel_y >= ZOOM_NEAREST_FILTER_PX);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, want_nearest ? GL_NEAREST : GL_LINEAR);
+
         glBegin(GL_QUADS);
-        glTexCoord2f(0, 0); glVertex2f(plot_x, plot_y);
-        glTexCoord2f(1, 0); glVertex2f(plot_x + plot_w, plot_y);
-        glTexCoord2f(1, 1); glVertex2f(plot_x + plot_w, plot_y + plot_h);
-        glTexCoord2f(0, 1); glVertex2f(plot_x, plot_y + plot_h);
+        glTexCoord2f(s0, t0); glVertex2f(plot_x, plot_y);
+        glTexCoord2f(s1, t0); glVertex2f(plot_x + plot_w, plot_y);
+        glTexCoord2f(s1, t1); glVertex2f(plot_x + plot_w, plot_y + plot_h);
+        glTexCoord2f(s0, t1); glVertex2f(plot_x, plot_y + plot_h);
         glEnd();
 
         glDisable(GL_TEXTURE_2D);
@@ -2531,16 +3047,21 @@ int visualizer_update(opengl_visualizer_t* vis, const fh_oran_memory_t* memory) 
         // capture has fired. Drawn in screen space (like the curve view's
         // lines) so it stays crisp regardless of the texture's row height.
         if (vis->trigger_mode != TRIGGER_OFF && vis->trigger_captured_symbol != TRIGGER_NO_SYMBOL) {
-            const int rows = vis->tex_height > 0 ? vis->tex_height : 1;
             const int centre_row = vis->trigger_capture_depth / 2;
-            const float line_y = plot_y + ((float)centre_row + 0.5f) * (plot_h / (float)rows);
-            glColor4f(1.0f, 0.0f, 0.0f, 1.0f);
-            glLineWidth(1.5f);
-            glBegin(GL_LINES);
-            glVertex2f(plot_x, line_y);
-            glVertex2f(plot_x + plot_w, line_y);
-            glEnd();
-            glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
+            const float row_norm = ((float)centre_row + 0.5f) / (float)rows;
+            const float line_y = zoom_y_to_px(vis, row_norm, plot_y, plot_h);
+            // Zooming can put the trigger row outside the window; drawing it
+            // anyway would pin a red line to the plot edge and misreport where
+            // the trigger sits.
+            if (line_y >= plot_y && line_y <= plot_y + plot_h) {
+                glColor4f(1.0f, 0.0f, 0.0f, 1.0f);
+                glLineWidth(1.5f);
+                glBegin(GL_LINES);
+                glVertex2f(plot_x, line_y);
+                glVertex2f(plot_x + plot_w, line_y);
+                glEnd();
+                glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
+            }
         }
     }
 

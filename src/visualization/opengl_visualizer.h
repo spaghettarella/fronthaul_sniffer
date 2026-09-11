@@ -160,6 +160,56 @@ void visualizer_get_axis_titles(const opengl_visualizer_t* vis,
                                 const char** out_y_title,
                                 const char** out_x_title);
 
+// --- Zoom ---
+// A view window over the data, expressed in normalized [0,1] coordinates per
+// axis, where 0,0 is the top-left of the fully zoomed-out view. Horizontally
+// the axis spans the resource-element grid; vertically it spans whatever the
+// view currently plots - symbol rows in the waterfall, magnitude in curve
+// view. Because the window is normalized rather than absolute, it survives
+// the vertical extent changing underneath it (Memory size, averaging period
+// and trigger capture depth all resize the row count).
+//
+// This is a rendering transform and nothing more: no capture, decode, memory
+// ring, rolling-mean or trigger parameter is affected, so zooming never
+// disturbs what is being measured or averaged. Axis ticks re-derive their
+// density from the zoomed window, so zooming in exposes finer divisions.
+#define VISUALIZER_RE_COUNT 3276
+
+// span is the fraction of the axis in view: 1.0 is everything, 0.25 is 4x
+// zoom. Both are clamped so the window stays inside the data and no narrower
+// than an internal minimum; read them back to see what was applied.
+void visualizer_set_zoom(opengl_visualizer_t* vis,
+                         float x_center, float x_span,
+                         float y_center, float y_span);
+void visualizer_get_zoom(const opengl_visualizer_t* vis,
+                         float* out_x_center, float* out_x_span,
+                         float* out_y_center, float* out_y_span);
+
+// Back to the full view on both axes.
+void visualizer_reset_zoom(opengl_visualizer_t* vis);
+
+// Non-zero when either axis is showing less than the whole extent.
+int visualizer_zoom_is_active(const opengl_visualizer_t* vis);
+
+// Scales the zoom on each axis by the given factor (>1 zooms in, 1 leaves the
+// axis alone) about a focus point given as a fraction of the plot rect. The
+// data under the focus point stays put, which is what makes scroll-wheel zoom
+// track the cursor instead of drifting away from it.
+void visualizer_zoom_by(opengl_visualizer_t* vis,
+                        float x_factor, float y_factor,
+                        float focus_x, float focus_y);
+
+// Moves the window by a fraction of its own current span, so a keypress pans
+// by the same visual distance no matter how deep the zoom is.
+void visualizer_pan_by(opengl_visualizer_t* vis, float x_fraction, float y_fraction);
+
+// Vertical extent of the fully zoomed-out waterfall, in texture rows - the
+// denominator the normalized y window is a fraction of. Follows whichever of
+// Memory size, averaging period or capture depth is driving the view, so the
+// zoom UI can show and set the window in rows. Returns 0 before the first
+// frame has been rendered.
+int visualizer_get_zoom_total_rows(const opengl_visualizer_t* vis);
+
 // --- Markers ---
 // Each marker pins a point in the view by frequency (resource element) and
 // time (an offset in symbols from a reference row). The reference is the
@@ -195,6 +245,37 @@ void visualizer_set_marker(opengl_visualizer_t* vis, int index, int re, int time
 
 // Names what marker offsets are measured from, for labelling the UI.
 const char* visualizer_get_marker_reference_label(const opengl_visualizer_t* vis);
+
+// --- Value at cursor ---
+// Reads out the cell under an arbitrary screen position, so hovering the plot
+// can report a value without placing a marker. Resolves through the same path
+// markers use, so the two always agree about what a cell holds, and respects
+// the zoom: the position is inverted through the current view window.
+//
+// Like markers, this describes the waterfall grid only. In curve view the
+// vertical axis is magnitude rather than time, so there is no cell under the
+// cursor to read; valid comes back 0.
+typedef struct visualizer_cursor_sample {
+    int valid;                  // cursor is over the plot and inside the grid
+    int re;                     // resource element under the cursor
+    int row;                    // texture row under the cursor, 0 = top of full view
+    int time_offset;            // row as a marker-style offset from the reference row
+    int has_symbol;             // whether symbol is meaningful (not rolling-mean)
+    int symbol;                 // absolute symbol number
+    int has_phase;              // whether phase is meaningful (rolling-mean only)
+    int phase;                  // position within the averaging period
+    int has_value;              // 0 when the cell holds no data
+    float magnitude;            // absolute IQ magnitude
+    float percent_of_baseline;  // relative to the mean magnitude on screen
+} visualizer_cursor_sample_t;
+
+// Returns 1 when out_sample->valid is set, 0 otherwise. Coordinates are in
+// framebuffer pixels, matching visualizer_get_plot_rect.
+int visualizer_sample_at_screen(const opengl_visualizer_t* vis,
+                                const fh_oran_memory_t* memory,
+                                float screen_x,
+                                float screen_y,
+                                visualizer_cursor_sample_t* out_sample);
 
 // --- Waterfall trigger ---
 // Oscilloscope-style triggering for the waterfall's raw (non-persistence)

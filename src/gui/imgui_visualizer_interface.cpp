@@ -21,6 +21,12 @@ struct imgui_visualizer_state {
 
     int selected_marker;
 
+    // Value at cursor. The two destinations are independent so the reading can
+    // go next to the pointer, into the Markers window, or both at once.
+    bool cursor_value_enabled;
+    bool cursor_value_at_cursor;
+    bool cursor_value_in_window;
+
     // Frame timing. The wire frame_id is only 8 bits, so it wraps every 256
     // frames; the memory pairs it with a wraparound count. Accumulating the
     // advance between samples here keeps a total that survives both that
@@ -306,6 +312,394 @@ void draw_markers(opengl_visualizer_t* visualizer) {
     }
 }
 
+// --- Zoom ---
+// The zoom window is held in the visualizer as normalized fractions; this layer
+// converts to and from the units an operator actually thinks in (resource
+// elements, symbol rows, percent of full scale) and drives it from the mouse
+// and keyboard.
+
+// One wheel notch. Compounding keeps each notch the same proportional step
+// whatever the current depth.
+const float ZOOM_WHEEL_STEP = 1.25f;
+
+// Fraction of a screenful per arrow keypress.
+const float ZOOM_PAN_STEP = 0.10f;
+
+struct zoom_window_t {
+    float x_first;   // leading edge, in data units
+    float x_extent;
+    float y_first;
+    float y_extent;
+};
+
+// Reads the current window out in the units of the given axis extents.
+zoom_window_t zoom_window_in_units(opengl_visualizer_t* visualizer, float x_total, float y_total) {
+    float xc = 0.5f, xs = 1.0f, yc = 0.5f, ys = 1.0f;
+    visualizer_get_zoom(visualizer, &xc, &xs, &yc, &ys);
+    zoom_window_t w;
+    w.x_extent = xs * x_total;
+    w.x_first = (xc - xs * 0.5f) * x_total;
+    w.y_extent = ys * y_total;
+    w.y_first = (yc - ys * 0.5f) * y_total;
+    return w;
+}
+
+// Applies a window given in data units, letting the visualizer do the clamping.
+void zoom_apply_units(opengl_visualizer_t* visualizer,
+                      const zoom_window_t& w,
+                      float x_total,
+                      float y_total) {
+    const float xs = (x_total > 0.0f) ? w.x_extent / x_total : 1.0f;
+    const float ys = (y_total > 0.0f) ? w.y_extent / y_total : 1.0f;
+    const float xc = (x_total > 0.0f) ? (w.x_first / x_total) + xs * 0.5f : 0.5f;
+    const float yc = (y_total > 0.0f) ? (w.y_first / y_total) + ys * 0.5f : 0.5f;
+    visualizer_set_zoom(visualizer, xc, xs, yc, ys);
+}
+
+// Scroll wheel zooms about the cursor, left-drag and arrow keys pan. All are
+// ignored while ImGui owns the input, so scrolling over a settings window or
+// typing in one of its fields never moves the plot underneath.
+void handle_zoom_input(opengl_visualizer_t* visualizer) {
+    if (visualizer == nullptr) {
+        return;
+    }
+
+    ImGuiIO& io = ImGui::GetIO();
+
+    float plot_x = 0.0f, plot_y = 0.0f, plot_w = 0.0f, plot_h = 0.0f;
+    visualizer_get_plot_rect(visualizer, &plot_x, &plot_y, &plot_w, &plot_h);
+
+    // Left-drag pans, grabbing the data under the cursor and carrying it along.
+    // Gated on where the drag *started*, not where the cursor is now, so a drag
+    // that runs out over a settings window or off the plot keeps working
+    // instead of stopping dead mid-gesture.
+    if (ImGui::IsMouseDragging(ImGuiMouseButton_Left) && plot_w > 1.0f && plot_h > 1.0f) {
+        const ImVec2 start = io.MouseClickedPos[ImGuiMouseButton_Left];
+        const bool started_on_plot = start.x >= plot_x && start.x <= plot_x + plot_w &&
+                                     start.y >= plot_y && start.y <= plot_y + plot_h;
+        if (started_on_plot && !ImGui::IsAnyItemActive()) {
+            // Negated: dragging right shows data further left, so the window
+            // moves the opposite way to the cursor.
+            visualizer_pan_by(visualizer, -io.MouseDelta.x / plot_w, -io.MouseDelta.y / plot_h);
+        }
+    }
+
+    if (!io.WantCaptureMouse && io.MouseWheel != 0.0f && plot_w > 1.0f && plot_h > 1.0f) {
+        const float focus_x = (io.MousePos.x - plot_x) / plot_w;
+        const float focus_y = (io.MousePos.y - plot_y) / plot_h;
+        // Only when the cursor is actually over the data, so a wheel event
+        // aimed at nothing in particular doesn't move the view.
+        if (focus_x >= 0.0f && focus_x <= 1.0f && focus_y >= 0.0f && focus_y <= 1.0f) {
+            const float factor = powf(ZOOM_WHEEL_STEP, io.MouseWheel);
+            // Shift or Ctrl restricts the zoom to one axis, for stretching a
+            // frequency slice or a time slice on its own.
+            const bool x_only = io.KeyShift;
+            const bool y_only = io.KeyCtrl;
+            visualizer_zoom_by(visualizer,
+                               y_only ? 1.0f : factor,
+                               x_only ? 1.0f : factor,
+                               focus_x, focus_y);
+        }
+    }
+
+    if (!io.WantCaptureKeyboard) {
+        float pan_x = 0.0f;
+        float pan_y = 0.0f;
+        // Repeat enabled so a held arrow key keeps panning.
+        if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow, true)) { pan_x -= ZOOM_PAN_STEP; }
+        if (ImGui::IsKeyPressed(ImGuiKey_RightArrow, true)) { pan_x += ZOOM_PAN_STEP; }
+        if (ImGui::IsKeyPressed(ImGuiKey_UpArrow, true)) { pan_y -= ZOOM_PAN_STEP; }
+        if (ImGui::IsKeyPressed(ImGuiKey_DownArrow, true)) { pan_y += ZOOM_PAN_STEP; }
+        if (pan_x != 0.0f || pan_y != 0.0f) {
+            visualizer_pan_by(visualizer, pan_x, pan_y);
+        }
+    }
+}
+
+// An overview of where the zoom window sits inside the whole display extent:
+// outer box is everything the view could show, inner box is what it is showing.
+// Quarter gridlines give the eye something to judge the position against.
+void draw_zoom_minimap(opengl_visualizer_t* visualizer) {
+    const float MINIMAP_W = 260.0f;
+    const float MINIMAP_H = 110.0f;
+    // A window zoomed in hard would otherwise shrink to nothing; keep it big
+    // enough to stay visible and grabbable by eye.
+    const float MINIMAP_MIN_PX = 3.0f;
+
+    float xc = 0.5f, xs = 1.0f, yc = 0.5f, ys = 1.0f;
+    visualizer_get_zoom(visualizer, &xc, &xs, &yc, &ys);
+
+    ImGui::Dummy(ImVec2(MINIMAP_W, MINIMAP_H));
+    const ImVec2 p0 = ImGui::GetItemRectMin();
+    const ImVec2 p1 = ImGui::GetItemRectMax();
+    const float w = p1.x - p0.x;
+    const float h = p1.y - p0.y;
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->AddRectFilled(p0, p1, IM_COL32(24, 24, 28, 255));
+
+    for (int q = 1; q < 4; q++) {
+        const float fx = p0.x + w * (float)q * 0.25f;
+        const float fy = p0.y + h * (float)q * 0.25f;
+        const ImU32 grid = IM_COL32(70, 70, 78, 255);
+        dl->AddLine(ImVec2(fx, p0.y), ImVec2(fx, p1.y), grid);
+        dl->AddLine(ImVec2(p0.x, fy), ImVec2(p1.x, fy), grid);
+    }
+
+    float wx0 = p0.x + (xc - xs * 0.5f) * w;
+    float wx1 = p0.x + (xc + xs * 0.5f) * w;
+    float wy0 = p0.y + (yc - ys * 0.5f) * h;
+    float wy1 = p0.y + (yc + ys * 0.5f) * h;
+    if (wx1 - wx0 < MINIMAP_MIN_PX) {
+        const float mid = (wx0 + wx1) * 0.5f;
+        wx0 = mid - MINIMAP_MIN_PX * 0.5f;
+        wx1 = mid + MINIMAP_MIN_PX * 0.5f;
+    }
+    if (wy1 - wy0 < MINIMAP_MIN_PX) {
+        const float mid = (wy0 + wy1) * 0.5f;
+        wy0 = mid - MINIMAP_MIN_PX * 0.5f;
+        wy1 = mid + MINIMAP_MIN_PX * 0.5f;
+    }
+
+    const ImU32 window_fill = IM_COL32(255, 170, 40, 60);
+    const ImU32 window_edge = IM_COL32(255, 190, 70, 255);
+    dl->AddRectFilled(ImVec2(wx0, wy0), ImVec2(wx1, wy1), window_fill);
+    dl->AddRect(ImVec2(wx0, wy0), ImVec2(wx1, wy1), window_edge);
+
+    // Outer frame last so it stays crisp over the window rect at full view,
+    // where the two coincide.
+    dl->AddRect(p0, p1, IM_COL32(150, 150, 158, 255));
+}
+
+void draw_zoom_window(opengl_visualizer_t* visualizer) {
+    if (visualizer == nullptr) {
+        return;
+    }
+
+    ImGui::Begin("Zoom", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
+
+    if (ImGui::Button("Reset to full view")) {
+        visualizer_reset_zoom(visualizer);
+    }
+    ImGui::SameLine();
+    if (visualizer_zoom_is_active(visualizer)) {
+        float xs = 1.0f, ys = 1.0f;
+        visualizer_get_zoom(visualizer, nullptr, &xs, nullptr, &ys);
+        ImGui::Text("x %.1fx   y %.1fx", (double)(1.0f / xs), (double)(1.0f / ys));
+    } else {
+        ImGui::TextDisabled("full view");
+    }
+
+    ImGui::TextDisabled("Display only - memory size, averaging period and");
+    ImGui::TextDisabled("capture depth are untouched by anything here.");
+
+    const bool curve_view = visualizer_get_view_mode(visualizer) == VIEW_MODE_CURVE;
+    const float x_total = (float)VISUALIZER_RE_COUNT;
+    // Curve view plots magnitude vertically, so its window is a percentage of
+    // full scale rather than a count of rows.
+    const int total_rows = visualizer_get_zoom_total_rows(visualizer);
+    const float y_total = curve_view ? 100.0f : (float)(total_rows > 0 ? total_rows : 1);
+
+    ImGui::Separator();
+    draw_zoom_minimap(visualizer);
+    if (curve_view) {
+        ImGui::TextDisabled("full extent: %d RE wide, magnitude tall", VISUALIZER_RE_COUNT);
+    } else {
+        ImGui::TextDisabled("full extent: %d RE wide, %d rows tall", VISUALIZER_RE_COUNT, total_rows);
+    }
+
+    zoom_window_t w = zoom_window_in_units(visualizer, x_total, y_total);
+    bool changed = false;
+
+    ImGui::Separator();
+    ImGui::TextUnformatted("Frequency (horizontal)");
+
+    int re_first = (int)lroundf(w.x_first);
+    int re_count = (int)lroundf(w.x_extent);
+    if (ImGui::InputInt("First RE", &re_first, 12, 120)) {
+        w.x_first = (float)re_first;
+        changed = true;
+    }
+    if (ImGui::InputInt("RE count", &re_count, 12, 120)) {
+        w.x_extent = (float)re_count;
+        changed = true;
+    }
+    ImGui::TextDisabled("showing RE %d-%d  (PRB %.1f-%.1f of %d)",
+                        re_first,
+                        re_first + (re_count > 0 ? re_count - 1 : 0),
+                        (double)(w.x_first / 12.0f),
+                        (double)((w.x_first + w.x_extent) / 12.0f),
+                        VISUALIZER_RE_COUNT / 12);
+
+    ImGui::Separator();
+    if (curve_view) {
+        ImGui::TextUnformatted("Magnitude (vertical)");
+        // Normalized y runs downward, so the window's leading edge is the high
+        // end of the magnitude scale; present it the way it reads on screen.
+        // y_total is 100, so y_first/y_extent are already percentages.
+        float pct_high = 100.0f - w.y_first;
+        float pct_low = pct_high - w.y_extent;
+        const bool high_edited = ImGui::InputFloat("Top of window (%)", &pct_high, 1.0f, 10.0f, "%.1f");
+        const bool low_edited = ImGui::InputFloat("Bottom of window (%)", &pct_low, 1.0f, 10.0f, "%.1f");
+        if (high_edited || low_edited) {
+            // Either field can be dragged past the other; order them so the
+            // window stays the right way up instead of inverting.
+            if (pct_low > pct_high) {
+                const float swap = pct_low;
+                pct_low = pct_high;
+                pct_high = swap;
+            }
+            w.y_first = 100.0f - pct_high;
+            w.y_extent = pct_high - pct_low;
+            changed = true;
+        }
+        ImGui::TextDisabled("showing %.1f%%-%.1f%% of full scale", (double)pct_low, (double)pct_high);
+    } else {
+        ImGui::TextUnformatted("Time (vertical)");
+        int row_first = (int)lroundf(w.y_first);
+        int row_count = (int)lroundf(w.y_extent);
+        if (ImGui::InputInt("First row", &row_first, 1, 10)) {
+            w.y_first = (float)row_first;
+            changed = true;
+        }
+        if (ImGui::InputInt("Row count", &row_count, 1, 10)) {
+            w.y_extent = (float)row_count;
+            changed = true;
+        }
+        ImGui::TextDisabled("showing rows %d-%d of %d (row 0 = oldest on screen)",
+                            row_first,
+                            row_first + (row_count > 0 ? row_count - 1 : 0),
+                            total_rows);
+        ImGui::TextDisabled("Row count follows Memory size / averaging period /");
+        ImGui::TextDisabled("capture depth, so the window is kept as a fraction");
+        ImGui::TextDisabled("of it and survives those changing.");
+    }
+
+    if (changed) {
+        zoom_apply_units(visualizer, w, x_total, y_total);
+    }
+
+    ImGui::Separator();
+    ImGui::TextDisabled("Wheel over the plot zooms both axes; Shift+wheel");
+    ImGui::TextDisabled("only horizontally, Ctrl+wheel only vertically.");
+    ImGui::TextDisabled("Drag the plot or use the arrow keys to move the window.");
+
+    ImGui::End();
+}
+
+// --- Value at cursor ---
+
+// Fills in the cell under the pointer, or clears valid when there is nothing to
+// read (cursor off the plot, over a panel, or the view is Curve).
+visualizer_cursor_sample_t sample_under_cursor(opengl_visualizer_t* visualizer,
+                                               const fh_oran_memory_t* memory) {
+    visualizer_cursor_sample_t sample;
+    memset(&sample, 0, sizeof(sample));
+    if (visualizer == nullptr) {
+        return sample;
+    }
+
+    ImGuiIO& io = ImGui::GetIO();
+    // A pointer parked over a settings panel isn't pointing at data, and
+    // reading the cell hidden behind the panel would be misleading.
+    if (io.WantCaptureMouse) {
+        return sample;
+    }
+
+    visualizer_sample_at_screen(visualizer, memory, io.MousePos.x, io.MousePos.y, &sample);
+    return sample;
+}
+
+// Crosshair plus a value box pinned to the pointer, in the same style as the
+// marker labels so the two read as the same kind of annotation.
+void draw_cursor_value_overlay(opengl_visualizer_t* visualizer,
+                               const visualizer_cursor_sample_t& sample) {
+    if (!sample.valid) {
+        return;
+    }
+
+    float plot_x = 0.0f, plot_y = 0.0f, plot_w = 0.0f, plot_h = 0.0f;
+    visualizer_get_plot_rect(visualizer, &plot_x, &plot_y, &plot_w, &plot_h);
+    if (plot_w <= 1.0f || plot_h <= 1.0f) {
+        return;
+    }
+    const float plot_right = plot_x + plot_w;
+    const float plot_bottom = plot_y + plot_h;
+
+    ImGuiIO& io = ImGui::GetIO();
+    ImDrawList* draw = ImGui::GetBackgroundDrawList();
+    const ImVec2 at = io.MousePos;
+
+    const ImU32 line_color = IM_COL32(120, 230, 255, 140);
+    draw->AddLine(ImVec2(plot_x, at.y), ImVec2(plot_right, at.y), line_color);
+    draw->AddLine(ImVec2(at.x, plot_y), ImVec2(at.x, plot_bottom), line_color);
+
+    char line1[64];
+    char line2[64];
+    char line3[64];
+    if (sample.has_value) {
+        snprintf(line1, sizeof(line1), "%.1f", static_cast<double>(sample.magnitude));
+        snprintf(line2, sizeof(line2), "%.1f%% base", static_cast<double>(sample.percent_of_baseline));
+    } else {
+        snprintf(line1, sizeof(line1), "no data");
+        line2[0] = '\0';
+    }
+    if (sample.has_phase) {
+        snprintf(line3, sizeof(line3), "RE %d  phase +%d", sample.re, sample.phase);
+    } else {
+        snprintf(line3, sizeof(line3), "RE %d  sym %d", sample.re, sample.symbol);
+    }
+
+    const char* lines[3] = { line1, line2, line3 };
+    float text_w = 0.0f;
+    float text_h = 0.0f;
+    for (int i = 0; i < 3; i++) {
+        if (lines[i][0] == '\0') {
+            continue;
+        }
+        const ImVec2 size = ImGui::CalcTextSize(lines[i]);
+        if (size.x > text_w) {
+            text_w = size.x;
+        }
+        text_h += size.y;
+    }
+
+    const float pad = 4.0f;
+    const float box_w = text_w + pad * 2.0f;
+    const float box_h = text_h + pad * 2.0f;
+
+    // Prefer below-right of the pointer, flipping and then clamping so the box
+    // never leaves the plot or sits under the pointer itself.
+    float box_x = at.x + 14.0f;
+    float box_y = at.y + 14.0f;
+    if (box_x + box_w > plot_right) {
+        box_x = at.x - 14.0f - box_w;
+    }
+    if (box_y + box_h > plot_bottom) {
+        box_y = at.y - 14.0f - box_h;
+    }
+    if (box_x < plot_x) {
+        box_x = plot_x;
+    }
+    if (box_y < plot_y) {
+        box_y = plot_y;
+    }
+
+    const ImVec2 box_min(box_x, box_y);
+    const ImVec2 box_max(box_x + box_w, box_y + box_h);
+    draw->AddRectFilled(box_min, box_max, IM_COL32(20, 28, 34, 235), 3.0f);
+    draw->AddRect(box_min, box_max, IM_COL32(120, 230, 255, 255), 3.0f, 0, 1.5f);
+
+    float text_y = box_y + pad;
+    for (int i = 0; i < 3; i++) {
+        if (lines[i][0] == '\0') {
+            continue;
+        }
+        draw->AddText(ImVec2(box_x + pad, text_y), IM_COL32(235, 250, 255, 255), lines[i]);
+        text_y += ImGui::CalcTextSize(lines[i]).y;
+    }
+}
+
 }  // namespace
 
 const char* data_direction_to_string(uint8_t data_direction) {
@@ -332,6 +726,9 @@ imgui_visualizer_state_t* imgui_visualizer_init(int window_width, int window_hei
     state->selected_data_direction = 0;  // Default to UL
     state->prev_data_direction = 0;
     state->selected_marker = -1;
+    state->cursor_value_enabled = false;
+    state->cursor_value_at_cursor = true;
+    state->cursor_value_in_window = true;
     state->frame_tracking_initialized = false;
     state->frame_tracking_memory = nullptr;
     state->last_absolute_frame = 0;
@@ -379,6 +776,24 @@ fh_oran_memory_t* imgui_visualizer_render(
     // Update display size in case window was resized, and grab IO reference
     ImGuiIO& io = ImGui::GetIO();
     io.DisplaySize = ImVec2(static_cast<float>(window_width), static_cast<float>(window_height));
+
+    // Wheel, drag and arrow keys drive the zoom. Done here, right after
+    // NewFrame, so the WantCapture flags for this frame are already resolved and
+    // input aimed at a settings window never reaches the plot.
+    handle_zoom_input(visualizer);
+
+    // Sampled once per frame and shared by both destinations, so the box at the
+    // pointer and the readout in the Markers window can never show different
+    // numbers for the same cell. Resolved against the axis state the last
+    // visualizer_update() left behind, the same one-frame-old view the axes and
+    // markers are drawn from.
+    const bool curve_view_active = visualizer != nullptr &&
+                                   visualizer_get_view_mode(visualizer) == VIEW_MODE_CURVE;
+    visualizer_cursor_sample_t cursor_sample;
+    memset(&cursor_sample, 0, sizeof(cursor_sample));
+    if (state->cursor_value_enabled) {
+        cursor_sample = sample_under_cursor(visualizer, current_display_memory);
+    }
 
     // Create stream selection window
     // Center on first appearance so the selector doesn't open partially off-screen.
@@ -642,6 +1057,8 @@ fh_oran_memory_t* imgui_visualizer_render(
         }
 
         ImGui::End();
+
+        draw_zoom_window(visualizer);
 
         if (view_mode == VIEW_MODE_WATERFALL) {
             ImGui::Begin("Waterfall Settings", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
@@ -957,6 +1374,53 @@ fh_oran_memory_t* imgui_visualizer_render(
 
         ImGui::TextDisabled("Baseline = mean magnitude currently on screen");
 
+        // Value at cursor: the same readout a marker gives, but following the
+        // pointer instead of being pinned, for sweeping across a region without
+        // placing anything.
+        ImGui::Separator();
+        ImGui::Checkbox("Value at cursor", &state->cursor_value_enabled);
+        if (!state->cursor_value_enabled) {
+            ImGui::BeginDisabled();
+        }
+        ImGui::Indent();
+        ImGui::Checkbox("Show next to cursor", &state->cursor_value_at_cursor);
+        ImGui::Checkbox("Show here", &state->cursor_value_in_window);
+
+        if (state->cursor_value_in_window) {
+            // Fixed-size region: the readout appears and disappears as the
+            // pointer moves on and off the plot, and this window auto-resizes,
+            // so a free-flowing block would make it jump around underneath the
+            // cursor. Three lines is the tallest the readout ever gets.
+            const float readout_h = ImGui::GetTextLineHeightWithSpacing() * 3.0f;
+            ImGui::BeginChild("cursor_readout", ImVec2(320.0f, readout_h), false);
+            if (curve_view_active) {
+                ImGui::TextDisabled("Not available in Curve view: the");
+                ImGui::TextDisabled("vertical axis is magnitude, not time.");
+            } else if (!cursor_sample.valid) {
+                ImGui::TextDisabled("Hover the plot to read a cell");
+            } else {
+                if (cursor_sample.has_phase) {
+                    ImGui::Text("RE %d, phase +%d (offset %+d)",
+                                cursor_sample.re, cursor_sample.phase, cursor_sample.time_offset);
+                } else {
+                    ImGui::Text("RE %d, symbol %d (offset %+d)",
+                                cursor_sample.re, cursor_sample.symbol, cursor_sample.time_offset);
+                }
+                if (cursor_sample.has_value) {
+                    ImGui::Text("IQ %.1f", static_cast<double>(cursor_sample.magnitude));
+                    ImGui::Text("%.1f%% of baseline",
+                                static_cast<double>(cursor_sample.percent_of_baseline));
+                } else {
+                    ImGui::TextDisabled("cell holds no data");
+                }
+            }
+            ImGui::EndChild();
+        }
+        ImGui::Unindent();
+        if (!state->cursor_value_enabled) {
+            ImGui::EndDisabled();
+        }
+
         ImGui::End();
     }
 
@@ -966,6 +1430,9 @@ fh_oran_memory_t* imgui_visualizer_render(
     if (visualizer != nullptr) {
         draw_plot_axes(visualizer, current_display_memory);
         draw_markers(visualizer);
+        if (state->cursor_value_enabled && state->cursor_value_at_cursor) {
+            draw_cursor_value_overlay(visualizer, cursor_sample);
+        }
     }
 
     // Pop the theme colors
