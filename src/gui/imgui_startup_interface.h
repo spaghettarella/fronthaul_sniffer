@@ -12,7 +12,10 @@ struct fh_startup_config_t {
     bool demo_pcap_loop = true;
     std::string ocudu_phy_tap_queue_name = "/ocudu_phy_tap_queue";
     int snaplen = 10000;
-    int timeout_ms = 100;
+    // Silence tolerated before the run ends itself; see the Capture section of
+    // the startup UI. Wide enough that an ordinary TDD gap on a
+    // direction-filtered stream cannot trip it.
+    int timeout_ms = 1000;
     bool timeout_enabled = false;
     unsigned long long queue_packets = 4096;
     unsigned long long queue_bytes = 10000;

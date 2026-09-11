@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../core/c_fronthaul_decoder.h"
+#include "c_capture_common.h"
 
 #include <signal.h>
 #include <stddef.h>
@@ -12,7 +13,11 @@ extern "C" {
 typedef struct fh_capture_socket_options {
     const char* interface_name;
     int snaplen;
-    int timeout_ms;
+    // Give up and return FH_CAPTURE_RC_STREAM_STOPPED once this many
+    // milliseconds pass with no packet. 0 keeps capturing forever. Only armed
+    // after the first packet, so starting the sniffer before the traffic source
+    // does not end the run immediately.
+    int stall_timeout_ms;
 } fh_capture_socket_options_t;
 
 typedef int (*fh_packet_callback_t)(const fh_packet_t* pkt, void* user_ctx);

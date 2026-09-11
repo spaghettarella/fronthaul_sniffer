@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../core/c_fronthaul_decoder.h"
+#include "c_capture_common.h"
 
 #include <signal.h>
 #include <stddef.h>
@@ -12,7 +13,11 @@ extern "C" {
 typedef struct fh_capture_loopback_options {
     const char* interface_name;  // e.g., "lo"
     int snaplen;
-    int timeout_ms;
+    // Give up and return FH_CAPTURE_RC_STREAM_STOPPED once this many
+    // milliseconds pass with no matching packet. 0 keeps capturing forever.
+    // Only armed after the first packet, so starting the sniffer before the
+    // traffic source does not end the run immediately.
+    int stall_timeout_ms;
     // Optional filter: if filter_has_eaxc is non-zero, only packets matching
     // filter_eaxc (16-bit) are considered. If filter_has_direction is non-zero,
     // only packets matching filter_direction (0=UL,1=DL) are considered.

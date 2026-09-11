@@ -291,15 +291,17 @@ bool imgui_startup_render(
     ImGui::SameLine();
     ImGui::TextDisabled("number of symbols to keep in memory (vertical resolution)");
 
-    // Place timeout control at the bottom of the Capture section
+    // Place stream-stop control at the bottom of the Capture section
     ImGui::Spacing();
-    ImGui::Checkbox("Enable timeout", &config->timeout_enabled);
-    if (config->timeout_enabled) {
-        ImGui::InputInt("Timeout (ms)", &config->timeout_ms, 1, 1000);
-        clamp_int(config->timeout_ms, 1, 1000000);
-    }
+    ImGui::Checkbox("Exit when stream stops", &config->timeout_enabled);
     ImGui::SameLine();
-    ImGui::TextDisabled("timeout for packet capture (shut down if stream stops)");
+    ImGui::TextDisabled("end the run once the capture goes silent");
+    if (config->timeout_enabled) {
+        ImGui::InputInt("Silence before exit (ms)", &config->timeout_ms, 1, 1000);
+        clamp_int(config->timeout_ms, 1, 1000000);
+        ImGui::SameLine();
+        ImGui::TextDisabled("armed only after the first packet arrives");
+    }
 
     ImGui::Spacing();
     ImGui::SeparatorText("Decoder");

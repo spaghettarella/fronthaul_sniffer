@@ -90,7 +90,9 @@ void print_usage(const char* argv0) {
         << "  --iface <name>                        Interface name (default: lo)\n"
         << "  --channel <eAxC_ID> <data_direction>  eAxC_ID (uint16) and data direction (UL/DL) to filter network capture before queue\n"
         << "  --snaplen <bytes>                     Max captured bytes per packet for Jumbo Frames >9000 for Phy Tap no upper limit (default: 10000)\n"
-        << "  --timeout-ms <ms>                     Read timeout in milliseconds (default: 100)\n"
+        << "  --timeout-ms <ms>                     Exit once the stream has been silent for <ms>\n"
+        << "                                         milliseconds; armed only after the first packet.\n"
+        << "                                         Omit to keep capturing until the window is closed.\n"
         << "  --queue-packets <count>               Max packets buffered before processing (default: 4096)\n"
         << "  (NOTE) --snaplen will also set the queue-bytes value to the same number\n"
         << "  --pcap-loop <bool>                    Loop demo pcap playback (default: true)\n"
@@ -202,13 +204,14 @@ int main(int argc, char** argv) {
     std::string iface = "lo";
     capture_options.interface_name = iface.c_str();
     capture_options.snaplen = 20000;
-    capture_options.timeout_ms = 100;
+    capture_options.stall_timeout_ms = 0;  // never give up unless asked to
 
     std::size_t queue_packets = 4096;
     std::size_t queue_bytes = static_cast<std::size_t>(capture_options.snaplen);
     std::size_t texture_height = 200;
 
-    bool timeout_specified = false;
+    int stall_timeout_ms = 1000;
+    bool stall_timeout_enabled = false;
 
     int iq_analysis_symbols = 0;  // 0 = off; see --iq-analysis
     bool ud_comp_hdr_present = false;
@@ -293,8 +296,11 @@ int main(int argc, char** argv) {
             // Combine: set queue_bytes to the same value as snaplen
             queue_bytes = static_cast<std::size_t>(capture_options.snaplen);
         } else if (arg == "--timeout-ms") {
-            capture_options.timeout_ms = std::stoi(next_arg("--timeout-ms"));
-            timeout_specified = true;
+            stall_timeout_ms = std::stoi(next_arg("--timeout-ms"));
+            if (stall_timeout_ms < 1) {
+                throw std::invalid_argument("--timeout-ms must be >= 1");
+            }
+            stall_timeout_enabled = true;
         } else if (arg == "--pcap-loop") {
             demo_pcap_loop = (next_arg("--pcap-loop") == "true");
         } else if (arg == "--queue-packets") {
@@ -373,8 +379,8 @@ int main(int argc, char** argv) {
         startup_config.demo_pcap_loop = demo_pcap_loop;
         startup_config.ocudu_phy_tap_queue_name = ocudu_phy_tap_queue_name;
         startup_config.snaplen = capture_options.snaplen;
-        startup_config.timeout_ms = capture_options.timeout_ms;
-        startup_config.timeout_enabled = timeout_specified;
+        startup_config.timeout_ms = stall_timeout_ms;
+        startup_config.timeout_enabled = stall_timeout_enabled;
         startup_config.queue_packets = queue_packets;
         startup_config.queue_bytes = queue_bytes;
         startup_config.decode_threads = decode_threads;
@@ -593,11 +599,8 @@ int main(int argc, char** argv) {
             demo_pcap_loop = startup_config.demo_pcap_loop;
             ocudu_phy_tap_queue_name = startup_config.ocudu_phy_tap_queue_name;
             capture_options.snaplen = startup_config.snaplen;
-            if (startup_config.timeout_enabled) {
-                capture_options.timeout_ms = startup_config.timeout_ms;
-            } else {
-                capture_options.timeout_ms = 0; // disable timeout
-            }
+            stall_timeout_enabled = startup_config.timeout_enabled;
+            stall_timeout_ms = startup_config.timeout_ms;
             queue_packets = static_cast<std::size_t>(startup_config.queue_packets);
             queue_bytes = static_cast<std::size_t>(startup_config.queue_bytes);
             decode_threads = static_cast<std::size_t>(startup_config.decode_threads);
@@ -626,6 +629,12 @@ int main(int argc, char** argv) {
             texture_height = memory_symbols;
             capture_options.interface_name = iface.c_str();
         }
+
+        // Only the give-up threshold is user-facing; each backend's own read
+        // timeout is fixed at FH_CAPTURE_POLL_TIMEOUT_MS so it always returns to
+        // its stop-flag check whether or not the stream is still running.
+        // Applies to both entry paths: CLI flags and the startup screen.
+        capture_options.stall_timeout_ms = stall_timeout_enabled ? stall_timeout_ms : 0;
 
         // The backdrop capture is started whenever the demo pcap is present,
         // which is independent of whether the startup screen runs, so it has
@@ -715,7 +724,7 @@ int main(int argc, char** argv) {
                 fh_capture_loopback_options_t loopback_options{};
                 loopback_options.interface_name = iface.c_str();
                 loopback_options.snaplen = capture_options.snaplen;
-                loopback_options.timeout_ms = capture_options.timeout_ms;
+                loopback_options.stall_timeout_ms = capture_options.stall_timeout_ms;
                 // Apply CLI channel filters if provided
                 loopback_options.filter_has_eaxc = channel_has_eaxc ? 1 : 0;
                 loopback_options.filter_eaxc = channel_eaxc;
@@ -732,6 +741,7 @@ int main(int argc, char** argv) {
                 fh_capture_ocudu_phy_tap_options_t phy_tap_options{};
                 phy_tap_options.queue_name = ocudu_phy_tap_queue_name.c_str();
                 phy_tap_options.poll_sleep_ms = 1;
+                phy_tap_options.stall_timeout_ms = capture_options.stall_timeout_ms;
                 rc = fh_capture_ocudu_phy_tap_run(
                     &phy_tap_options,
                     queue_callback,
@@ -748,8 +758,14 @@ int main(int argc, char** argv) {
                     errbuf,
                     sizeof(errbuf));
             }
-            if (rc != 0) {
+            // Negative is a real failure; the stall code is a positive value, so
+            // this has to test the sign rather than != 0.
+            if (rc < 0) {
                 std::cerr << "capture error: " << errbuf << '\n';
+                g_stop = 1;
+            } else if (rc == FH_CAPTURE_RC_STREAM_STOPPED) {
+                std::cout << "[capture] no packets for " << capture_options.stall_timeout_ms
+                          << " ms, stream stopped - shutting down\n";
                 g_stop = 1;
             } else if (!demo_pcap_loop) {
                 // If not in looping mode for pcap replay, stop when capture finishes cleanly.

@@ -50,9 +50,12 @@ int fh_capture_socket_run(
     }
 
     // Apply a receive timeout so the loop can periodically check stop_flag.
+    // A zero timeval means "no timeout" to the kernel, which would leave recv
+    // blocked past shutdown once the stream goes quiet, so this is always the
+    // fixed poll interval and never the user's stall setting.
     struct timeval timeout;
-    timeout.tv_sec = options->timeout_ms / 1000;
-    timeout.tv_usec = (options->timeout_ms % 1000) * 1000;
+    timeout.tv_sec = FH_CAPTURE_POLL_TIMEOUT_MS / 1000;
+    timeout.tv_usec = (FH_CAPTURE_POLL_TIMEOUT_MS % 1000) * 1000;
     (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
 
     // Resolve the interface index for the selected interface name.
@@ -82,18 +85,31 @@ int fh_capture_socket_run(
         return write_err(errbuf, errbuf_len, "failed to allocate socket receive buffer");
     }
 
+    int result = 0;
+    int stall_armed = 0;
+    struct timespec last_packet_time;
+    fh_capture_monotonic_now(&last_packet_time);
+
     // Main receive loop: read packets, timestamp them, and hand them off.
     while (*stop_flag == 0) {
         ssize_t n = recv(fd, buf, (size_t)options->snaplen, 0);
         if (n < 0) {
             // Timeout just means we should check for shutdown and try again.
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                if (options->stall_timeout_ms > 0 && stall_armed &&
+                    fh_capture_elapsed_ms(&last_packet_time) >= (long)options->stall_timeout_ms) {
+                    result = FH_CAPTURE_RC_STREAM_STOPPED;
+                    break;
+                }
                 continue;
             }
             free(buf);
             close(fd);
             return write_err(errbuf, errbuf_len, "socket recv failed");
         }
+
+        fh_capture_monotonic_now(&last_packet_time);
+        stall_armed = 1;
 
         // Stamp the packet and populate the lightweight packet view.
         struct timespec ts;
@@ -115,7 +131,7 @@ int fh_capture_socket_run(
     // Release resources before returning to the caller.
     free(buf);
     close(fd);
-    return 0;
+    return result;
 }
 #else
 int fh_capture_socket_run(

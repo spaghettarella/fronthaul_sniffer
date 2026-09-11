@@ -69,6 +69,15 @@ printf 'test' | nc 127.0.0.1 9000
 --queue-bytes <bytes>
 ```
 
+`--timeout-ms <ms>` is the stream-stop timeout, equivalent to "Exit when stream
+stops" on the startup screen: once the capture has been silent for that long the
+run ends by itself. It is armed only after the first packet arrives, so starting
+the sniffer before the gNB/RU does not cut the run short, and omitting it keeps
+the capture alive until the window is closed. It is not a read timeout — every
+live backend polls on a fixed `FH_CAPTURE_POLL_TIMEOUT_MS` interval so it always
+returns to its stop-flag check, silent stream or not. Run `--help` for the
+authoritative option list.
+
 ## Architecture
 
 - `capture/c_capture.*` (C): backend-specific packet ingestion (`pcap`, `socket`)

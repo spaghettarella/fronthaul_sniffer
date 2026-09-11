@@ -216,11 +216,23 @@ int fh_capture_ocudu_phy_tap_run(
 		return write_err(errbuf, errbuf_len, "failed to allocate phy tap packet buffer");
 	}
 
+	int stall_armed = 0;
+	struct timespec last_record_time;
+	fh_capture_monotonic_now(&last_record_time);
+
 	while (*stop_flag == 0) {
 		const uint64_t read_seq = __atomic_load_n(&state->read_sequence, __ATOMIC_ACQUIRE);
 		const uint64_t write_seq = __atomic_load_n(&state->write_sequence, __ATOMIC_ACQUIRE);
 
 		if (read_seq == write_seq) {
+			// Producer has published nothing new; the only place a stopped tap
+			// becomes visible.
+			if (options->stall_timeout_ms > 0 && stall_armed &&
+				fh_capture_elapsed_ms(&last_record_time) >= (long)options->stall_timeout_ms) {
+				rc = FH_CAPTURE_RC_STREAM_STOPPED;
+				break;
+			}
+
 			struct timespec delay;
 			delay.tv_sec = poll_sleep_ms / 1000;
 			delay.tv_nsec = (long)(poll_sleep_ms % 1000) * 1000L * 1000L;
@@ -283,6 +295,11 @@ int fh_capture_ocudu_phy_tap_run(
 		if (on_packet(&pkt, user_ctx) != 0) {
 			break;
 		}
+
+		// Liveness is measured on records actually handed downstream, so a tap
+		// stuck republishing torn records still trips the stall timeout.
+		fh_capture_monotonic_now(&last_record_time);
+		stall_armed = 1;
 
 		__atomic_store_n(&state->read_sequence, read_seq + 1ULL, __ATOMIC_RELEASE);
 	}
