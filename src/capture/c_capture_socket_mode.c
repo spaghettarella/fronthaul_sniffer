@@ -108,6 +108,16 @@ int fh_capture_socket_run(
             return write_err(errbuf, errbuf_len, "socket recv failed");
         }
 
+        // Dropped before the queue, so a filtered-out channel never gets
+        // decoded and never appears in the stream selector. Ahead of the stall
+        // timer deliberately, matching the loopback backend: the timeout is
+        // meant to measure silence on the channel being watched, and feeding it
+        // from traffic that was just discarded would keep a dead stream looking
+        // alive on the strength of its neighbours.
+        if (!fh_channel_filter_accepts(&options->filter, buf, (size_t)n, FH_LINKTYPE_ETHERNET)) {
+            continue;
+        }
+
         fh_capture_monotonic_now(&last_packet_time);
         stall_armed = 1;
 

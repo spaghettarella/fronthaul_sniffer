@@ -2,6 +2,7 @@
 
 #include "../core/c_fronthaul_decoder.h"
 #include "c_capture_common.h"
+#include "c_channel_filter.h"
 
 #include <signal.h>
 #include <stddef.h>
@@ -14,10 +15,12 @@ typedef struct fh_capture_socket_options {
     const char* interface_name;
     int snaplen;
     // Give up and return FH_CAPTURE_RC_STREAM_STOPPED once this many
-    // milliseconds pass with no packet. 0 keeps capturing forever. Only armed
-    // after the first packet, so starting the sniffer before the traffic source
-    // does not end the run immediately.
+    // milliseconds pass with no matching packet. 0 keeps capturing forever.
+    // Only armed after the first packet, so starting the sniffer before the
+    // traffic source does not end the run immediately.
     int stall_timeout_ms;
+    // Optional eAxC / direction filter, applied before packets reach the queue.
+    fh_channel_filter_t filter;
 } fh_capture_socket_options_t;
 
 typedef int (*fh_packet_callback_t)(const fh_packet_t* pkt, void* user_ctx);

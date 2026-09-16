@@ -1,0 +1,440 @@
+#!/usr/bin/env bash
+#
+# make_demo_release - package the current build into a self-contained directory
+# (and tarball) that runs on another Ubuntu machine without installing anything.
+#
+# What gets bundled: every shared library the binary links against that is not
+# part of the base system, plus a compat copy of glibc/libstdc++ used only when
+# the target machine's own copies are too old. Graphics libraries (libGL*, X11)
+# are deliberately NOT bundled - they have to match the target's GPU driver.
+#
+# Usage: ./make_demo_release [options]   (run from anywhere; paths are derived)
+#
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd -P)"
+
+BIN_NAME="fronthaul_sniffer"
+BUILD_DIR="${REPO_ROOT}/build"
+OUT_DIR="${SCRIPT_DIR}"
+INCLUDE_DEMO_DATA=1
+DO_STRIP=1
+DO_ARCHIVE=1
+DO_VERIFY=1
+DO_REBUILD=0
+
+# Libraries that must come from the target machine, never from the bundle:
+# the GL stack is tied to the installed GPU driver and X11 to the running server.
+SYSTEM_ONLY_RE='^(libGL|libGLX|libGLdispatch|libOpenGL|libEGL|libGLESv|libglapi|libgbm|libdrm|libX11|libXext|libXi|libXrandr|libXinerama|libXcursor|libXrender|libXfixes|libXau|libXdmcp|libxcb|libwayland|libxkbcommon|libselinux)'
+
+# Libraries bundled into lib/compat/ and used only as a fallback (see run.sh):
+# loading these when the target already has new enough ones would risk clashing
+# with its GL driver, so they sit outside the default search path.
+COMPAT_RE='^(ld-linux-x86-64\.so|libc\.so|libm\.so|libdl\.so|libpthread\.so|librt\.so|libresolv\.so|libutil\.so|libcrypt\.so|libanl\.so|libBrokenLocale\.so|libthread_db\.so|libnsl\.so|libstdc\+\+\.so|libgcc_s\.so)'
+
+# Data files the program opens through paths relative to its own directory.
+DEMO_DATA=(
+    "src/capture/demo.pcap"        # default demo stream
+    "src/capture/KlarweinXP.pcap"  # startup-screen background replay
+)
+
+usage() {
+    cat <<'USAGE'
+make_demo_release - package the current build for distribution
+
+Options:
+  --build-dir DIR    Build directory to take the binary from (default: ../build)
+  --out-dir DIR      Where to write the bundle (default: this script's folder)
+  --rebuild          Run `cmake --build` on the build directory first
+  --no-demo-data     Leave out the demo .pcap files (~50 MB smaller, demo mode
+                     and the startup background then need a --demo-pcap path)
+  --no-strip         Keep debug symbols in the packaged binary
+  --no-archive       Leave the bundle as a directory, do not create the tarball
+  --no-verify        Skip the post-package smoke test
+  -h, --help         Show this message
+USAGE
+}
+
+die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+info() { printf '  %s\n' "$*"; }
+step() { printf '\n==> %s\n' "$*"; }
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --build-dir) [ $# -ge 2 ] || die "--build-dir needs a path"; BUILD_DIR="$2"; shift 2 ;;
+        --out-dir)   [ $# -ge 2 ] || die "--out-dir needs a path";   OUT_DIR="$2";   shift 2 ;;
+        --rebuild)      DO_REBUILD=1;        shift ;;
+        --no-demo-data) INCLUDE_DEMO_DATA=0; shift ;;
+        --no-strip)     DO_STRIP=0;          shift ;;
+        --no-archive)   DO_ARCHIVE=0;        shift ;;
+        --no-verify)    DO_VERIFY=0;         shift ;;
+        -h|--help)      usage; exit 0 ;;
+        *) usage >&2; die "unknown option: $1" ;;
+    esac
+done
+
+command -v ldd >/dev/null || die "ldd not found"
+command -v objdump >/dev/null || die "objdump not found (apt install binutils)"
+
+# ---------------------------------------------------------------- build input
+if [ "${DO_REBUILD}" -eq 1 ]; then
+    step "Rebuilding"
+    cmake --build "${BUILD_DIR}" -j
+fi
+
+BIN="${BUILD_DIR}/${BIN_NAME}"
+[ -x "${BIN}" ] || die "no binary at ${BIN} - build first, or pass --build-dir"
+
+step "Packaging $(basename "${BIN}") from ${BUILD_DIR}"
+
+# A silently stale binary is the easiest way to ship last week's bugs.
+if [ -n "$(find "${REPO_ROOT}/src" "${REPO_ROOT}/CMakeLists.txt" \
+            -newer "${BIN}" \( -name '*.c' -o -name '*.cpp' -o -name '*.h' -o -name 'CMakeLists.txt' \) \
+            -print -quit 2>/dev/null)" ]; then
+    printf '  WARNING: sources are newer than the binary; consider --rebuild\n' >&2
+fi
+
+VERSION="$(sed -n 's/.*project(.*VERSION \([0-9][0-9.]*\).*/\1/p' "${REPO_ROOT}/CMakeLists.txt" | head -1)"
+VERSION="${VERSION:-0.0.0}"
+GIT_REV="$(git -C "${REPO_ROOT}" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+if ! git -C "${REPO_ROOT}" diff --quiet HEAD 2>/dev/null; then
+    GIT_REV="${GIT_REV}-dirty"
+fi
+BUILD_DISTRO="$(. /etc/os-release 2>/dev/null && echo "${PRETTY_NAME}" || echo "unknown Linux")"
+REQ_GLIBC="$(objdump -T "${BIN}" | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sed 's/GLIBC_//' | sort -uV | tail -1)"
+REQ_GLIBCXX="$(objdump -T "${BIN}" | grep -oE 'GLIBCXX_[0-9.]+' | sed 's/GLIBCXX_//' | sort -uV | tail -1)"
+
+NAME="${BIN_NAME}-demo-${VERSION}-${GIT_REV}-linux-x86_64"
+STAGE="${OUT_DIR}/${NAME}"
+
+info "version      ${VERSION} (${GIT_REV})"
+info "built on     ${BUILD_DISTRO}"
+info "needs glibc  >= ${REQ_GLIBC}  (bundled fallback covers older targets)"
+
+# ------------------------------------------------------------------- staging
+step "Staging ${STAGE}"
+rm -rf "${STAGE}"
+mkdir -p "${STAGE}/bin" "${STAGE}/lib/compat" "${STAGE}/src/capture"
+
+install -m 0755 "${BIN}" "${STAGE}/bin/${BIN_NAME}"
+if [ "${DO_STRIP}" -eq 1 ] && command -v strip >/dev/null; then
+    strip --strip-unneeded "${STAGE}/bin/${BIN_NAME}"
+    info "binary       $(du -h "${STAGE}/bin/${BIN_NAME}" | cut -f1) (stripped)"
+else
+    info "binary       $(du -h "${STAGE}/bin/${BIN_NAME}" | cut -f1)"
+fi
+
+# A sane default window layout beats the blank one ImGui starts from.
+if [ -f "${BUILD_DIR}/imgui.ini" ]; then
+    install -m 0644 "${BUILD_DIR}/imgui.ini" "${STAGE}/bin/imgui.ini"
+    info "layout       imgui.ini copied from the build directory"
+fi
+
+# --------------------------------------------------------------- shared libs
+step "Collecting shared libraries"
+n_bundled=0 n_compat=0 n_system=0
+missing=""
+
+while IFS= read -r line; do
+    case "${line}" in
+        *'linux-vdso'*) continue ;;
+        *'not found'*)
+            missing="${missing} $(printf '%s' "${line}" | awk '{print $1}')"
+            continue ;;
+    esac
+
+    if printf '%s' "${line}" | grep -q '=>'; then
+        soname="$(printf '%s' "${line}" | awk '{print $1}')"
+        libpath="$(printf '%s' "${line}" | awk '{print $3}')"
+    else
+        libpath="$(printf '%s' "${line}" | awk '{print $1}')"
+        soname="$(basename "${libpath}")"
+    fi
+    [ -n "${libpath}" ] && [ -e "${libpath}" ] || continue
+
+    if printf '%s' "${soname}" | grep -qE "${SYSTEM_ONLY_RE}"; then
+        n_system=$((n_system + 1))
+        continue
+    fi
+
+    if printf '%s' "${soname}" | grep -qE "${COMPAT_RE}"; then
+        dest="${STAGE}/lib/compat/${soname}"
+        n_compat=$((n_compat + 1))
+    else
+        dest="${STAGE}/lib/${soname}"
+        n_bundled=$((n_bundled + 1))
+    fi
+    # -L: ldd resolves to the symlink; the bundle needs the real object under
+    # the soname the binary asks for.
+    cp -L "${libpath}" "${dest}"
+    chmod 0644 "${dest}"
+done < <(ldd "${BIN}")
+
+# The loader is executed directly in fallback mode, so it needs the exec bit.
+[ -e "${STAGE}/lib/compat/ld-linux-x86-64.so.2" ] && chmod 0755 "${STAGE}/lib/compat/ld-linux-x86-64.so.2"
+
+[ -z "${missing}" ] || die "unresolved libraries on this machine:${missing}"
+
+info "bundled      ${n_bundled} libraries in lib/"
+info "compat       ${n_compat} libraries in lib/compat/ (fallback only)"
+info "from target  ${n_system} graphics/X11 libraries stay on the target machine"
+
+# -------------------------------------------------------------------- demo data
+if [ "${INCLUDE_DEMO_DATA}" -eq 1 ]; then
+    step "Copying demo captures"
+    for rel in "${DEMO_DATA[@]}"; do
+        src="${REPO_ROOT}/${rel}"
+        if [ -f "${src}" ]; then
+            install -m 0644 "${src}" "${STAGE}/${rel}"
+            info "$(basename "${rel}")  $(du -h "${src}" | cut -f1)"
+        else
+            printf '  WARNING: %s missing, demo mode will need an explicit --demo-pcap\n' "${rel}" >&2
+        fi
+    done
+else
+    info "demo captures skipped (--no-demo-data)"
+fi
+
+# --------------------------------------------------------------- launcher
+step "Writing run.sh"
+cat > "${STAGE}/run.sh" <<'LAUNCHER'
+#!/bin/sh
+#
+# Launcher for the fronthaul sniffer demo bundle.
+#
+# Picks the least invasive way to satisfy the program's library needs:
+#   1. native  - bundled non-system libraries + this machine's glibc/libstdc++
+#   2. compat  - also use the bundled libstdc++/libgcc  (machine's C++ runtime too old)
+#   3. loader  - run under the bundled glibc loader     (machine's glibc too old)
+#
+# Mode 1 is tried first because the GL driver is loaded from this machine and
+# is happiest next to this machine's own runtime. Each mode is verified with a
+# real `--help` run before it is used, so a mode is only chosen if it loads.
+#
+# Env: FH_LAUNCH_MODE=native|compat|loader forces a mode, FH_DEBUG=1 is verbose.
+#
+set -eu
+
+APPDIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+BIN="${APPDIR}/bin/fronthaul_sniffer"
+LIB="${APPDIR}/lib"
+COMPAT="${APPDIR}/lib/compat"
+LOADER="${COMPAT}/ld-linux-x86-64.so.2"
+SYSLIB="/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu:/lib64:/usr/lib"
+
+[ -x "${BIN}" ] || { echo "run.sh: missing ${BIN}" >&2; exit 1; }
+
+debug() { [ "${FH_DEBUG:-0}" = "1" ] && echo "run.sh: $*" >&2 || true; }
+
+# The program opens its demo captures as ../src/capture/*.pcap, relative to the
+# working directory, and writes its window layout to imgui.ini in it.
+cd "${APPDIR}/bin"
+
+probe_native() { LD_LIBRARY_PATH="${LIB}" "${BIN}" --help >/dev/null 2>&1; }
+probe_compat() { LD_LIBRARY_PATH="${LIB}:${COMPAT}" "${BIN}" --help >/dev/null 2>&1; }
+probe_loader() {
+    [ -x "${LOADER}" ] || return 1
+    "${LOADER}" --library-path "${LIB}:${COMPAT}:${SYSLIB}" "${BIN}" --help >/dev/null 2>&1
+}
+
+MODE="${FH_LAUNCH_MODE:-}"
+if [ -z "${MODE}" ]; then
+    if   probe_native; then MODE=native
+    elif probe_compat; then MODE=compat
+    elif probe_loader; then MODE=loader
+    else
+        cat >&2 <<'DIAG'
+run.sh: the program will not start on this machine.
+
+This bundle needs a 64-bit x86 Linux with a working OpenGL/X11 setup. The most
+common cause is a missing graphics library, which is deliberately not bundled
+because it has to match your GPU driver. On Debian/Ubuntu:
+
+    sudo apt install libgl1 libx11-6 libxcb1
+
+The loader's own report follows.
+DIAG
+        LD_LIBRARY_PATH="${LIB}" "${BIN}" --help >/dev/null || true
+        echo "--- unresolved libraries ---" >&2
+        LD_LIBRARY_PATH="${LIB}" ldd "${BIN}" 2>/dev/null | grep 'not found' >&2 || true
+        exit 1
+    fi
+fi
+debug "launch mode ${MODE}"
+
+if [ "$(id -u)" = "0" ] && [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; then
+    echo "run.sh: running as root with no DISPLAY - use 'sudo -E ./run.sh' so the window can open." >&2
+fi
+
+case "${MODE}" in
+    native) exec env LD_LIBRARY_PATH="${LIB}" "${BIN}" "$@" ;;
+    compat) exec env LD_LIBRARY_PATH="${LIB}:${COMPAT}" "${BIN}" "$@" ;;
+    loader) exec "${LOADER}" --library-path "${LIB}:${COMPAT}:${SYSLIB}" "${BIN}" "$@" ;;
+    *) echo "run.sh: unknown FH_LAUNCH_MODE '${MODE}'" >&2; exit 1 ;;
+esac
+LAUNCHER
+chmod 0755 "${STAGE}/run.sh"
+
+# ---------------------------------------------------------------- bundle README
+step "Writing README.md"
+cat > "${STAGE}/README.md" <<'BUNDLE_README'
+# Fronthaul Sniffer - demo build
+
+A live viewer for O-RAN fronthaul traffic: it decodes eCPRI/O-RAN user-plane
+packets and plots the IQ data as a waterfall or a curve.
+
+This is a self-contained bundle. Nothing is installed, nothing is written
+outside the folder you unpacked, and removing the folder removes the program.
+
+## Requirements
+
+- 64-bit x86 Linux with a graphical desktop (built and tested on @BUILD_DISTRO@)
+- Working OpenGL - any normal desktop install has this
+- Older distributions are handled automatically: the bundle carries its own
+  C/C++ runtime and falls back to it when the machine's own is too old
+  (this build needs glibc @REQ_GLIBC@ / libstdc++ GLIBCXX_@REQ_GLIBCXX@ natively)
+
+If the program refuses to start, it is almost always a missing graphics
+library - those are not bundled because they must match your GPU driver:
+
+```bash
+sudo apt install libgl1 libx11-6 libxcb1
+```
+
+## Run it
+
+```bash
+tar -xzf @NAME@.tar.gz
+cd @NAME@
+./run.sh
+```
+
+A startup screen opens. **Click anywhere on it once** - the configuration
+panel only appears after the first click. Pick a source, adjust the decode
+settings if you need to, and start the capture.
+
+### Replaying the bundled capture (no hardware needed)
+
+This is the interesting path if you just want to see what the tool does. On the
+startup screen choose the demo pcap source; the path is pre-filled with the
+capture shipped in this bundle. Or straight from the command line:
+
+```bash
+./run.sh --demo-pcap ../src/capture/demo.pcap 25
+```
+
+The number is the replay rate in packets per second. The capture loops.
+
+### Live capture
+
+Reading from a real interface needs root, and the window has to reach your
+desktop, so keep your environment with `-E`:
+
+```bash
+sudo -E ./run.sh --iface eth0
+```
+
+Without `-E` the program starts but cannot open a window. Setting file
+capabilities with `setcap` instead of using sudo does **not** work here: the
+kernel then ignores the library paths this bundle relies on.
+
+## Useful options
+
+```text
+--demo-pcap <path> <speed>   Replay a capture instead of a live interface
+--iface <name>               Interface to capture from (default: lo)
+--channel <eAxC_ID> <UL|DL>  Only decode one stream
+--snaplen <bytes>            Max bytes per packet; jumbo frames need > 9000
+--memory-size <symbols>      Symbols kept per stream, i.e. capture depth
+--decode-threads <count>     Parallel decode workers
+--ud-iq-width <bits>         IQ sample width on the wire (default: 9)
+--ud-comp-method <NONE|BFP>  User-data compression (default: BFP)
+--ud-comp-hdr-present <bool> Whether packets carry a compression header
+--scs-khz <value>            Subcarrier spacing (default: 30)
+--timeout-ms <ms>            Exit after the stream has been silent this long
+--help                       Full option list
+```
+
+Everything on the command line can also be set on the startup screen.
+
+## Driving the plot
+
+- **Scroll** over the plot zooms around the cursor; **Shift+scroll** horizontal
+  only, **Ctrl+scroll** vertical only
+- **Left-drag** pans, **arrow keys** step by 10% of a screenful
+- The **Zoom** window shows the visible range in real units and has
+  *Reset to full view*
+- The **Markers** window has *Value at cursor*, which reads out the cell under
+  the pointer without placing a marker
+
+Zoom is display-only: it never touches the capture, the decode, or the
+measurements.
+
+## What is in here
+
+```text
+run.sh              Start the program (use this, not bin/ directly)
+bin/                The executable and its saved window layout
+lib/                Bundled libraries (libpcap, GLFW, ...)
+lib/compat/         C/C++ runtime, used only on older distributions
+src/capture/*.pcap  Demo captures replayed by demo mode
+```
+
+`run.sh` decides how to launch by actually trying each option, so it adapts to
+the machine rather than guessing. `FH_DEBUG=1 ./run.sh` reports which mode it
+picked.
+
+## Troubleshooting
+
+| Symptom | Cause |
+| --- | --- |
+| Nothing happens after the startup screen appears | Click the screen once; the panel is behind that first click |
+| `error while loading shared libraries` | Missing graphics library - see Requirements |
+| Window never opens under `sudo` | Use `sudo -E ./run.sh` |
+| Live capture sees no packets | Needs root and an interface carrying fronthaul traffic; check with `--iface` |
+| Plot stays empty while packets arrive | Decode settings do not match the stream - check `--ud-iq-width`, `--ud-comp-method` and `--ud-comp-hdr-present` |
+BUNDLE_README
+
+sed -i \
+    -e "s|@BUILD_DISTRO@|${BUILD_DISTRO}|g" \
+    -e "s|@REQ_GLIBC@|${REQ_GLIBC}|g" \
+    -e "s|@REQ_GLIBCXX@|${REQ_GLIBCXX}|g" \
+    -e "s|@NAME@|${NAME}|g" \
+    "${STAGE}/README.md"
+
+# ------------------------------------------------------------------- verify
+if [ "${DO_VERIFY}" -eq 1 ]; then
+    step "Smoke test"
+    # A scrubbed environment approximates a machine that has none of this
+    # project's build dependencies installed.
+    if env -i PATH=/usr/bin:/bin HOME="${HOME:-/tmp}" "${STAGE}/run.sh" --help >/dev/null 2>&1; then
+        mode="$(env -i PATH=/usr/bin:/bin HOME="${HOME:-/tmp}" FH_DEBUG=1 \
+                "${STAGE}/run.sh" --help 2>&1 >/dev/null | sed -n 's/.*launch mode //p')"
+        info "bundle starts in a clean environment (mode: ${mode:-native})"
+    else
+        die "the packaged bundle does not start - run '${STAGE}/run.sh --help' to see why"
+    fi
+fi
+
+# ------------------------------------------------------------------ archive
+if [ "${DO_ARCHIVE}" -eq 1 ]; then
+    step "Creating tarball"
+    rm -f "${OUT_DIR}/${NAME}.tar.gz"
+    tar -C "${OUT_DIR}" -czf "${OUT_DIR}/${NAME}.tar.gz" "${NAME}"
+    info "$(du -h "${OUT_DIR}/${NAME}.tar.gz" | cut -f1)  ${NAME}.tar.gz"
+    info "sha256 $(sha256sum "${OUT_DIR}/${NAME}.tar.gz" | cut -d' ' -f1)"
+fi
+
+step "Done"
+info "bundle   ${STAGE}"
+[ "${DO_ARCHIVE}" -eq 1 ] && info "send     ${OUT_DIR}/${NAME}.tar.gz"
+cat <<EOF
+
+The recipient needs no installation:
+
+    tar -xzf ${NAME}.tar.gz
+    cd ${NAME}
+    ./run.sh
+
+EOF

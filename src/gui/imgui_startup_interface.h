@@ -20,6 +20,7 @@ struct fh_startup_config_t {
     unsigned long long queue_packets = 4096;
     unsigned long long queue_bytes = 10000;
     unsigned long long decode_threads = 8;
+    unsigned long long fft_threads = 4;
     unsigned long long memory_symbols = 1120;
     bool ud_comp_hdr_present = false;
     int ud_iq_width = 9;

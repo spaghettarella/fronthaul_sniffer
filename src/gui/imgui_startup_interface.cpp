@@ -371,6 +371,20 @@ bool imgui_startup_render(
     }
 
     ImGui::Spacing();
+    ImGui::SeparatorText("Radar");
+
+    const unsigned long long fft_threads_step = 1ULL;
+    const unsigned long long fft_threads_step_fast = 4ULL;
+    ImGui::InputScalar("FFT threads", ImGuiDataType_U64, &config->fft_threads, &fft_threads_step, &fft_threads_step_fast, "%llu");
+    if (config->fft_threads < 1ULL) {
+        config->fft_threads = 1ULL;
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("threads for the radar transforms; fixed for the run");
+    ImGui::TextDisabled("Only used by the Radar view. Everything else about the radar");
+    ImGui::TextDisabled("is configured live, in the Radar Settings window.");
+
+    ImGui::Spacing();
     ImGui::SeparatorText("Channel filter");
     ImGui::Checkbox("Filter by eAxC ID", &config->channel_has_eaxc);
     ImGui::SameLine();

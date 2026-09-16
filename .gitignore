@@ -8,3 +8,8 @@ build/
 # ignoring a path has no effect on files git already follows.
 *.pcap
 *.pcapng
+
+# Generated release bundles and their tarballs - see release/README.md.
+# The script and its README stay tracked; the packaged output does not.
+release/*/
+release/*.tar.gz

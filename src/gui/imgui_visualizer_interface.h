@@ -12,6 +12,7 @@ extern "C" {
 
 // Forward declarations
 struct fh_oran_memory;
+struct fh_radar;
 typedef struct opengl_visualizer opengl_visualizer_t;
 
 typedef struct fh_memory_key {
@@ -60,7 +61,10 @@ void imgui_visualizer_present(void);
 // keys: array of discovered memory keys
 // num_keys: number of keys in the array
 // current_display_memory: pointer to the currently displayed memory (can be NULL)
-// out_selected_memory: will be set to the pointer of the selected memory
+// radar: radar core the Radar Settings window edits; may be NULL
+// out_radar_dl, out_radar_ul: both directions of the selected eAxC, for the
+//   radar, which needs the pair rather than the single displayed stream. Either
+//   is set to NULL when that direction has not been seen. Optional.
 // window_width, window_height: current window dimensions
 // Returns the display_memory pointer (either unchanged or updated based on user selection)
 struct fh_oran_memory* imgui_visualizer_render(
@@ -72,7 +76,10 @@ struct fh_oran_memory* imgui_visualizer_render(
     int window_width,
     int window_height,
     fh_queue_stats_t stats,
-    opengl_visualizer_t* visualizer);
+    opengl_visualizer_t* visualizer,
+    struct fh_radar* radar,
+    struct fh_oran_memory** out_radar_dl,
+    struct fh_oran_memory** out_radar_ul);
 
 // Shutdown ImGui and release resources
 void imgui_visualizer_shutdown(imgui_visualizer_state_t* state);

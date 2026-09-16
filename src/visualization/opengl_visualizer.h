@@ -57,13 +57,25 @@ int visualizer_get_persistence_n(const opengl_visualizer_t* vis);
 void visualizer_reset_persistence(opengl_visualizer_t* vis);
 
 // --- View mode ---
+// VIEW_MODE_COUNT sizes the per-mode state below; keep it last so adding a
+// mode grows those arrays instead of silently sharing another mode's slot.
 typedef enum visualizer_view_mode {
     VIEW_MODE_WATERFALL = 0,
-    VIEW_MODE_CURVE = 1
+    VIEW_MODE_CURVE = 1,
+    VIEW_MODE_RADAR = 2,
+    VIEW_MODE_COUNT = 3
 } visualizer_view_mode_t;
 
 void visualizer_set_view_mode(opengl_visualizer_t* vis, visualizer_view_mode_t mode);
 visualizer_view_mode_t visualizer_get_view_mode(const opengl_visualizer_t* vis);
+
+// --- Radar view ---
+// The radar's magnitude matrix is computed by the radar core on its own
+// thread (see core/c_radar.h); the visualizer only draws whatever frame is
+// current. Handing over the handle is what switches the radar view from its
+// placeholder to live data.
+struct fh_radar;
+void visualizer_set_radar(opengl_visualizer_t* vis, struct fh_radar* radar);
 
 // --- Curve view: single-symbol magnitude-vs-resource-element plot ---
 // Instead of the waterfall's scrolling time axis, Curve mode plots one
@@ -159,6 +171,41 @@ int visualizer_get_x_ticks(const opengl_visualizer_t* vis,
 void visualizer_get_axis_titles(const opengl_visualizer_t* vis,
                                 const char** out_y_title,
                                 const char** out_x_title);
+
+// --- Grid description ---
+// What the two axes currently measure. The waterfall and curve views always
+// plot resource elements horizontally, but the radar's axes change with its
+// selected output - delay taps horizontally, Doppler bins vertically - so
+// anything that labels an axis, converts a cell index to a physical quantity,
+// or sizes the zoom window has to ask rather than assume.
+typedef enum visualizer_axis_unit {
+    AXIS_UNIT_RE = 0,          // resource element index (horizontal)
+    AXIS_UNIT_DELAY_TAP = 1,   // channel-impulse-response tap (horizontal)
+    AXIS_UNIT_SYMBOL = 2,      // OFDM symbol, i.e. time (vertical)
+    AXIS_UNIT_DOPPLER_BIN = 3, // Doppler frequency bin (vertical)
+    AXIS_UNIT_MAGNITUDE = 4    // normalised magnitude (vertical, curve view)
+} visualizer_axis_unit_t;
+
+typedef struct visualizer_grid_info {
+    int x_count;                  // cells across; 0 when nothing is drawn
+    int y_count;                  // cells down
+    visualizer_axis_unit_t x_unit;
+    visualizer_axis_unit_t y_unit;
+    const char* x_title;
+    const char* y_title;
+    const char* value_label;      // what one cell holds, e.g. "magnitude", "|H|"
+    // Physical size of one cell, 0 when unknown or not meaningful: metres per
+    // delay tap horizontally, hertz per bin vertically. Lets callers show a
+    // real quantity next to the raw index.
+    float x_unit_scale;
+    float y_unit_scale;
+    // Whether the vertical axis scrolls with newly arriving symbols. False for
+    // Range-Doppler, where the whole matrix is replaced per processing
+    // interval and the axis is a fixed frequency scale.
+    int y_is_scrolling;
+} visualizer_grid_info_t;
+
+void visualizer_get_grid_info(const opengl_visualizer_t* vis, visualizer_grid_info_t* out);
 
 // --- Zoom ---
 // A view window over the data, expressed in normalized [0,1] coordinates per

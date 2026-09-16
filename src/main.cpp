@@ -4,6 +4,7 @@
 #include "capture/c_capture_ocudu_phy_tap.h"
 #include "core/c_fronthaul_decoder.h"
 #include "core/c_oran_memory.h"
+#include "core/c_radar.h"
 #include "pipeline/c_packet_queue.h"
 #include "visualization/opengl_visualizer.h"
 #include "analysis/c_iq_analysis.h"
@@ -96,8 +97,9 @@ void print_usage(const char* argv0) {
         << "  --queue-packets <count>               Max packets buffered before processing (default: 4096)\n"
         << "  (NOTE) --snaplen will also set the queue-bytes value to the same number\n"
         << "  --pcap-loop <bool>                    Loop demo pcap playback (default: true)\n"
-        << "  --decode-threads <count>              Number of parallel decode worker threads (default: 1)\n"
-        << "  --memory-size <symbols>               Max symbols buffered per eAxC_ID and Direction (max: 573440; default: 2800)\n"
+        << "  --decode-threads <count>              Number of parallel decode worker threads (default: 8)\n"
+        << "  --fft-threads <count>                 Threads for the radar transforms (default: 4)\n"
+        << "  --memory-size <symbols>               Max symbols buffered per eAxC_ID and Direction (max: 573440; default: 1120)\n"
         << "  --ud-comp-hdr-present <bool>          Whether user data compression header is present (default: false)\n"
         << "  --ud-iq-width <bits>                  Width of user data IQ samples (default: 9)\n"
         << "  --ud-iq-width-decompressed <bits>     Width of user data IQ samples after decompression (default: 16)\n"
@@ -228,6 +230,7 @@ int main(int argc, char** argv) {
 
     std::size_t memory_symbols = 1120;
     std::size_t decode_threads = 8;
+    std::size_t fft_threads = 4;
     bool channel_has_eaxc = false;
     uint16_t channel_eaxc = 0;
     bool channel_has_direction = false;
@@ -310,6 +313,11 @@ int main(int argc, char** argv) {
             if (decode_threads < 1) {
                 throw std::invalid_argument("--decode-threads must be >= 1");
             }
+        } else if (arg == "--fft-threads") {
+            fft_threads = static_cast<std::size_t>(std::stoull(next_arg("--fft-threads")));
+            if (fft_threads < 1) {
+                throw std::invalid_argument("--fft-threads must be >= 1");
+            }
         } else if (arg == "--memory-size") {
             memory_symbols = static_cast<std::size_t>(std::stoull(next_arg("--memory-size")));
         } else if (arg == "--iq-analysis") {
@@ -384,6 +392,7 @@ int main(int argc, char** argv) {
         startup_config.queue_packets = queue_packets;
         startup_config.queue_bytes = queue_bytes;
         startup_config.decode_threads = decode_threads;
+        startup_config.fft_threads = fft_threads;
         startup_config.memory_symbols = memory_symbols;
         startup_config.ud_comp_hdr_present = ud_comp_hdr_present;
         startup_config.ud_iq_width = ud_iq_width;
@@ -607,6 +616,10 @@ int main(int argc, char** argv) {
             if (decode_threads < 1) {
                 decode_threads = 1;
             }
+            fft_threads = static_cast<std::size_t>(startup_config.fft_threads);
+            if (fft_threads < 1) {
+                fft_threads = 1;
+            }
             memory_symbols = static_cast<std::size_t>(startup_config.memory_symbols);
             ud_comp_hdr_present = startup_config.ud_comp_hdr_present;
             ud_iq_width = startup_config.ud_iq_width;
@@ -635,6 +648,14 @@ int main(int argc, char** argv) {
         // its stop-flag check whether or not the stream is still running.
         // Applies to both entry paths: CLI flags and the startup screen.
         capture_options.stall_timeout_ms = stall_timeout_enabled ? stall_timeout_ms : 0;
+
+        // Created only now: the thread count is not final until the startup
+        // screen has been through, and it is fixed for the radar's lifetime.
+        fh_radar_t* radar = fh_radar_create(fft_threads);
+        if (radar == nullptr) {
+            std::cerr << "warning: failed to create radar core, Radar view will be unavailable\n";
+        }
+        visualizer_set_radar(visualizer, radar);
 
         // The backdrop capture is started whenever the demo pcap is present,
         // which is independent of whether the startup screen runs, so it has
@@ -685,6 +706,16 @@ int main(int argc, char** argv) {
         }
 
         // Run packet capture on a background thread (just network I/O/file replay, no OpenGL)
+        // Built once and handed to whichever backend runs, so the startup
+        // screen's Channel filter means the same thing regardless of where the
+        // packets come from.
+        fh_channel_filter_t channel_filter{};
+        channel_filter.has_eaxc = channel_has_eaxc ? 1 : 0;
+        channel_filter.eaxc = channel_eaxc;
+        channel_filter.has_direction = channel_has_direction ? 1 : 0;
+        channel_filter.direction = channel_direction;
+        capture_options.filter = channel_filter;
+
         std::thread capture_thread([&] {
             char errbuf[256] = {0};
             int rc = 0;
@@ -692,6 +723,7 @@ int main(int argc, char** argv) {
                 fh_pcap_stream_options_t demo_options{};
                 demo_options.pcap_path = demo_pcap_path.c_str();
                 demo_options.demo_pcap_timeout = 1.0 / static_cast<double>(demo_pcap_speed);
+                demo_options.filter = channel_filter;
                 // Looping is controlled by the demo_pcap_loop flag.
                 if (demo_pcap_loop) {
                     rc = 0;
@@ -725,11 +757,7 @@ int main(int argc, char** argv) {
                 loopback_options.interface_name = iface.c_str();
                 loopback_options.snaplen = capture_options.snaplen;
                 loopback_options.stall_timeout_ms = capture_options.stall_timeout_ms;
-                // Apply CLI channel filters if provided
-                loopback_options.filter_has_eaxc = channel_has_eaxc ? 1 : 0;
-                loopback_options.filter_eaxc = channel_eaxc;
-                loopback_options.filter_has_direction = channel_has_direction ? 1 : 0;
-                loopback_options.filter_direction = channel_direction;
+                loopback_options.filter = channel_filter;
                 rc = fh_capture_loopback_run(
                     &loopback_options,
                     queue_callback,
@@ -862,6 +890,12 @@ int main(int argc, char** argv) {
                         ui_height = 800;
                     }
 
+                    // The radar reads both directions of the selected eAxC, so
+                    // it needs the pair rather than the one stream the other
+                    // views draw.
+                    fh_oran_memory_t* radar_dl = nullptr;
+                    fh_oran_memory_t* radar_ul = nullptr;
+
                     display_memory = imgui_visualizer_render(
                         imgui_state,
                         keys_snapshot.data(),
@@ -871,7 +905,14 @@ int main(int argc, char** argv) {
                         ui_width,
                         ui_height,
                         stats,
-                        visualizer);
+                        visualizer,
+                        radar,
+                        &radar_dl,
+                        &radar_ul);
+
+                    // Only stores the pointers; the radar worker notices a
+                    // changed pair itself and drops its accumulated frame.
+                    fh_radar_submit(radar, radar_dl, radar_ul);
 
                     // A different eAxC/direction stream means accumulated
                     // persistence averages no longer correspond to what's shown.
@@ -955,6 +996,13 @@ int main(int argc, char** argv) {
         // Release resources in reverse order of creation.
         if (imgui_state != nullptr) {
             imgui_visualizer_shutdown(imgui_state);
+        }
+        // Before the visualizer, which holds a borrowed pointer to it, and
+        // before the memories the radar worker reads.
+        if (radar != nullptr) {
+            visualizer_set_radar(visualizer, nullptr);
+            fh_radar_destroy(radar);
+            radar = nullptr;
         }
         if (visualizer != nullptr) {
             visualizer_destroy(visualizer);

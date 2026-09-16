@@ -1,5 +1,6 @@
 #include "imgui_visualizer_interface.h"
 #include "core/c_oran_memory.h"
+#include "core/c_radar.h"
 #include "pipeline/c_packet_queue.h"
 #include "visualization/opengl_visualizer.h"
 
@@ -493,8 +494,17 @@ void draw_zoom_window(opengl_visualizer_t* visualizer) {
     ImGui::TextDisabled("Display only - memory size, averaging period and");
     ImGui::TextDisabled("capture depth are untouched by anything here.");
 
+    // The axes are not fixed any more: the radar spans delay taps horizontally
+    // and Doppler bins vertically depending on its output, so the extents and
+    // the labels are read from the view rather than assumed.
+    visualizer_grid_info_t grid;
+    visualizer_get_grid_info(visualizer, &grid);
+
     const bool curve_view = visualizer_get_view_mode(visualizer) == VIEW_MODE_CURVE;
-    const float x_total = (float)VISUALIZER_RE_COUNT;
+    const bool delay_x = (grid.x_unit == AXIS_UNIT_DELAY_TAP);
+    const bool doppler_y = (grid.y_unit == AXIS_UNIT_DOPPLER_BIN);
+
+    const float x_total = (float)(grid.x_count > 0 ? grid.x_count : 1);
     // Curve view plots magnitude vertically, so its window is a percentage of
     // full scale rather than a count of rows.
     const int total_rows = visualizer_get_zoom_total_rows(visualizer);
@@ -503,36 +513,89 @@ void draw_zoom_window(opengl_visualizer_t* visualizer) {
     ImGui::Separator();
     draw_zoom_minimap(visualizer);
     if (curve_view) {
-        ImGui::TextDisabled("full extent: %d RE wide, magnitude tall", VISUALIZER_RE_COUNT);
+        ImGui::TextDisabled("full extent: %d RE wide, magnitude tall", (int)x_total);
     } else {
-        ImGui::TextDisabled("full extent: %d RE wide, %d rows tall", VISUALIZER_RE_COUNT, total_rows);
+        ImGui::TextDisabled("full extent: %d %s wide, %d %s tall",
+                            (int)x_total, delay_x ? "taps" : "RE",
+                            total_rows, doppler_y ? "bins" : "rows");
     }
 
     zoom_window_t w = zoom_window_in_units(visualizer, x_total, y_total);
     bool changed = false;
 
     ImGui::Separator();
-    ImGui::TextUnformatted("Frequency (horizontal)");
+    if (delay_x) {
+        ImGui::TextUnformatted("Delay (horizontal)");
 
-    int re_first = (int)lroundf(w.x_first);
-    int re_count = (int)lroundf(w.x_extent);
-    if (ImGui::InputInt("First RE", &re_first, 12, 120)) {
-        w.x_first = (float)re_first;
-        changed = true;
+        int tap_first = (int)lroundf(w.x_first);
+        int tap_count = (int)lroundf(w.x_extent);
+        if (ImGui::InputInt("First tap", &tap_first, 1, 16)) {
+            w.x_first = (float)tap_first;
+            changed = true;
+        }
+        if (ImGui::InputInt("Tap count", &tap_count, 1, 16)) {
+            w.x_extent = (float)tap_count;
+            changed = true;
+        }
+        const int tap_last = tap_first + (tap_count > 0 ? tap_count - 1 : 0);
+        if (grid.x_unit_scale > 0.0f) {
+            ImGui::TextDisabled("showing taps %d-%d  (%.1f-%.1f m of %.0f m)",
+                                tap_first, tap_last,
+                                (double)((float)tap_first * grid.x_unit_scale),
+                                (double)((float)tap_last * grid.x_unit_scale),
+                                (double)(x_total * grid.x_unit_scale));
+        } else {
+            ImGui::TextDisabled("showing taps %d-%d of %d", tap_first, tap_last, (int)x_total);
+        }
+    } else {
+        ImGui::TextUnformatted("Frequency (horizontal)");
+
+        int re_first = (int)lroundf(w.x_first);
+        int re_count = (int)lroundf(w.x_extent);
+        if (ImGui::InputInt("First RE", &re_first, 12, 120)) {
+            w.x_first = (float)re_first;
+            changed = true;
+        }
+        if (ImGui::InputInt("RE count", &re_count, 12, 120)) {
+            w.x_extent = (float)re_count;
+            changed = true;
+        }
+        ImGui::TextDisabled("showing RE %d-%d  (PRB %.1f-%.1f of %d)",
+                            re_first,
+                            re_first + (re_count > 0 ? re_count - 1 : 0),
+                            (double)(w.x_first / 12.0f),
+                            (double)((w.x_first + w.x_extent) / 12.0f),
+                            (int)x_total / 12);
     }
-    if (ImGui::InputInt("RE count", &re_count, 12, 120)) {
-        w.x_extent = (float)re_count;
-        changed = true;
-    }
-    ImGui::TextDisabled("showing RE %d-%d  (PRB %.1f-%.1f of %d)",
-                        re_first,
-                        re_first + (re_count > 0 ? re_count - 1 : 0),
-                        (double)(w.x_first / 12.0f),
-                        (double)((w.x_first + w.x_extent) / 12.0f),
-                        VISUALIZER_RE_COUNT / 12);
 
     ImGui::Separator();
-    if (curve_view) {
+    if (doppler_y) {
+        // Rows are frequency bins covering one processing interval, not a
+        // sliding stretch of time, so they are addressed from the zero-Doppler
+        // centre outward rather than as "first row".
+        ImGui::TextUnformatted("Doppler (vertical)");
+        int bin_first = (int)lroundf(w.y_first);
+        int bin_count = (int)lroundf(w.y_extent);
+        if (ImGui::InputInt("First bin", &bin_first, 1, 10)) {
+            w.y_first = (float)bin_first;
+            changed = true;
+        }
+        if (ImGui::InputInt("Bin count", &bin_count, 1, 10)) {
+            w.y_extent = (float)bin_count;
+            changed = true;
+        }
+        const int centre = total_rows / 2;
+        const int bin_last = bin_first + (bin_count > 0 ? bin_count - 1 : 0);
+        if (grid.y_unit_scale > 0.0f) {
+            ImGui::TextDisabled("showing %+.0f to %+.0f Hz",
+                                (double)((float)(centre - bin_first) * grid.y_unit_scale),
+                                (double)((float)(centre - bin_last) * grid.y_unit_scale));
+        } else {
+            ImGui::TextDisabled("showing bins %d-%d of %d", bin_first, bin_last, total_rows);
+        }
+        ImGui::TextDisabled("Zero Doppler is the centre row. The whole matrix is");
+        ImGui::TextDisabled("replaced each interval, so this axis does not scroll.");
+    } else if (curve_view) {
         ImGui::TextUnformatted("Magnitude (vertical)");
         // Normalized y runs downward, so the window's leading edge is the high
         // end of the magnitude scale; present it the way it reads on screen.
@@ -587,7 +650,303 @@ void draw_zoom_window(opengl_visualizer_t* visualizer) {
     ImGui::End();
 }
 
+// --- Radar settings ---
+
+#define RADAR_SPEED_OF_LIGHT 299792458.0
+
+// Duration of one OFDM symbol including a normal cyclic prefix, in seconds.
+// A slot is always 14 symbols and always 1 ms / (scs / 15 kHz), so the symbol
+// period follows from the subcarrier spacing alone. Returns 0 when the stream
+// has not reported its spacing yet.
+static double radar_symbol_seconds(int scs_khz) {
+    if (scs_khz <= 0) {
+        return 0.0;
+    }
+    const double slots_per_subframe = (double)scs_khz / 15.0;
+    if (slots_per_subframe <= 0.0) {
+        return 0.0;
+    }
+    return 0.001 / slots_per_subframe / 14.0;
+}
+
+// Reads the radar config, runs the widgets against a local copy, and commits
+// once if anything moved - the same read/edit/write shape the trigger's
+// frequency range uses, generalised to the whole struct. Clamping lives in
+// fh_radar_set_config, so raw widget values can go straight over.
+static void draw_radar_window(fh_radar_t* radar,
+                              const fh_oran_memory_t* dl,
+                              const fh_oran_memory_t* ul,
+                              bool have_eaxc,
+                              uint16_t eaxc_id) {
+    ImGui::Begin("Radar Settings", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
+
+    const ImVec4 warn_color(1.0f, 0.45f, 0.35f, 1.0f);
+    const ImVec4 ok_color(0.3f, 1.0f, 0.3f, 1.0f);
+
+    if (radar == nullptr) {
+        ImGui::TextColored(warn_color, "Radar core unavailable.");
+        ImGui::End();
+        return;
+    }
+
+    fh_radar_config_t cfg;
+    fh_radar_get_config(radar, &cfg);
+    fh_radar_stats_t st;
+    fh_radar_get_stats(radar, &st);
+
+    bool changed = false;
+
+    // --- Stream -----------------------------------------------------------
+    ImGui::TextUnformatted("Stream");
+    if (!have_eaxc) {
+        ImGui::TextColored(warn_color, "No eAxC selected.");
+    } else {
+        ImGui::Text("eAxC 0x%04X", eaxc_id);
+        // Missing either direction is the most common reason the plot stays
+        // blank, so it is called out rather than left to be inferred.
+        if (dl != nullptr && ul != nullptr) {
+            ImGui::TextColored(ok_color, "DL and UL both present");
+        } else if (dl == nullptr && ul == nullptr) {
+            ImGui::TextColored(warn_color, "Neither direction captured yet");
+        } else {
+            ImGui::TextColored(warn_color, "Only %s captured - the radar needs both",
+                               (dl != nullptr) ? "DL" : "UL");
+        }
+    }
+    ImGui::TextDisabled("Pick the eAxC in Stream Selection; both its directions");
+    ImGui::TextDisabled("are read together, so there is no UL/DL choice to make.");
+
+    const int scs_khz = (dl != nullptr && dl->scs_khz > 0)
+        ? dl->scs_khz
+        : ((ul != nullptr && ul->scs_khz > 0) ? ul->scs_khz : 0);
+    const double subcarrier_hz = (double)scs_khz * 1000.0;
+
+    // --- Processing window ------------------------------------------------
+    ImGui::Separator();
+    ImGui::TextUnformatted("Processing window");
+
+    changed |= ImGui::InputInt("Time range (symbols)", &cfg.time_symbols);
+    changed |= ImGui::InputInt("Freq. start (RE index)", &cfg.freq_start_re);
+    changed |= ImGui::InputInt("Freq. end (RE index)", &cfg.freq_end_re);
+
+    const int re_span = (cfg.freq_end_re >= cfg.freq_start_re)
+        ? (cfg.freq_end_re - cfg.freq_start_re + 1) : 0;
+    if (subcarrier_hz > 0.0 && re_span > 0) {
+        const double bandwidth_hz = (double)re_span * subcarrier_hz;
+        // What can actually be resolved in delay, set by occupied bandwidth.
+        const double range_res_m = RADAR_SPEED_OF_LIGHT / (2.0 * bandwidth_hz);
+        ImGui::TextDisabled("Occupied BW: %.2f MHz over %d RE", bandwidth_hz / 1.0e6, re_span);
+        ImGui::TextDisabled("Range resolution: %.2f m", range_res_m);
+    } else {
+        ImGui::TextDisabled("Occupied BW: waiting for subcarrier spacing");
+    }
+
+    // --- Symbol pairing ---------------------------------------------------
+    ImGui::Separator();
+    ImGui::TextUnformatted("Symbol pairing");
+
+    changed |= ImGui::InputInt("DL->UL lag (symbols)", &cfg.dl_ul_lag_symbols);
+    ImGui::TextDisabled("UL symbol n+lag is divided against DL symbol n. Sweep this");
+    ImGui::TextDisabled("if the paired count below stays low or mean |H| is wrong.");
+
+    int division_int = (int)cfg.division;
+    ImGui::TextUnformatted("Division");
+    ImGui::RadioButton("UL/DL  (H)", &division_int, RADAR_DIV_UL_OVER_DL);
+    ImGui::SameLine();
+    ImGui::RadioButton("DL/UL  (1/H)", &division_int, RADAR_DIV_DL_OVER_UL);
+    if (division_int != (int)cfg.division) {
+        cfg.division = (fh_radar_division_t)division_int;
+        changed = true;
+    }
+    ImGui::TextDisabled("UL/DL is the physical channel. DL/UL is its reciprocal and");
+    ImGui::TextDisabled("mirrors the delay axis - both read ~1 on occupied REs, so");
+    ImGui::TextDisabled("the mean below cannot tell them apart.");
+
+    ImGui::Text("Paired: %d / %d symbols", st.paired_symbols, st.window_symbols);
+    ImGui::Text("Skipped: %d (DL empty), %d (UL missing)",
+                st.skipped_dl_empty, st.skipped_ul_missing);
+
+    // The acceptance test: an occupied RE divided by itself through a unit
+    // channel is 1, so a healthy setup parks this near 1.0.
+    const bool mean_healthy = (st.mean_cfr_magnitude > 0.5f && st.mean_cfr_magnitude < 2.0f);
+    ImGui::TextColored(mean_healthy ? ok_color : warn_color,
+                       "Mean |H| on occupied REs: %.3f", st.mean_cfr_magnitude);
+
+    // --- Delay / range ----------------------------------------------------
+    ImGui::Separator();
+    ImGui::TextUnformatted("Delay / range");
+
+    static const int ifft_sizes[] = { 512, 1024, 2048, 4096, 8192 };
+    static const char* ifft_labels[] = { "512", "1024", "2048", "4096", "8192" };
+    int ifft_index = 3;
+    for (int i = 0; i < IM_ARRAYSIZE(ifft_sizes); i++) {
+        if (ifft_sizes[i] == cfg.ifft_size) {
+            ifft_index = i;
+            break;
+        }
+    }
+    if (ImGui::Combo("IFFT size", &ifft_index, ifft_labels, IM_ARRAYSIZE(ifft_labels))) {
+        cfg.ifft_size = ifft_sizes[ifft_index];
+        changed = true;
+    }
+
+    // Only the Doppler stage truncates: Range-Time plots the full transform.
+    const bool depth_applies = (cfg.output == RADAR_OUT_RANGE_DOPPLER);
+    if (!depth_applies) {
+        ImGui::BeginDisabled();
+    }
+    changed |= ImGui::InputInt("CIR depth (taps)", &cfg.cir_depth_taps);
+    if (!depth_applies) {
+        ImGui::EndDisabled();
+    }
+    if (depth_applies) {
+        // One slow-time transform per kept tap, so this field is what sets the
+        // refresh cost.
+        ImGui::TextDisabled("%d slow-time FFTs of %d points per refresh",
+                            cfg.cir_depth_taps, cfg.time_symbols);
+    } else {
+        ImGui::TextDisabled("Truncation feeds the Doppler stage only; Range-Time");
+        ImGui::TextDisabled("plots all %d taps.", cfg.ifft_size);
+    }
+
+    if (subcarrier_hz > 0.0) {
+        // Zero padding makes taps finer than the true resolution above; these
+        // are deliberately reported as separate numbers.
+        const double tap_spacing_m =
+            RADAR_SPEED_OF_LIGHT / (2.0 * (double)cfg.ifft_size * subcarrier_hz);
+        const int extent_taps = depth_applies ? cfg.cir_depth_taps : cfg.ifft_size;
+        ImGui::TextDisabled("Tap spacing: %.2f m   Max range: %.1f m",
+                            tap_spacing_m, tap_spacing_m * (double)extent_taps);
+    }
+
+    const double symbol_s = radar_symbol_seconds(scs_khz);
+    if (symbol_s > 0.0 && cfg.time_symbols > 0) {
+        const double doppler_res_hz = 1.0 / ((double)cfg.time_symbols * symbol_s);
+        const double doppler_span_hz = 1.0 / (2.0 * symbol_s);
+        ImGui::TextDisabled("Doppler: %.1f Hz resolution, +/- %.1f kHz unambiguous",
+                            doppler_res_hz, doppler_span_hz / 1000.0);
+    }
+
+    // --- Cancellation -----------------------------------------------------
+    ImGui::Separator();
+    ImGui::TextUnformatted("Cancellation");
+
+    bool mti = cfg.mti_enabled != 0;
+    if (ImGui::Checkbox("Static clutter removal (MTI)", &mti)) {
+        cfg.mti_enabled = mti ? 1 : 0;
+        changed = true;
+    }
+    ImGui::TextDisabled("Subtracts each tap's mean over the window. Removes the");
+    ImGui::TextDisabled("Tx->Rx leakage and anything stationary; moving targets stay.");
+
+    bool blank = cfg.blank_taps_enabled != 0;
+    if (ImGui::Checkbox("Blank leading taps", &blank)) {
+        cfg.blank_taps_enabled = blank ? 1 : 0;
+        changed = true;
+    }
+    if (!blank) {
+        ImGui::BeginDisabled();
+    }
+    changed |= ImGui::InputInt("Taps to blank (K)", &cfg.blank_taps);
+    if (!blank) {
+        ImGui::EndDisabled();
+    }
+    ImGui::TextDisabled("Kills the direct path even when it drifts, which MTI alone");
+    ImGui::TextDisabled("leaves as a residual - at the cost of any target that close.");
+
+    // --- Output -----------------------------------------------------------
+    ImGui::Separator();
+    ImGui::TextUnformatted("Output");
+
+    int output_int = (int)cfg.output;
+    ImGui::RadioButton("CFR magnitude", &output_int, RADAR_OUT_CFR);
+    ImGui::RadioButton("Range-Time", &output_int, RADAR_OUT_RANGE_TIME);
+    ImGui::RadioButton("Range-Doppler", &output_int, RADAR_OUT_RANGE_DOPPLER);
+    if (output_int != (int)cfg.output) {
+        cfg.output = (fh_radar_output_t)output_int;
+        changed = true;
+    }
+
+    if (cfg.output == RADAR_OUT_CFR) {
+        ImGui::TextDisabled("Symbol x RE. No transform involved - this is the view");
+        ImGui::TextDisabled("that says whether the pairing itself is right.");
+    } else {
+        ImGui::TextColored(warn_color, "Not implemented yet - the transform stages");
+        ImGui::TextColored(warn_color, "are the next step. The plot stays blank.");
+    }
+
+    // --- Compute ----------------------------------------------------------
+    ImGui::Separator();
+    ImGui::TextUnformatted("Compute");
+    ImGui::Text("FFT threads: %zu", fh_radar_get_fft_threads(radar));
+    ImGui::TextDisabled("Fixed at startup, like decode threads.");
+    ImGui::Text("Last refresh: %.1f ms   Frames: %llu",
+                st.last_refresh_ms, (unsigned long long)st.refresh_count);
+
+    if (ImGui::Button("Reset")) {
+        fh_radar_reset(radar);
+    }
+
+    if (changed) {
+        fh_radar_set_config(radar, &cfg);
+    }
+
+    ImGui::End();
+}
+
 // --- Value at cursor ---
+
+// Raw IQ magnitudes run to thousands, while a channel estimate sits around 1,
+// so a fixed precision either drowns the reading in digits or quantises away
+// the part worth looking at. Picked from the value rather than the view, which
+// keeps it right for whatever a future output stage happens to produce.
+static const char* value_format(float value) {
+    const float magnitude = (value < 0.0f) ? -value : value;
+    return (magnitude < 100.0f) ? "%.3f" : "%.1f";
+}
+
+// Names the cell a reading came from in whatever the current view's axes
+// measure, so one readout serves the resource grid, the delay axis and the
+// Doppler axis without any of them being described in another's units.
+static void format_cell_column(const visualizer_grid_info_t& grid, int column,
+                               char* out, size_t out_size) {
+    if (grid.x_unit == AXIS_UNIT_DELAY_TAP) {
+        if (grid.x_unit_scale > 0.0f) {
+            snprintf(out, out_size, "tap %d (%.1f m)", column,
+                     static_cast<double>(static_cast<float>(column) * grid.x_unit_scale));
+        } else {
+            snprintf(out, out_size, "tap %d", column);
+        }
+        return;
+    }
+    snprintf(out, out_size, "RE %d", column);
+}
+
+static void format_cell_row(const visualizer_grid_info_t& grid,
+                            const visualizer_cursor_sample_t& sample,
+                            char* out, size_t out_size) {
+    if (grid.y_unit == AXIS_UNIT_DOPPLER_BIN) {
+        // Zero Doppler is the centre row; a bin index alone would not say
+        // which side of it a reading is on.
+        const int centre = grid.y_count / 2;
+        if (grid.y_unit_scale > 0.0f) {
+            snprintf(out, out_size, "%+.0f Hz",
+                     static_cast<double>(static_cast<float>(centre - sample.row) * grid.y_unit_scale));
+        } else {
+            snprintf(out, out_size, "bin %+d", centre - sample.row);
+        }
+        return;
+    }
+    if (sample.has_phase) {
+        snprintf(out, out_size, "phase +%d", sample.phase);
+        return;
+    }
+    if (sample.has_symbol) {
+        snprintf(out, out_size, "sym %d", sample.symbol);
+        return;
+    }
+    snprintf(out, out_size, "row %d", sample.row);
+}
 
 // Fills in the cell under the pointer, or clears valid when there is nothing to
 // read (cursor off the plot, over a panel, or the view is Curve).
@@ -636,19 +995,24 @@ void draw_cursor_value_overlay(opengl_visualizer_t* visualizer,
 
     char line1[64];
     char line2[64];
-    char line3[64];
+    // Wide enough for the two cell labels plus their separator; a delay tap
+    // carrying its range in metres is the longest either of them gets.
+    char line3[112];
     if (sample.has_value) {
-        snprintf(line1, sizeof(line1), "%.1f", static_cast<double>(sample.magnitude));
+        snprintf(line1, sizeof(line1), value_format(sample.magnitude),
+                 static_cast<double>(sample.magnitude));
         snprintf(line2, sizeof(line2), "%.1f%% base", static_cast<double>(sample.percent_of_baseline));
     } else {
         snprintf(line1, sizeof(line1), "no data");
         line2[0] = '\0';
     }
-    if (sample.has_phase) {
-        snprintf(line3, sizeof(line3), "RE %d  phase +%d", sample.re, sample.phase);
-    } else {
-        snprintf(line3, sizeof(line3), "RE %d  sym %d", sample.re, sample.symbol);
-    }
+    visualizer_grid_info_t grid;
+    visualizer_get_grid_info(visualizer, &grid);
+    char col_text[48];
+    char row_text[48];
+    format_cell_column(grid, sample.re, col_text, sizeof(col_text));
+    format_cell_row(grid, sample, row_text, sizeof(row_text));
+    snprintf(line3, sizeof(line3), "%s  %s", col_text, row_text);
 
     const char* lines[3] = { line1, line2, line3 };
     float text_w = 0.0f;
@@ -762,7 +1126,13 @@ fh_oran_memory_t* imgui_visualizer_render(
     int window_width,
     int window_height,
     fh_queue_stats_t stats,
-    opengl_visualizer_t* visualizer) {
+    opengl_visualizer_t* visualizer,
+    fh_radar_t* radar,
+    fh_oran_memory_t** out_radar_dl,
+    fh_oran_memory_t** out_radar_ul) {
+
+    if (out_radar_dl != nullptr) { *out_radar_dl = nullptr; }
+    if (out_radar_ul != nullptr) { *out_radar_ul = nullptr; }
 
     if (!state || !state->initialized || num_keys == 0) {
         return current_display_memory;
@@ -906,7 +1276,18 @@ fh_oran_memory_t* imgui_visualizer_render(
     // Display stream list
     ImGui::BeginChild("StreamList", ImVec2(280, 120), true, ImGuiWindowFlags_AlwaysAutoResize);
 
-    ImGui::TextUnformatted("Columns: eAxC_ID | UL | DL");
+    // The radar reads both directions of one eAxC at once, so a per-direction
+    // selection has nothing to mean there. The eAxC itself becomes the
+    // selectable thing and the direction columns fall back to reporting which
+    // directions exist - which is what decides whether the radar can run at all.
+    const bool radar_selection = visualizer != nullptr &&
+                                 visualizer_get_view_mode(visualizer) == VIEW_MODE_RADAR;
+
+    if (radar_selection) {
+        ImGui::TextUnformatted("Columns: eAxC_ID | UL | DL  (select an eAxC)");
+    } else {
+        ImGui::TextUnformatted("Columns: eAxC_ID | UL | DL");
+    }
     ImGui::Spacing();
 
     if (ImGui::BeginTable("stream_table", 3, ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_RowBg)) {
@@ -919,8 +1300,10 @@ fh_oran_memory_t* imgui_visualizer_render(
             ImGui::PushID(i);
 
             const bool row_selected = (state->selected_eaxc_id_index == i);
-            const bool ul_selected = row_selected && state->selected_data_direction == 0;
-            const bool dl_selected = row_selected && state->selected_data_direction == 1;
+            const bool ul_selected = !radar_selection && row_selected &&
+                                     state->selected_data_direction == 0;
+            const bool dl_selected = !radar_selection && row_selected &&
+                                     state->selected_data_direction == 1;
 
             ImGui::TableNextRow();
 
@@ -930,11 +1313,31 @@ fh_oran_memory_t* imgui_visualizer_render(
             char eaxc_label[16];
             snprintf(eaxc_label, sizeof(eaxc_label), "0x%04X", eaxc_id);
 
+            // In radar mode this button carries the selection, so it takes the
+            // same highlight the direction buttons use elsewhere.
+            const bool highlight_eaxc = radar_selection && row_selected;
+            if (highlight_eaxc) {
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.55f, 0.95f, 1.00f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.26f, 0.64f, 1.00f, 1.00f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.14f, 0.40f, 0.80f, 1.00f));
+            }
             bool eaxc_clicked = ImGui::Button(eaxc_label, ImVec2(80.0f, 0.0f));
+            if (highlight_eaxc) {
+                ImGui::PopStyleColor(3);
+            }
 
             if (eaxc_clicked) {
                 state->selected_eaxc_id_index = i;
-                if (!streams[i].has_ul && streams[i].has_dl) {
+                // A direction is still resolved underneath, even in radar mode:
+                // it decides which ring the rest of the app treats as the
+                // displayed stream, and that is where the subcarrier spacing
+                // the radar's derived figures depend on comes from. Radar
+                // prefers downlink, the reference the channel estimate divides
+                // by; elsewhere a direction that is still available is kept, so
+                // clicking an eAxC does not silently switch what is on screen.
+                if (radar_selection && streams[i].has_dl) {
+                    state->selected_data_direction = 1;
+                } else if (!streams[i].has_ul && streams[i].has_dl) {
                     state->selected_data_direction = 1;
                 } else if (!streams[i].has_dl && streams[i].has_ul) {
                     state->selected_data_direction = 0;
@@ -943,7 +1346,19 @@ fh_oran_memory_t* imgui_visualizer_render(
 
             auto draw_direction_button = [&](const char* label, uint8_t direction, bool available, bool active) {
                 ImGui::TableSetColumnIndex(direction == 0 ? 1 : 2);
-                
+
+                if (radar_selection) {
+                    // Presence readout rather than a control. Text instead of a
+                    // greyed-out button, so nothing looks like it could be
+                    // clicked into a state the radar cannot actually use.
+                    if (available) {
+                        ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.3f, 1.0f), "%s", label);
+                    } else {
+                        ImGui::TextDisabled("-");
+                    }
+                    return;
+                }
+
                 if (!available) {
                     ImGui::BeginDisabled();
                 }
@@ -982,11 +1397,48 @@ fh_oran_memory_t* imgui_visualizer_render(
     ImGui::EndChild();
 
     // Status display
+    uint16_t selected_eaxc_id = 0;
+    bool have_selected_eaxc = false;
     if (state->selected_eaxc_id_index < num_unique_streams) {
-        uint16_t selected_eaxc_id = streams[state->selected_eaxc_id_index].eaxc_id;
-        const char* direction_str = data_direction_to_string(state->selected_data_direction);
-        ImGui::Text("Selected: 0x%04X / %s", selected_eaxc_id, direction_str);
+        const StreamInfo& sel = streams[state->selected_eaxc_id_index];
+        selected_eaxc_id = sel.eaxc_id;
+        have_selected_eaxc = true;
+        if (radar_selection) {
+            // Naming one direction here would misdescribe what the radar reads.
+            ImGui::Text("Selected: 0x%04X", selected_eaxc_id);
+            if (sel.has_ul && sel.has_dl) {
+                ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.3f, 1.0f), "DL and UL - radar can run");
+            } else {
+                ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.35f, 1.0f),
+                                   "Only %s - the radar needs both directions",
+                                   sel.has_dl ? "DL" : "UL");
+            }
+        } else {
+            const char* direction_str = data_direction_to_string(state->selected_data_direction);
+            ImGui::Text("Selected: 0x%04X / %s", selected_eaxc_id, direction_str);
+        }
     }
+
+    // The radar needs both directions of the selected eAxC at once, not the
+    // single stream the other views draw. The eAxC is already tracked
+    // independently of the direction buttons, so both rings resolve from the
+    // same arrays the selector was built from.
+    fh_oran_memory_t* radar_dl = nullptr;
+    fh_oran_memory_t* radar_ul = nullptr;
+    if (have_selected_eaxc && memory_ptrs != nullptr) {
+        for (size_t i = 0; i < num_keys; i++) {
+            if (keys[i].eaxc_id != selected_eaxc_id) {
+                continue;
+            }
+            if (keys[i].data_direction == 1) {
+                radar_dl = memory_ptrs[i];
+            } else if (keys[i].data_direction == 0) {
+                radar_ul = memory_ptrs[i];
+            }
+        }
+    }
+    if (out_radar_dl != nullptr) { *out_radar_dl = radar_dl; }
+    if (out_radar_ul != nullptr) { *out_radar_ul = radar_ul; }
 
     ImGui::End();
 
@@ -1051,6 +1503,8 @@ fh_oran_memory_t* imgui_visualizer_render(
         ImGui::RadioButton("Waterfall", &mode_int, VIEW_MODE_WATERFALL);
         ImGui::SameLine();
         ImGui::RadioButton("Curve", &mode_int, VIEW_MODE_CURVE);
+        ImGui::SameLine();
+        ImGui::RadioButton("Radar", &mode_int, VIEW_MODE_RADAR);
         if (mode_int != (int)view_mode) {
             visualizer_set_view_mode(visualizer, (visualizer_view_mode_t)mode_int);
             view_mode = (visualizer_view_mode_t)mode_int;
@@ -1060,7 +1514,9 @@ fh_oran_memory_t* imgui_visualizer_render(
 
         draw_zoom_window(visualizer);
 
-        if (view_mode == VIEW_MODE_WATERFALL) {
+        if (view_mode == VIEW_MODE_RADAR) {
+            draw_radar_window(radar, radar_dl, radar_ul, have_selected_eaxc, selected_eaxc_id);
+        } else if (view_mode == VIEW_MODE_WATERFALL) {
             ImGui::Begin("Waterfall Settings", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
 
             bool persist_enabled = visualizer_get_persistence_enabled(visualizer) != 0;
@@ -1311,10 +1767,18 @@ fh_oran_memory_t* imgui_visualizer_render(
         } else if (ImGui::BeginTable("marker_table", 5,
                                      ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_RowBg |
                                          ImGuiTableFlags_BordersInnerV)) {
+            // Column and value headings follow whatever the view's axes
+            // measure, so a marker over a delay grid is never labelled as if it
+            // sat on the resource grid.
+            visualizer_grid_info_t mgrid;
+            visualizer_get_grid_info(visualizer, &mgrid);
+            const bool marker_delay_x = (mgrid.x_unit == AXIS_UNIT_DELAY_TAP);
+            const bool marker_doppler_y = (mgrid.y_unit == AXIS_UNIT_DOPPLER_BIN);
+
             ImGui::TableSetupColumn("#", ImGuiTableColumnFlags_WidthFixed, 40.0f);
-            ImGui::TableSetupColumn("RE", ImGuiTableColumnFlags_WidthFixed, 76.0f);
-            ImGui::TableSetupColumn("Offset", ImGuiTableColumnFlags_WidthFixed, 76.0f);
-            ImGui::TableSetupColumn("IQ", ImGuiTableColumnFlags_WidthFixed, 76.0f);
+            ImGui::TableSetupColumn(marker_delay_x ? "Tap" : "RE", ImGuiTableColumnFlags_WidthFixed, 76.0f);
+            ImGui::TableSetupColumn(marker_doppler_y ? "Bin" : "Offset", ImGuiTableColumnFlags_WidthFixed, 76.0f);
+            ImGui::TableSetupColumn(mgrid.value_label, ImGuiTableColumnFlags_WidthFixed, 76.0f);
             ImGui::TableSetupColumn("% base", ImGuiTableColumnFlags_WidthFixed, 76.0f);
             ImGui::TableHeadersRow();
 
@@ -1354,7 +1818,8 @@ fh_oran_memory_t* imgui_visualizer_render(
 
                 ImGui::TableSetColumnIndex(3);
                 if (marker.has_value) {
-                    ImGui::Text("%.1f", static_cast<double>(marker.magnitude));
+                    ImGui::Text(value_format(marker.magnitude),
+                                static_cast<double>(marker.magnitude));
                 } else {
                     ImGui::TextDisabled("-");
                 }
@@ -1399,15 +1864,25 @@ fh_oran_memory_t* imgui_visualizer_render(
             } else if (!cursor_sample.valid) {
                 ImGui::TextDisabled("Hover the plot to read a cell");
             } else {
-                if (cursor_sample.has_phase) {
-                    ImGui::Text("RE %d, phase +%d (offset %+d)",
-                                cursor_sample.re, cursor_sample.phase, cursor_sample.time_offset);
+                visualizer_grid_info_t grid;
+                visualizer_get_grid_info(visualizer, &grid);
+                char col_text[48];
+                char row_text[48];
+                format_cell_column(grid, cursor_sample.re, col_text, sizeof(col_text));
+                format_cell_row(grid, cursor_sample, row_text, sizeof(row_text));
+
+                // A Doppler row is not an offset in time, so the offset column
+                // only appears where the vertical axis actually measures time.
+                if (grid.y_is_scrolling) {
+                    ImGui::Text("%s, %s (offset %+d)", col_text, row_text, cursor_sample.time_offset);
                 } else {
-                    ImGui::Text("RE %d, symbol %d (offset %+d)",
-                                cursor_sample.re, cursor_sample.symbol, cursor_sample.time_offset);
+                    ImGui::Text("%s, %s", col_text, row_text);
                 }
                 if (cursor_sample.has_value) {
-                    ImGui::Text("IQ %.1f", static_cast<double>(cursor_sample.magnitude));
+                    char value_text[64];
+                    snprintf(value_text, sizeof(value_text), value_format(cursor_sample.magnitude),
+                             static_cast<double>(cursor_sample.magnitude));
+                    ImGui::Text("%s %s", grid.value_label, value_text);
                     ImGui::Text("%.1f%% of baseline",
                                 static_cast<double>(cursor_sample.percent_of_baseline));
                 } else {
@@ -1447,15 +1922,31 @@ fh_oran_memory_t* imgui_visualizer_render(
         uint8_t selected_direction = state->selected_data_direction;
 
         // Search for matching key
+        fh_oran_memory_t* same_eaxc_fallback = nullptr;
         for (size_t i = 0; i < num_keys; i++) {
-            if (keys[i].eaxc_id == selected_eaxc_id && keys[i].data_direction == selected_direction) {
-                if (memory_ptrs && memory_ptrs[i]) {
-                    return memory_ptrs[i];
-                }
+            if (keys[i].eaxc_id != selected_eaxc_id) {
+                continue;
             }
+            if (memory_ptrs == nullptr || memory_ptrs[i] == nullptr) {
+                continue;
+            }
+            if (keys[i].data_direction == selected_direction) {
+                return memory_ptrs[i];
+            }
+            same_eaxc_fallback = memory_ptrs[i];
+        }
+
+        // The carried direction may not exist for this eAxC - easy to reach in
+        // radar mode, where the eAxC is chosen by row and the direction is
+        // implicit. Falling back to the other direction of the same eAxC keeps
+        // the displayed stream related to what is selected; returning the
+        // previous memory would hand back an unrelated eAxC, and the radar
+        // reads its subcarrier spacing from whatever this resolves to.
+        if (same_eaxc_fallback != nullptr) {
+            return same_eaxc_fallback;
         }
     }
-    
+
     return current_display_memory;
 }
 

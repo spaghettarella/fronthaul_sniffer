@@ -57,11 +57,24 @@ int fh_pcap_stream_run(
         return write_err(errbuf, errbuf_len, pcap_errbuf[0] != '\0' ? pcap_errbuf : "failed to open pcap file");
     }
 
+    // Framing of the recorded packets, needed to find the eCPRI payload the
+    // channel filter inspects.
+    const int datalink = pcap_datalink(pcap_handle);
+
     while (*stop_flag == 0) {
         struct pcap_pkthdr* header = NULL;
         const u_char* packet_data = NULL;
         const int rc = pcap_next_ex(pcap_handle, &header, &packet_data);
         if (rc == 1) {
+            // Dropped before the queue, so a filtered-out channel never gets
+            // decoded, never gets a memory ring, and never shows up in the
+            // stream selector. Replay pacing is deliberately skipped for
+            // rejected packets so filtering does not slow the replay down.
+            if (!fh_channel_filter_accepts(&options->filter, (const uint8_t*)packet_data,
+                                           (size_t)header->caplen, datalink)) {
+                continue;
+            }
+
             fh_packet_t pkt;
             memset(&pkt, 0, sizeof(pkt));
             pkt.timestamp.tv_sec = (time_t)header->ts.tv_sec;

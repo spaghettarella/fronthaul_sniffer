@@ -1,5 +1,6 @@
 #include "opengl_visualizer.h"
 #include "core/c_oran_memory.h"
+#include "core/c_radar.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -68,6 +69,10 @@ typedef struct opengl_visualizer {
     int width;
     int height;
     int tex_height; // number of symbol rows in the texture
+    // Columns in the texture. HEATMAP_TEXTURE_WIDTH for every view built from
+    // the symbol ring; the radar sets its own, since a delay axis is as wide as
+    // the transform rather than as wide as the resource grid.
+    int tex_width;
     int tex_max_height; // maximum texture height supported by GL
     int tex_requested_height; // CLI-configurable requested height before clamping
     float magnitude_scale_ema; // Smoothed normalization to reduce per-frame color flicker
@@ -87,6 +92,10 @@ typedef struct opengl_visualizer {
 
     visualizer_view_mode_t view_mode;
     const fh_oran_memory_t* last_seen_memory; // detects stream switches to reset accumulators
+
+    // Radar core, owned by main and borrowed here. NULL until handed over,
+    // which is what the radar view treats as "not available yet".
+    struct fh_radar* radar;
 
     // Curve view: trailing raw traces (read live from the memory ring, no storage of their own)
     int curve_trace_enabled;
@@ -150,11 +159,22 @@ typedef struct opengl_visualizer {
     // rows against magnitude - so each parks its own window here while the
     // other is on screen. Without that, zooming into a band of symbols and
     // switching to Curve would silently reinterpret those row bounds as a
-    // magnitude range. The horizontal axis is the resource-element grid in both
-    // views, so that window is shared and needs no parking. Indexed by
+    // magnitude range. The horizontal axis is shared between the waterfall and
+    // curve views, which both span resource elements, but not with the radar,
+    // whose delay outputs span transform taps instead - so it is parked too,
+    // and only swapped when the radar is on one side of the switch. Indexed by
     // visualizer_view_mode_t.
-    float zoom_y_parked_center[2];
-    float zoom_y_parked_span[2];
+    float zoom_y_parked_center[VIEW_MODE_COUNT];
+    float zoom_y_parked_span[VIEW_MODE_COUNT];
+    // The horizontal window is parked by what the axis measures rather than by
+    // view mode: the waterfall, curve and radar-CFR views all span resource
+    // elements and should share one window, while the radar's delay outputs
+    // need their own. Keying on the unit also covers the radar changing its own
+    // horizontal axis when its output changes, which a view-mode switch never
+    // sees. Slot 0 is resource elements, slot 1 delay taps.
+    float zoom_x_parked_center[2];
+    float zoom_x_parked_span[2];
+    int zoom_x_parked_slot;
 
     int axes_enabled;      // margins reserved for axes; off makes the view full-bleed
     int axis_valid;
@@ -163,6 +183,20 @@ typedef struct opengl_visualizer {
     int axis_curve_mode;   // rows are magnitude, not time
     int axis_row0_value;   // absolute symbol (or phase) shown by row 0
     int axis_period;       // averaging period, phase mode only
+    // Grid comes from the radar core, not the symbol ring, so markers and the
+    // cursor readout sample the published radar frame instead of the ring.
+    int axis_radar_mode;
+    // What the axes measure this frame. The waterfall and curve views are
+    // always RE-by-symbol, but the radar's grid changes with its output, so
+    // ticks, the cursor readout and the zoom window all read these rather than
+    // assuming the resource-element grid. See visualizer_grid_info_t.
+    int axis_x_count;
+    visualizer_axis_unit_t axis_x_unit;
+    visualizer_axis_unit_t axis_y_unit;
+    float axis_x_unit_scale;   // metres per delay tap, 0 when not applicable
+    float axis_y_unit_scale;   // hertz per Doppler bin, 0 when not applicable
+    int axis_y_scrolling;      // vertical axis advances with new symbols
+    const char* axis_value_label;
 
     // Permanent per-row capture of a triggered window, independent of the
     // live ring: once a row is seen it's locked in here and never re-read,
@@ -187,6 +221,24 @@ static void extract_iq(fh_complex_t val, float& i_val, float& q_val) {
 
 static void error_callback(int error, const char* description) {
     fprintf(stderr, "GLFW error %d: %s\n", error, description);
+}
+
+// Resets the grid description to the resource-element-by-symbol layout the
+// waterfall and curve views share. Each draw path calls this before publishing
+// its own axis state, so a field only has to be set where it actually differs
+// and nothing carries over from the previous frame's view.
+static void axis_publish_defaults(opengl_visualizer_t* vis) {
+    vis->axis_phase_mode = 0;
+    vis->axis_curve_mode = 0;
+    vis->axis_radar_mode = 0;
+    vis->axis_period = 0;
+    vis->axis_x_count = HEATMAP_TEXTURE_WIDTH;
+    vis->axis_x_unit = AXIS_UNIT_RE;
+    vis->axis_y_unit = AXIS_UNIT_SYMBOL;
+    vis->axis_x_unit_scale = 0.0f;
+    vis->axis_y_unit_scale = 0.0f;
+    vis->axis_y_scrolling = 1;
+    vis->axis_value_label = "magnitude";
 }
 
 // Advances the display's normalisation toward the level just measured.
@@ -369,16 +421,30 @@ void visualizer_set_view_mode(opengl_visualizer_t* vis, visualizer_view_mode_t m
         return;
     }
 
+    if (mode < 0 || mode >= VIEW_MODE_COUNT) {
+        return;
+    }
+
     // Hand the vertical zoom window over to the incoming view's own, since rows
     // and magnitude are not interchangeable; see zoom_y_parked_center.
-    const int leaving = (vis->view_mode == VIEW_MODE_CURVE) ? 1 : 0;
-    const int arriving = (mode == VIEW_MODE_CURVE) ? 1 : 0;
+    const int leaving = (int)vis->view_mode;
+    const int arriving = (int)mode;
     vis->zoom_y_parked_center[leaving] = vis->zoom_y_center;
     vis->zoom_y_parked_span[leaving] = vis->zoom_y_span;
     vis->zoom_y_center = vis->zoom_y_parked_center[arriving];
     vis->zoom_y_span = vis->zoom_y_parked_span[arriving];
 
     vis->view_mode = mode;
+    // The horizontal window is handed over by zoom_x_park_on_unit_change once
+    // the incoming view has published what its axis measures - which is not
+    // known here, since the radar's horizontal axis depends on its output.
+}
+
+void visualizer_set_radar(opengl_visualizer_t* vis, struct fh_radar* radar) {
+    if (!vis) {
+        return;
+    }
+    vis->radar = radar;
 }
 
 visualizer_view_mode_t visualizer_get_view_mode(const opengl_visualizer_t* vis) {
@@ -836,18 +902,17 @@ opengl_visualizer_t* visualizer_create(int width, int height, int texture_height
     vis->display_mean_valid = 0;
     visualizer_reset_zoom(vis);
     vis->axes_enabled = 1;
+    axis_publish_defaults(vis);
     vis->axis_valid = 0;
     vis->axis_rows = 0;
-    vis->axis_phase_mode = 0;
-    vis->axis_curve_mode = 0;
     vis->axis_row0_value = 0;
-    vis->axis_period = 0;
     vis->trigger_snapshot_symbol = NULL;
     vis->trigger_snapshot_magnitude = NULL;
     trigger_snapshot_realloc(vis);
 
-    // Allocate texture buffer (width x tex_height)
-    vis->texture_data = (uint8_t*)calloc(HEATMAP_TEXTURE_WIDTH * vis->tex_height * 4, sizeof(uint8_t));
+    // Allocate texture buffer (tex_width x tex_height)
+    vis->tex_width = HEATMAP_TEXTURE_WIDTH;
+    vis->texture_data = (uint8_t*)calloc((size_t)vis->tex_width * vis->tex_height * 4, sizeof(uint8_t));
     if (!vis->texture_data) {
         free(vis);
         glfwDestroyWindow(window);
@@ -860,7 +925,7 @@ opengl_visualizer_t* visualizer_create(int width, int height, int texture_height
     glBindTexture(GL_TEXTURE_2D, vis->texture_id);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, HEATMAP_TEXTURE_WIDTH, vis->tex_height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, vis->tex_width, vis->tex_height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
     
     // Set up OpenGL state for 2D rendering
     glDisable(GL_DEPTH_TEST);
@@ -1083,8 +1148,42 @@ static void zoom_normalize_axis(float* center, float* span, float min_span) {
     *center = c;
 }
 
+// Smallest horizontal span allowed. The fixed fraction is fine across 3276
+// resource elements, but the radar's delay axis can be a couple of hundred taps
+// wide, where the same fraction is less than a single cell - so the horizontal
+// axis gets the same cell-count quantisation the vertical one has.
+static float zoom_x_min_span(const opengl_visualizer_t* vis) {
+    const int columns = vis->axis_x_count > 0 ? vis->axis_x_count : HEATMAP_TEXTURE_WIDTH;
+    float min_span = ZOOM_MIN_VISIBLE_ROWS / (float)columns;
+    if (min_span > 1.0f) {
+        min_span = 1.0f;
+    }
+    if (min_span < ZOOM_MIN_SPAN) {
+        min_span = ZOOM_MIN_SPAN;
+    }
+    return min_span;
+}
+
+// Hands the horizontal window over whenever the axis changes what it measures,
+// so a resource-element range is never silently reinterpreted as a range of
+// delay taps. Driven by the published unit rather than by the view mode,
+// because the radar swaps its own horizontal axis when its output changes and
+// no mode switch occurs at all.
+static void zoom_x_park_on_unit_change(opengl_visualizer_t* vis) {
+    const int slot = (vis->axis_x_unit == AXIS_UNIT_DELAY_TAP) ? 1 : 0;
+    if (slot == vis->zoom_x_parked_slot) {
+        return;
+    }
+    vis->zoom_x_parked_center[vis->zoom_x_parked_slot] = vis->zoom_x_center;
+    vis->zoom_x_parked_span[vis->zoom_x_parked_slot] = vis->zoom_x_span;
+    vis->zoom_x_center = vis->zoom_x_parked_center[slot];
+    vis->zoom_x_span = vis->zoom_x_parked_span[slot];
+    vis->zoom_x_parked_slot = slot;
+}
+
 static void zoom_normalize(opengl_visualizer_t* vis) {
-    zoom_normalize_axis(&vis->zoom_x_center, &vis->zoom_x_span, ZOOM_MIN_SPAN);
+    zoom_x_park_on_unit_change(vis);
+    zoom_normalize_axis(&vis->zoom_x_center, &vis->zoom_x_span, zoom_x_min_span(vis));
     zoom_normalize_axis(&vis->zoom_y_center, &vis->zoom_y_span, zoom_y_min_span(vis));
 }
 
@@ -1176,11 +1275,15 @@ void visualizer_reset_zoom(opengl_visualizer_t* vis) {
     vis->zoom_x_span = 1.0f;
     vis->zoom_y_center = 0.5f;
     vis->zoom_y_span = 1.0f;
-    // Also clears the other view's parked window, so Reset means the full view
+    // Also clears the other views' parked windows, so Reset means the full view
     // everywhere rather than leaving a surprise behind the next mode switch.
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < VIEW_MODE_COUNT; i++) {
         vis->zoom_y_parked_center[i] = 0.5f;
         vis->zoom_y_parked_span[i] = 1.0f;
+    }
+    for (int i = 0; i < 2; i++) {
+        vis->zoom_x_parked_center[i] = 0.5f;
+        vis->zoom_x_parked_span[i] = 1.0f;
     }
 }
 
@@ -1380,11 +1483,12 @@ static void draw_curve_view(opengl_visualizer_t* vis, const fh_oran_memory_t* me
     // must not be drawn over the axis margins.
     zoom_push_plot_scissor(vis);
 
+    axis_publish_defaults(vis);
     vis->axis_valid = 1;
     vis->axis_rows = vis->tex_height > 0 ? vis->tex_height : 1;
-    vis->axis_phase_mode = 0;
     vis->axis_curve_mode = 1;
-    vis->axis_period = 0;
+    vis->axis_y_unit = AXIS_UNIT_MAGNITUDE;
+    vis->axis_y_scrolling = 0;
 
     // Width now runs the opposite way from brightness/opacity: the newest
     // trace is the sharpest (thinnest) line, older ones thicken as they fade,
@@ -1958,11 +2062,14 @@ void visualizer_set_marker(opengl_visualizer_t* vis, int index, int re, int time
     if (!vis || index < 0 || index >= vis->marker_count) {
         return;
     }
+    // Clamped to the grid actually on screen, which is narrower than the
+    // resource grid whenever the radar is showing a truncated delay axis.
+    const int columns = vis->axis_x_count > 0 ? vis->axis_x_count : HEATMAP_TEXTURE_WIDTH;
     if (re < 0) {
         re = 0;
     }
-    if (re >= HEATMAP_TEXTURE_WIDTH) {
-        re = HEATMAP_TEXTURE_WIDTH - 1;
+    if (re >= columns) {
+        re = columns - 1;
     }
     vis->markers[index].re = re;
     vis->markers[index].time_offset = time_offset;
@@ -2038,21 +2145,66 @@ static int axis_nice_multiple(float unit_px, float min_px) {
 void visualizer_get_axis_titles(const opengl_visualizer_t* vis,
                                 const char** out_y_title,
                                 const char** out_x_title) {
-    const char* y_title = "Symbol";
-    if (vis) {
-        if (vis->axis_curve_mode) {
-            y_title = "Magnitude";
-        } else if (vis->axis_phase_mode) {
-            y_title = "Offset in period";
-        } else {
-            y_title = "Frame / slot";
-        }
-    }
+    visualizer_grid_info_t info;
+    visualizer_get_grid_info(vis, &info);
     if (out_y_title) {
-        *out_y_title = y_title;
+        *out_y_title = info.y_title;
     }
     if (out_x_title) {
-        *out_x_title = "PRB / RE";
+        *out_x_title = info.x_title;
+    }
+}
+
+void visualizer_get_grid_info(const opengl_visualizer_t* vis, visualizer_grid_info_t* out) {
+    if (out == NULL) {
+        return;
+    }
+
+    out->x_count = HEATMAP_TEXTURE_WIDTH;
+    out->y_count = 1;
+    out->x_unit = AXIS_UNIT_RE;
+    out->y_unit = AXIS_UNIT_SYMBOL;
+    out->x_title = "PRB / RE";
+    out->y_title = "Frame / slot";
+    out->value_label = "magnitude";
+    out->x_unit_scale = 0.0f;
+    out->y_unit_scale = 0.0f;
+    out->y_is_scrolling = 1;
+
+    if (vis == NULL) {
+        return;
+    }
+
+    out->x_count = vis->axis_x_count > 0 ? vis->axis_x_count : HEATMAP_TEXTURE_WIDTH;
+    out->y_count = vis->axis_rows > 0 ? vis->axis_rows : 1;
+    out->x_unit = vis->axis_x_unit;
+    out->y_unit = vis->axis_y_unit;
+    out->x_unit_scale = vis->axis_x_unit_scale;
+    out->y_unit_scale = vis->axis_y_unit_scale;
+    out->y_is_scrolling = vis->axis_y_scrolling;
+    out->value_label = vis->axis_value_label ? vis->axis_value_label : "magnitude";
+
+    switch (vis->axis_x_unit) {
+    case AXIS_UNIT_DELAY_TAP:
+        out->x_title = (vis->axis_x_unit_scale > 0.0f) ? "Delay tap / range" : "Delay tap";
+        break;
+    case AXIS_UNIT_RE:
+    default:
+        out->x_title = "PRB / RE";
+        break;
+    }
+
+    switch (vis->axis_y_unit) {
+    case AXIS_UNIT_MAGNITUDE:
+        out->y_title = "Magnitude";
+        break;
+    case AXIS_UNIT_DOPPLER_BIN:
+        out->y_title = (vis->axis_y_unit_scale > 0.0f) ? "Doppler (Hz)" : "Doppler bin";
+        break;
+    case AXIS_UNIT_SYMBOL:
+    default:
+        out->y_title = vis->axis_phase_mode ? "Offset in period" : "Frame / slot";
+        break;
     }
 }
 
@@ -2071,6 +2223,52 @@ int visualizer_get_y_ticks(const opengl_visualizer_t* vis,
     // divisions into view as you zoom in.
     const float px_per_row = plot_h / (vis->zoom_y_span * (float)vis->axis_rows);
     int count = 0;
+
+    // Range-Doppler: rows are frequency bins covering the whole interval at
+    // once, so there is no frame/slot structure and nothing scrolls. Zero
+    // Doppler sits at the centre row, with approaching targets above it and
+    // receding ones below.
+    if (vis->axis_y_unit == AXIS_UNIT_DOPPLER_BIN) {
+        const int bins = vis->axis_rows;
+        const float bin_origin = zoom_y_origin(vis) * (float)bins;
+        const float bin_extent = vis->zoom_y_span * (float)bins;
+        const float px_per_bin = plot_h / (bin_extent > 1e-6f ? bin_extent : 1e-6f);
+        const int step = axis_nice_multiple(px_per_bin, AXIS_MIN_LABEL_PX_Y);
+
+        int first = (int)floorf(bin_origin) - 1;
+        int last = (int)ceilf(bin_origin + bin_extent) + 1;
+        if (first < 0) {
+            first = 0;
+        }
+        if (last > bins - 1) {
+            last = bins - 1;
+        }
+
+        const int centre = bins / 2;
+        for (int bin = (first / step) * step; bin <= last && count < max_ticks; bin += step) {
+            if (bin < first) {
+                continue;
+            }
+            visualizer_axis_tick_t* t = &out_ticks[count++];
+            t->position_px = plot_y + ((float)bin - bin_origin) * px_per_bin;
+            t->level = (bin == centre) ? 2 : 1;
+            t->has_label = 1;
+            t->is_anchor = (bin == centre);
+            if (vis->axis_y_unit_scale > 0.0f) {
+                const double hz = (double)(centre - bin) * (double)vis->axis_y_unit_scale;
+                if (fabs(hz) >= 1000.0) {
+                    snprintf(t->label, sizeof(t->label), "%+.1fk", hz / 1000.0);
+                } else {
+                    snprintf(t->label, sizeof(t->label), "%+.0f", hz);
+                }
+            } else {
+                snprintf(t->label, sizeof(t->label), "%d", centre - bin);
+            }
+            t->label2[0] = '\0';
+            t->label3[0] = '\0';
+        }
+        return count;
+    }
 
     // Curve view: the vertical axis is normalised magnitude, so it gets
     // percentage gridlines, stepped by however fine the zoom can show.
@@ -2351,6 +2549,48 @@ int visualizer_get_x_ticks(const opengl_visualizer_t* vis,
     float plot_x = 0.0f, plot_w = 1.0f;
     visualizer_get_plot_rect(vis, &plot_x, NULL, &plot_w, NULL);
 
+    // Delay taps have no twelve-to-a-group structure to hang a second level of
+    // ticks on, so they get a plain index ladder, with range in metres on the
+    // second label line when the subcarrier spacing is known.
+    if (vis->axis_x_unit == AXIS_UNIT_DELAY_TAP) {
+        const int taps = vis->axis_x_count > 0 ? vis->axis_x_count : 1;
+        const float tap_origin = zoom_x_origin(vis) * (float)taps;
+        const float tap_extent = vis->zoom_x_span * (float)taps;
+        const float px_per_tap = plot_w / (tap_extent > 1e-6f ? tap_extent : 1e-6f);
+        const int step = axis_nice_multiple(px_per_tap, AXIS_MIN_LABEL_PX_X);
+
+        int first = (int)floorf(tap_origin) - 1;
+        int last = (int)ceilf(tap_origin + tap_extent) + 1;
+        if (first < 0) {
+            first = 0;
+        }
+        if (last > taps - 1) {
+            last = taps - 1;
+        }
+
+        int count = 0;
+        const int start = (first / step) * step;
+        for (int tap = start; tap <= last && count < max_ticks; tap += step) {
+            if (tap < first) {
+                continue;
+            }
+            visualizer_axis_tick_t* t = &out_ticks[count++];
+            t->position_px = plot_x + ((float)tap - tap_origin) * px_per_tap;
+            t->level = 1;
+            t->has_label = 1;
+            t->is_anchor = 0;
+            snprintf(t->label, sizeof(t->label), "%d", tap);
+            if (vis->axis_x_unit_scale > 0.0f) {
+                snprintf(t->label2, sizeof(t->label2), "%.0fm",
+                         (double)((float)tap * vis->axis_x_unit_scale));
+            } else {
+                t->label2[0] = '\0';
+            }
+            t->label3[0] = '\0';
+        }
+        return count;
+    }
+
     // Narrowed by the zoom, which everything below adapts to: wider spacing
     // promotes finer divisions into view and thins out crowded ones.
     // re_origin is fractional, so ticks stay put rather than snapping to whole
@@ -2435,8 +2675,32 @@ static int display_cell_magnitude(const opengl_visualizer_t* vis,
                                   int row,
                                   int re,
                                   float* out_magnitude) {
-    if (re < 0 || re >= HEATMAP_TEXTURE_WIDTH || row < 0) {
+    const int columns = vis->axis_x_count > 0 ? vis->axis_x_count : HEATMAP_TEXTURE_WIDTH;
+    if (re < 0 || re >= columns || row < 0) {
         return 0;
+    }
+
+    // The radar view draws a matrix the symbol ring knows nothing about, so its
+    // cells are read back from the published frame instead. Borrowing per
+    // lookup is a mutex pair for a handful of cells per frame; the alternative
+    // is keeping a second copy of a matrix that can run to tens of megabytes.
+    if (vis->axis_radar_mode) {
+        if (vis->radar == NULL) {
+            return 0;
+        }
+        int rows = 0;
+        int cols = 0;
+        const float* frame = fh_radar_acquire_result(vis->radar, &rows, &cols);
+        if (frame == NULL) {
+            return 0;
+        }
+        int found = 0;
+        if (row < rows && re < cols) {
+            *out_magnitude = frame[(size_t)row * (size_t)cols + (size_t)re];
+            found = 1;
+        }
+        fh_radar_release_result(vis->radar);
+        return found;
     }
 
     const int showing_triggered = vis->trigger_mode != TRIGGER_OFF &&
@@ -2490,8 +2754,10 @@ static void markers_evaluate(opengl_visualizer_t* vis, const fh_oran_memory_t* m
     visualizer_get_plot_rect(vis, &plot_x, &plot_y, &plot_w, &plot_h);
 
     const int rows = vis->axis_rows > 0 ? vis->axis_rows : 1;
+    const int columns = vis->axis_x_count > 0 ? vis->axis_x_count : HEATMAP_TEXTURE_WIDTH;
     const int showing_triggered = vis->trigger_mode != TRIGGER_OFF &&
-                                   vis->trigger_captured_symbol != TRIGGER_NO_SYMBOL;
+                                   vis->trigger_captured_symbol != TRIGGER_NO_SYMBOL &&
+                                   !vis->axis_radar_mode;
     // Offsets are measured from the trigger row when one is held, otherwise
     // from the bottom row, which carries the newest symbol.
     const int reference_row = showing_triggered ? (vis->trigger_capture_depth / 2) : (rows - 1);
@@ -2505,21 +2771,23 @@ static void markers_evaluate(opengl_visualizer_t* vis, const fh_oran_memory_t* m
         m->magnitude = 0.0f;
         m->percent_of_baseline = 0.0f;
 
+        // Curve view plots magnitude vertically rather than a grid of cells,
+        // so there is no cell for a marker to name. Every other view has one.
         if (!vis->axis_valid || vis->axis_curve_mode) {
-            continue;  // markers describe the waterfall grid only
+            continue;
         }
 
         const int row = reference_row + m->time_offset;
         if (row < 0 || row >= rows) {
             continue;
         }
-        if (m->re < 0 || m->re >= HEATMAP_TEXTURE_WIDTH) {
+        if (m->re < 0 || m->re >= columns) {
             continue;
         }
 
         // Markers stay pinned to their data cell; the zoom only decides where
         // that cell lands on screen, and whether it is on screen at all.
-        m->screen_x = zoom_x_to_px(vis, ((float)m->re + 0.5f) / (float)HEATMAP_TEXTURE_WIDTH,
+        m->screen_x = zoom_x_to_px(vis, ((float)m->re + 0.5f) / (float)columns,
                                    plot_x, plot_w);
         m->screen_y = zoom_y_to_px(vis, ((float)row + 0.5f) / (float)rows, plot_y, plot_h);
         m->on_screen = (m->screen_x >= plot_x && m->screen_x <= plot_x + plot_w &&
@@ -2566,11 +2834,12 @@ int visualizer_sample_at_screen(const opengl_visualizer_t* vis,
     const float y_norm = zoom_y_origin(vis) + ((screen_y - plot_y) / plot_h) * vis->zoom_y_span;
 
     const int rows = vis->axis_rows;
-    int re = (int)floorf(x_norm * (float)HEATMAP_TEXTURE_WIDTH);
+    const int columns = vis->axis_x_count > 0 ? vis->axis_x_count : HEATMAP_TEXTURE_WIDTH;
+    int re = (int)floorf(x_norm * (float)columns);
     int row = (int)floorf(y_norm * (float)rows);
     // Rounding at the far edge can land one past the last cell.
     if (re < 0) { re = 0; }
-    if (re > HEATMAP_TEXTURE_WIDTH - 1) { re = HEATMAP_TEXTURE_WIDTH - 1; }
+    if (re > columns - 1) { re = columns - 1; }
     if (row < 0) { row = 0; }
     if (row > rows - 1) { row = rows - 1; }
 
@@ -2581,11 +2850,15 @@ int visualizer_sample_at_screen(const opengl_visualizer_t* vis,
     // Same reference row markers measure their offsets from, so a cursor
     // reading can be compared with marker offsets directly.
     const int showing_triggered = vis->trigger_mode != TRIGGER_OFF &&
-                                   vis->trigger_captured_symbol != TRIGGER_NO_SYMBOL;
+                                   vis->trigger_captured_symbol != TRIGGER_NO_SYMBOL &&
+                                   !vis->axis_radar_mode;
     const int reference_row = showing_triggered ? (vis->trigger_capture_depth / 2) : (rows - 1);
     out_sample->time_offset = row - reference_row;
 
-    if (vis->axis_phase_mode && vis->axis_period > 0) {
+    if (vis->axis_y_unit == AXIS_UNIT_DOPPLER_BIN) {
+        // Rows are frequency bins, not symbols. Reporting a symbol number here
+        // would invent a time the row does not have.
+    } else if (vis->axis_phase_mode && vis->axis_period > 0) {
         int phase = (vis->axis_row0_value + row) % vis->axis_period;
         if (phase < 0) {
             phase += vis->axis_period;
@@ -2658,17 +2931,24 @@ static void update_heatmap_texture(opengl_visualizer_t* vis, const fh_oran_memor
         desired_height = cap;
     }
 
-    if (desired_height != vis->tex_height) {
+    // Also catches coming back from the radar view, which sizes the texture to
+    // its own transform width rather than the resource grid.
+    if (desired_height != vis->tex_height || vis->tex_width != HEATMAP_TEXTURE_WIDTH) {
         // Reallocate CPU-side buffer and resize GPU texture
         free(vis->texture_data);
         vis->tex_height = desired_height;
-        vis->texture_data = (uint8_t*)calloc(HEATMAP_TEXTURE_WIDTH * vis->tex_height * 4, sizeof(uint8_t));
+        vis->tex_width = HEATMAP_TEXTURE_WIDTH;
+        vis->texture_data = (uint8_t*)calloc((size_t)vis->tex_width * vis->tex_height * 4, sizeof(uint8_t));
         glBindTexture(GL_TEXTURE_2D, vis->texture_id);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, HEATMAP_TEXTURE_WIDTH, vis->tex_height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, vis->tex_width, vis->tex_height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    }
+
+    if (vis->texture_data == NULL) {
+        return;
     }
 
     // Clear texture
-    memset(vis->texture_data, 0, HEATMAP_TEXTURE_WIDTH * vis->tex_height * 4);
+    memset(vis->texture_data, 0, (size_t)HEATMAP_TEXTURE_WIDTH * vis->tex_height * 4);
 
     if (memory->symbol_highest < memory->symbol_lowest) {
         return;  // No data yet
@@ -2681,10 +2961,10 @@ static void update_heatmap_texture(opengl_visualizer_t* vis, const fh_oran_memor
         // period. Triggered, the same averaged rows are rotated so the phase
         // the crossing landed on sits at the middle row, under the red line -
         // the alignment is what makes the averaged picture hold still.
+        axis_publish_defaults(vis);
         vis->axis_valid = 1;
         vis->axis_rows = vis->tex_height;
         vis->axis_phase_mode = 1;
-        vis->axis_curve_mode = 0;
         vis->axis_period = period;
 
         int display_height;
@@ -2803,11 +3083,9 @@ static void update_heatmap_texture(opengl_visualizer_t* vis, const fh_oran_memor
         int symbol_count = memory->symbol_highest - memory->symbol_lowest + 1;
         int display_height = (symbol_count < vis->tex_height) ? symbol_count : vis->tex_height;
 
+        axis_publish_defaults(vis);
         vis->axis_valid = 1;
         vis->axis_rows = vis->tex_height;
-        vis->axis_phase_mode = 0;
-        vis->axis_curve_mode = 0;
-        vis->axis_period = 0;
         // A triggered window is centred on the captured symbol; the live view
         // scrolls with the newest symbol pinned to the bottom row.
         vis->axis_row0_value = showing_triggered
@@ -2928,7 +3206,206 @@ static void update_heatmap_texture(opengl_visualizer_t* vis, const fh_oran_memor
 
     // Upload texture to GPU
     glBindTexture(GL_TEXTURE_2D, vis->texture_id);
-    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, HEATMAP_TEXTURE_WIDTH, vis->tex_height, GL_RGBA, GL_UNSIGNED_BYTE, vis->texture_data);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, vis->tex_width, vis->tex_height, GL_RGBA, GL_UNSIGNED_BYTE, vis->texture_data);
+}
+
+// Build the texture from the radar core's most recent finished frame. Unlike
+// the waterfall this reads no symbol ring at all: the radar worker has already
+// reduced two rings to one magnitude matrix, and the render thread only borrows
+// it for as long as the copy takes.
+//
+// Returns 1 when a frame was drawn, 0 when the radar has nothing yet - the
+// caller distinguishes "no data" from "no radar" for the on-screen notice.
+static int update_radar_texture(opengl_visualizer_t* vis) {
+    axis_publish_defaults(vis);
+    vis->axis_valid = 0;
+    vis->axis_radar_mode = 1;
+
+    if (vis->radar == NULL) {
+        return 0;
+    }
+
+    // The three outputs do not share a grid, so the axes are described from the
+    // selected one rather than inherited from the waterfall.
+    fh_radar_config_t rcfg;
+    fh_radar_get_config(vis->radar, &rcfg);
+
+    const int scs_khz = (vis->last_seen_memory != NULL) ? vis->last_seen_memory->scs_khz : 0;
+    const double subcarrier_hz = (double)scs_khz * 1000.0;
+
+    switch (rcfg.output) {
+    case RADAR_OUT_CFR:
+        // Still the resource-element grid, just holding a channel estimate
+        // instead of a received magnitude.
+        vis->axis_value_label = "|H|";
+        break;
+
+    case RADAR_OUT_RANGE_TIME:
+        vis->axis_x_unit = AXIS_UNIT_DELAY_TAP;
+        vis->axis_x_count = rcfg.ifft_size;
+        vis->axis_value_label = "|CIR|";
+        if (subcarrier_hz > 0.0) {
+            vis->axis_x_unit_scale =
+                (float)(299792458.0 / (2.0 * (double)rcfg.ifft_size * subcarrier_hz));
+        }
+        break;
+
+    case RADAR_OUT_RANGE_DOPPLER:
+        vis->axis_x_unit = AXIS_UNIT_DELAY_TAP;
+        vis->axis_x_count = rcfg.cir_depth_taps;
+        vis->axis_value_label = "|RD|";
+        if (subcarrier_hz > 0.0) {
+            vis->axis_x_unit_scale =
+                (float)(299792458.0 / (2.0 * (double)rcfg.ifft_size * subcarrier_hz));
+        }
+        // A whole processing interval collapses into one matrix: the vertical
+        // axis is a fixed frequency scale, replaced outright each refresh
+        // rather than scrolling with arriving symbols.
+        vis->axis_y_unit = AXIS_UNIT_DOPPLER_BIN;
+        vis->axis_y_scrolling = 0;
+        if (scs_khz > 0 && rcfg.time_symbols > 0) {
+            // A slot is 14 symbols and 1 ms / (scs / 15 kHz); one Doppler bin
+            // is the reciprocal of the whole interval's duration.
+            const double symbol_s = 0.001 / ((double)scs_khz / 15.0) / 14.0;
+            vis->axis_y_unit_scale = (float)(1.0 / ((double)rcfg.time_symbols * symbol_s));
+        }
+        break;
+    }
+
+    int rows = 0;
+    int cols = 0;
+    const float* result = fh_radar_acquire_result(vis->radar, &rows, &cols);
+    if (result == NULL) {
+        return 0;
+    }
+    if (rows <= 0 || cols <= 0) {
+        fh_radar_release_result(vis->radar);
+        return 0;
+    }
+
+    // The cell counts come from the published frame, never from the config the
+    // axes were described with. The two can briefly disagree - the worker may
+    // still be finishing a pass under the previous settings - and letting the
+    // axis claim a size the pixels do not have is how a plot starts lying.
+    int desired_width = cols;
+    int desired_height = rows;
+    const int cap = vis->tex_max_height > 0 ? vis->tex_max_height : 4096;
+    if (desired_height > cap) {
+        desired_height = cap;
+    }
+    if (desired_width > cap) {
+        desired_width = cap;
+    }
+
+    if (desired_height != vis->tex_height || desired_width != vis->tex_width) {
+        free(vis->texture_data);
+        vis->tex_height = desired_height;
+        vis->tex_width = desired_width;
+        vis->texture_data = (uint8_t*)calloc((size_t)vis->tex_width * vis->tex_height * 4, sizeof(uint8_t));
+        glBindTexture(GL_TEXTURE_2D, vis->texture_id);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, vis->tex_width, vis->tex_height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    }
+
+    if (vis->texture_data == NULL) {
+        fh_radar_release_result(vis->radar);
+        return 0;
+    }
+
+    // Same adaptive normalisation as the waterfall. A channel estimate sits
+    // near 1.0 when everything is right, but it is the numeric mean in the
+    // settings window that says so precisely - the colours only need to show
+    // structure, and auto-scaling keeps them legible when it is wrong.
+    float max_magnitude = 0.0f;
+    double mean_sum = 0.0;
+    uint64_t mean_count = 0;
+    for (int row = 0; row < vis->tex_height; row++) {
+        const float* src = result + (size_t)row * cols;
+        for (int col = 0; col < vis->tex_width; col++) {
+            const float v = src[col];
+            if (v > max_magnitude) {
+                max_magnitude = v;
+            }
+            if (v > 0.0f) {
+                mean_sum += (double)v;
+                mean_count++;
+            }
+        }
+    }
+
+    // Markers and the cursor report a percentage against this, the same way
+    // they do over the waterfall.
+    vis->display_mean_magnitude = (mean_count > 0) ? (float)(mean_sum / (double)mean_count) : 0.0f;
+    vis->display_mean_valid = mean_count > 0;
+
+    if (!vis->magnitude_scale_initialized) {
+        vis->magnitude_scale_ema = max_magnitude;
+        vis->magnitude_scale_initialized = 1;
+    } else {
+        vis->magnitude_scale_ema = magnitude_scale_step(vis->magnitude_scale_ema, max_magnitude);
+    }
+    const float render_scale = (vis->magnitude_scale_ema > 1e-6f) ? vis->magnitude_scale_ema : 1e-6f;
+
+    // Row 0 is the oldest symbol in the window, which is the waterfall's
+    // top-to-bottom time order, so rows map straight across.
+    for (int row = 0; row < vis->tex_height; row++) {
+        const float* src = result + (size_t)row * cols;
+        for (int col = 0; col < vis->tex_width; col++) {
+            uint8_t r, g, b;
+            magnitude_to_rgb(src[col], render_scale, &r, &g, &b);
+
+            const size_t pixel_idx = ((size_t)row * vis->tex_width + col) * 4;
+            vis->texture_data[pixel_idx + 0] = r;
+            vis->texture_data[pixel_idx + 1] = g;
+            vis->texture_data[pixel_idx + 2] = b;
+            vis->texture_data[pixel_idx + 3] = 255;
+        }
+    }
+
+    fh_radar_stats_t stats;
+    fh_radar_get_stats(vis->radar, &stats);
+    fh_radar_release_result(vis->radar);
+
+    vis->axis_valid = 1;
+    vis->axis_rows = vis->tex_height;
+    vis->axis_x_count = vis->tex_width;
+    vis->axis_row0_value = stats.window_first_valid ? stats.window_first_symbol : 0;
+
+    glBindTexture(GL_TEXTURE_2D, vis->texture_id);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, vis->tex_width, vis->tex_height, GL_RGBA, GL_UNSIGNED_BYTE, vis->texture_data);
+    return 1;
+}
+
+// Draw the current texture across the plot rect. Shared by the waterfall and
+// the radar; the two differ only in where the texture came from and whether
+// the zoom window narrows the sampled sub-rectangle.
+static void draw_plot_texture_quad(opengl_visualizer_t* vis, int apply_zoom) {
+    glEnable(GL_TEXTURE_2D);
+    glBindTexture(GL_TEXTURE_2D, vis->texture_id);
+
+    float plot_x = 0.0f, plot_y = 0.0f, plot_w = 1.0f, plot_h = 1.0f;
+    visualizer_get_plot_rect(vis, &plot_x, &plot_y, &plot_w, &plot_h);
+
+    const float s0 = apply_zoom ? zoom_x_origin(vis) : 0.0f;
+    const float s1 = apply_zoom ? (s0 + vis->zoom_x_span) : 1.0f;
+    const float t0 = apply_zoom ? zoom_y_origin(vis) : 0.0f;
+    const float t1 = apply_zoom ? (t0 + vis->zoom_y_span) : 1.0f;
+
+    const int texels_x = vis->tex_width > 0 ? vis->tex_width : 1;
+    const float px_per_texel_x = plot_w / ((s1 - s0) * (float)texels_x);
+    const int rows = vis->tex_height > 0 ? vis->tex_height : 1;
+    const float px_per_texel_y = plot_h / ((t1 - t0) * (float)rows);
+    const int want_nearest = (px_per_texel_x >= ZOOM_NEAREST_FILTER_PX ||
+                              px_per_texel_y >= ZOOM_NEAREST_FILTER_PX);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, want_nearest ? GL_NEAREST : GL_LINEAR);
+
+    glBegin(GL_QUADS);
+    glTexCoord2f(s0, t0); glVertex2f(plot_x, plot_y);
+    glTexCoord2f(s1, t0); glVertex2f(plot_x + plot_w, plot_y);
+    glTexCoord2f(s1, t1); glVertex2f(plot_x + plot_w, plot_y + plot_h);
+    glTexCoord2f(s0, t1); glVertex2f(plot_x, plot_y + plot_h);
+    glEnd();
+
+    glDisable(GL_TEXTURE_2D);
 }
 
 int visualizer_update(opengl_visualizer_t* vis, const fh_oran_memory_t* memory) {
@@ -2991,12 +3468,28 @@ int visualizer_update(opengl_visualizer_t* vis, const fh_oran_memory_t* memory) 
 
     glClear(GL_COLOR_BUFFER_BIT);
 
-    if (vis->view_mode == VIEW_MODE_CURVE) {
+    // No default case: -Wswitch then points at every dispatch site whenever a
+    // view mode is added, which is how the radar mode was found to need one.
+    switch (vis->view_mode) {
+    case VIEW_MODE_CURVE:
         draw_curve_view(vis, memory);
         // Clears any marker readouts left over from the waterfall, which has
         // no counterpart here.
         markers_evaluate(vis, memory);
-    } else {
+        break;
+
+    case VIEW_MODE_RADAR:
+        // The grid is published before the zoom is re-clamped, because the
+        // vertical minimum is a row count and the radar's row count changes
+        // with the processing window.
+        update_radar_texture(vis);
+        zoom_normalize(vis);
+        markers_evaluate(vis, memory);
+        draw_plot_texture_quad(vis, 1);
+        break;
+
+    case VIEW_MODE_WATERFALL:
+    case VIEW_MODE_COUNT: {
         // Update texture from memory
         update_heatmap_texture(vis, memory);
 
@@ -3006,47 +3499,19 @@ int visualizer_update(opengl_visualizer_t* vis, const fh_oran_memory_t* memory) 
         // trigger capture changes it - and nothing else would notice.
         zoom_normalize(vis);
 
-        // Render with immediate mode - draw fullscreen quad
-        glEnable(GL_TEXTURE_2D);
-        glBindTexture(GL_TEXTURE_2D, vis->texture_id);
-
-        // Confined to the plot rect so the surrounding margins stay clear for
-        // the axes.
-        float plot_x = 0.0f, plot_y = 0.0f, plot_w = 1.0f, plot_h = 1.0f;
-        visualizer_get_plot_rect(vis, &plot_x, &plot_y, &plot_w, &plot_h);
-
         // Zooming the waterfall is exactly a narrowing of the texture
         // coordinates: the same quad fills the same plot rect, sampling a
         // sub-rectangle of the same texture. Nothing upstream of the texture
         // upload is involved, which is why zoom cannot perturb the pipeline.
-        const float s0 = zoom_x_origin(vis);
-        const float s1 = s0 + vis->zoom_x_span;
-        const float t0 = zoom_y_origin(vis);
-        const float t1 = t0 + vis->zoom_y_span;
-
-        // Interpolating between texels that each cover several pixels would
-        // draw gradients the data doesn't contain, so past that point show the
-        // cells as the discrete samples they are.
-        const float px_per_texel_x = plot_w / ((s1 - s0) * (float)HEATMAP_TEXTURE_WIDTH);
-        const int rows = vis->tex_height > 0 ? vis->tex_height : 1;
-        const float px_per_texel_y = plot_h / ((t1 - t0) * (float)rows);
-        const int want_nearest = (px_per_texel_x >= ZOOM_NEAREST_FILTER_PX ||
-                                  px_per_texel_y >= ZOOM_NEAREST_FILTER_PX);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, want_nearest ? GL_NEAREST : GL_LINEAR);
-
-        glBegin(GL_QUADS);
-        glTexCoord2f(s0, t0); glVertex2f(plot_x, plot_y);
-        glTexCoord2f(s1, t0); glVertex2f(plot_x + plot_w, plot_y);
-        glTexCoord2f(s1, t1); glVertex2f(plot_x + plot_w, plot_y + plot_h);
-        glTexCoord2f(s0, t1); glVertex2f(plot_x, plot_y + plot_h);
-        glEnd();
-
-        glDisable(GL_TEXTURE_2D);
+        draw_plot_texture_quad(vis, 1);
 
         // Trigger line: marks the row carrying the captured symbol once a
         // capture has fired. Drawn in screen space (like the curve view's
         // lines) so it stays crisp regardless of the texture's row height.
         if (vis->trigger_mode != TRIGGER_OFF && vis->trigger_captured_symbol != TRIGGER_NO_SYMBOL) {
+            float plot_x = 0.0f, plot_y = 0.0f, plot_w = 1.0f, plot_h = 1.0f;
+            visualizer_get_plot_rect(vis, &plot_x, &plot_y, &plot_w, &plot_h);
+            const int rows = vis->tex_height > 0 ? vis->tex_height : 1;
             const int centre_row = vis->trigger_capture_depth / 2;
             const float row_norm = ((float)centre_row + 0.5f) / (float)rows;
             const float line_y = zoom_y_to_px(vis, row_norm, plot_y, plot_h);
@@ -3063,6 +3528,8 @@ int visualizer_update(opengl_visualizer_t* vis, const fh_oran_memory_t* memory) 
                 glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
             }
         }
+        break;
+    }
     }
 
     return 0;
