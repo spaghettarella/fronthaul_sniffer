@@ -709,6 +709,22 @@ int main(int argc, char** argv) {
         // Built once and handed to whichever backend runs, so the startup
         // screen's Channel filter means the same thing regardless of where the
         // packets come from.
+        // Names the capture the run is reading, for the statistics window. Built
+        // the same way the capture thread below picks its backend, so the label
+        // can never describe a source other than the one actually running.
+        std::string source_name;
+        if (demo_pcap_enabled || iface == "pcap") {
+            const std::string file = std::filesystem::path(demo_pcap_path).filename().string();
+            source_name = "pcap " + (file.empty() ? demo_pcap_path : file);
+            if (demo_pcap_loop) {
+                source_name += " (looping)";
+            }
+        } else if (iface == "ocudu phy tap") {
+            source_name = "phy tap " + ocudu_phy_tap_queue_name;
+        } else {
+            source_name = "interface " + iface;
+        }
+
         fh_channel_filter_t channel_filter{};
         channel_filter.has_eaxc = channel_has_eaxc ? 1 : 0;
         channel_filter.eaxc = channel_eaxc;
@@ -906,6 +922,7 @@ int main(int argc, char** argv) {
                         ui_height,
                         stats,
                         visualizer,
+                        source_name.c_str(),
                         radar,
                         &radar_dl,
                         &radar_ul);

@@ -41,6 +41,34 @@ struct fh_phy_tap_packet_header {
     uint64_t timestamp_ns;
 } __attribute__((packed));
 
+// This layout is written by fh_phy_tap_packet_header_t in
+// c_capture_ocudu_phy_tap.c and read here, from two independent definitions
+// with no shared header between them. The size check is the only thing that
+// notices if one side gains or resizes a field: everything downstream would
+// otherwise read the payload at the wrong offset and still look plausible.
+_Static_assert(sizeof(struct fh_phy_tap_packet_header) == 60,
+               "phy tap packet header layout changed - update the matching "
+               "definition in c_capture_ocudu_phy_tap.c");
+
+// The phy tap queue stores resource-grid samples as ocudu cbf16_t: a pair of
+// bfloat16 values, i.e. the top 16 bits of an IEEE-754 float32 (1 sign, 8
+// exponent, 7 mantissa). They are NOT Q15 fixed point, even though the record
+// advertises iq_bit_width=16 and compression_method=0 - those describe the
+// component width and the absence of O-RAN compression, not an integer format.
+//
+// Reading the bit pattern as an int16 is silent and destructive: the exponent
+// lands in the high bits, so every sample collapses into a narrow band around
+// +/-16000 regardless of its real amplitude, and the true dynamic range
+// disappears. Widening back to float32 is exact, no scaling required - the
+// values are already normalized to roughly [-1, +1), matching what the network
+// U-Plane path produces after its 2^-15 scaling.
+static inline float bf16_to_float(uint16_t bits) {
+    uint32_t widened = (uint32_t)bits << 16;
+    float out;
+    memcpy(&out, &widened, sizeof(out));
+    return out;
+}
+
 struct ecpri_common_header {
     uint8_t concat_ind : 1;
     uint8_t reserved : 3;
@@ -220,8 +248,9 @@ int fh_decode_packet(const fh_packet_t* raw_pkt, fh_decoded_packet_t* decoded_pk
                     return -1;
                 }
                 if (phy_tap->iq_bit_width != 16) {
-                    // Raw/uncompressed phy tap samples are only supported at their native
-                    // 16-bit width; a different width would need its own unpacking logic.
+                    // Uncompressed phy tap samples are only supported at their native
+                    // bfloat16 width; a different width is not a bfloat16 and would need
+                    // its own unpacking logic.
                     return -1;
                 }
 
@@ -270,9 +299,7 @@ int fh_decode_packet(const fh_packet_t* raw_pkt, fh_decoded_packet_t* decoded_pk
                 for (size_t i = 0; i < samples_to_copy; ++i) {
                     const uint16_t i_raw = (uint16_t)((uint16_t)iq_payload[i * 4 + 0] | ((uint16_t)iq_payload[i * 4 + 1] << 8));
                     const uint16_t q_raw = (uint16_t)((uint16_t)iq_payload[i * 4 + 2] | ((uint16_t)iq_payload[i * 4 + 3] << 8));
-                    const int16_t i_s = (int16_t)i_raw;
-                    const int16_t q_s = (int16_t)q_raw;
-                    decoded_pkt->sections[0].iq_data[i] = (float)i_s + I * (float)q_s;
+                    decoded_pkt->sections[0].iq_data[i] = bf16_to_float(i_raw) + I * bf16_to_float(q_raw);
                 }
 
                 return 0;

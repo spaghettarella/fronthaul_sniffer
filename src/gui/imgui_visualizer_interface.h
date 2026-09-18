@@ -61,6 +61,8 @@ void imgui_visualizer_present(void);
 // keys: array of discovered memory keys
 // num_keys: number of keys in the array
 // current_display_memory: pointer to the currently displayed memory (can be NULL)
+// source_name: human-readable capture source (interface, pcap file, tap queue)
+//   shown in the statistics window; may be NULL
 // radar: radar core the Radar Settings window edits; may be NULL
 // out_radar_dl, out_radar_ul: both directions of the selected eAxC, for the
 //   radar, which needs the pair rather than the single displayed stream. Either
@@ -77,6 +79,7 @@ struct fh_oran_memory* imgui_visualizer_render(
     int window_height,
     fh_queue_stats_t stats,
     opengl_visualizer_t* visualizer,
+    const char* source_name,
     struct fh_radar* radar,
     struct fh_oran_memory** out_radar_dl,
     struct fh_oran_memory** out_radar_ul);

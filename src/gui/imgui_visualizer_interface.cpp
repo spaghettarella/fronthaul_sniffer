@@ -1127,6 +1127,7 @@ fh_oran_memory_t* imgui_visualizer_render(
     int window_height,
     fh_queue_stats_t stats,
     opengl_visualizer_t* visualizer,
+    const char* source_name,
     fh_radar_t* radar,
     fh_oran_memory_t** out_radar_dl,
     fh_oran_memory_t** out_radar_ul) {
@@ -1475,6 +1476,12 @@ fh_oran_memory_t* imgui_visualizer_render(
     ImGui::Begin("Live Statistics", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
 
     if (ImGui::CollapsingHeader("Data Query", ImGuiTreeNodeFlags_DefaultOpen)) {
+        // Which capture this run is reading. Worth having on screen: the
+        // counters below mean quite different things for a looped pcap than
+        // for a live interface, and nothing else in the running UI says which
+        // one is in force.
+        ImGui::Text("Source: %s", (source_name != nullptr && source_name[0] != '\0')
+                                      ? source_name : "unknown");
         ImGui::Text("Packet drop rate: %.2f%%", dropped_pct);
         ImGui::Text("Total packets: %llu", static_cast<unsigned long long>(stats.total_packets));
         ImGui::Text("Dropped packets: %llu", static_cast<unsigned long long>(stats.dropped_packets));

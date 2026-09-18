@@ -32,6 +32,18 @@ typedef struct fh_section {
     /// Whether numerology was reported by the source capture. Ethernet/eCPRI O-RAN frames don't
     /// carry numerology in the U-Plane header, so this stays 0 for those.
     uint8_t has_numerology;
+    /// Resource elements for this section, indexed 0..3275 across the 273-PRB grid.
+    ///
+    /// Normalized to roughly [-1, +1) regardless of which capture produced it, so
+    /// magnitudes are comparable between sources and no consumer needs to know
+    /// where a sample came from. The two paths reach that scale differently:
+    /// the Ethernet/eCPRI path unpacks fixed-point components and applies 2^-15
+    /// (or the BFP exponent), while the PHY tap carries bfloat16 values that are
+    /// already normalized and are only widened to float.
+    ///
+    /// Treating the PHY tap's samples as fixed point instead is silent and
+    /// destructive - see bf16_to_float in c_fronthaul_decoder.c - so anything
+    /// adding a capture source has to land on this scale too.
     fh_complex_t *iq_data;
 } fh_section_t;
 

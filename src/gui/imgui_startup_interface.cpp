@@ -327,7 +327,15 @@ bool imgui_startup_render(
         for (const char* method : kCompMethods) {
             const bool is_selected = (config->ud_comp_method == method);
             if (ImGui::Selectable(method, is_selected)) {
+                const bool method_changed = (config->ud_comp_method != method);
                 config->ud_comp_method = method;
+                // Uncompressed samples are carried at their full width, which is
+                // 16 bits in practice; the 9-bit default only makes sense for
+                // BFP. Applied on the change rather than every frame, so it
+                // stays a starting point the field below can still override.
+                if (method_changed && config->ud_comp_method == "NONE") {
+                    config->ud_iq_width = 16;
+                }
             }
             if (is_selected) {
                 ImGui::SetItemDefaultFocus();
@@ -340,7 +348,11 @@ bool imgui_startup_render(
 
     ImGui::InputInt("UD IQ-Width (bits)", &config->ud_iq_width);
     ImGui::SameLine();
-    ImGui::TextDisabled("default 9, range 1-16");
+    if (config->ud_comp_method == "NONE") {
+        ImGui::TextDisabled("uncompressed: 16 unless the sender says otherwise, range 1-16");
+    } else {
+        ImGui::TextDisabled("default 9, range 1-16");
+    }
     clamp_int(config->ud_iq_width, 1, 16);
 
     ImGui::InputInt("UD IQ-Width Decompressed (bits)", &config->ud_iq_width_decompressed);

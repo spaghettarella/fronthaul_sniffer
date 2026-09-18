@@ -823,7 +823,7 @@ opengl_visualizer_t* visualizer_create(int width, int height, int texture_height
     glfwSetErrorCallback(error_callback);
     glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
     
-    GLFWwindow* window = glfwCreateWindow(width, height, "ORAN Fronthaul Waterfall", NULL, NULL);
+    GLFWwindow* window = glfwCreateWindow(width, height, "ORAN Fronthaul Visualizer", NULL, NULL);
     if (!window) {
         fprintf(stderr, "Failed to create GLFW window\n");
         glfwTerminate();
@@ -2250,7 +2250,8 @@ int visualizer_get_y_ticks(const opengl_visualizer_t* vis,
                 continue;
             }
             visualizer_axis_tick_t* t = &out_ticks[count++];
-            t->position_px = plot_y + ((float)bin - bin_origin) * px_per_bin;
+            // Cell centre, as on the other discrete axes.
+            t->position_px = plot_y + ((float)bin + 0.5f - bin_origin) * px_per_bin;
             t->level = (bin == centre) ? 2 : 1;
             t->has_label = 1;
             t->is_anchor = (bin == centre);
@@ -2307,10 +2308,13 @@ int visualizer_get_y_ticks(const opengl_visualizer_t* vis,
         visible_row_last = vis->axis_rows - 1;
     }
 
-    // Screen position of a row, given the zoom window.
+    // Screen position of a row, given the zoom window. Centre of the row rather
+    // than its top edge: a symbol row is a discrete cell, and markers, the
+    // cursor readout and the trigger line all address it at its centre, so an
+    // edge-aligned tick would sit half a row away from every one of them.
     const float row_to_px_scale = plot_h / (row_extent > 1e-6f ? row_extent : 1e-6f);
     const auto row_to_px = [&](int row) {
-        return plot_y + ((float)row - row_origin) * row_to_px_scale;
+        return plot_y + ((float)row + 0.5f - row_origin) * row_to_px_scale;
     };
 
     // Last row that overlaps the window, which carries the always-present
@@ -2320,7 +2324,12 @@ int visualizer_get_y_ticks(const opengl_visualizer_t* vis,
     // caller filters it out - which silently dropped this readout on any zoom
     // that wasn't flush against the bottom. Taken from the window bounds
     // instead, so its position is always strictly inside the plot.
-    int anchor_row = (int)ceilf(row_origin + row_extent) - 1;
+    //
+    // Rows are addressed at their centre, so this is the last row whose centre
+    // still falls inside the window: ceil() here would pick a row centred up to
+    // half a row past the bottom edge, which is far enough to be filtered out
+    // again once the zoom makes rows tall.
+    int anchor_row = (int)floorf(row_origin + row_extent - 0.5f);
     if (anchor_row > vis->axis_rows - 1) {
         anchor_row = vis->axis_rows - 1;
     }
@@ -2575,7 +2584,8 @@ int visualizer_get_x_ticks(const opengl_visualizer_t* vis,
                 continue;
             }
             visualizer_axis_tick_t* t = &out_ticks[count++];
-            t->position_px = plot_x + ((float)tap - tap_origin) * px_per_tap;
+            // Cell centre, as on the resource-element axis above.
+            t->position_px = plot_x + ((float)tap + 0.5f - tap_origin) * px_per_tap;
             t->level = 1;
             t->has_label = 1;
             t->is_anchor = 0;
@@ -2612,12 +2622,29 @@ int visualizer_get_x_ticks(const opengl_visualizer_t* vis,
 
     // Individual resource elements only get their own ticks once a PRB is
     // wide enough to show its twelve subcarriers without them merging.
-    const int show_re = px_per_re >= AXIS_MIN_TICK_PX;
+    int show_re = px_per_re >= AXIS_MIN_TICK_PX;
     const int label_re = px_per_re >= 20.0f;
 
-    const int prb_step = axis_nice_multiple(px_per_prb, AXIS_MIN_LABEL_PX_X);
+    int prb_step = axis_nice_multiple(px_per_prb, AXIS_MIN_LABEL_PX_X);
     const int prb_first = re_first / HEATMAP_SAMPLES_PER_PRB;
     const int prb_last = re_last / HEATMAP_SAMPLES_PER_PRB;
+
+    // Thin the ladder down to what the caller's array can hold, rather than
+    // letting the loop below stop when it fills up. Running out mid-sweep
+    // leaves the right-hand part of the axis with no ticks at all, which is
+    // what a wide window hits at high zoom: every visible PRB emits all twelve
+    // of its resource elements, so plot_w / AXIS_MIN_TICK_PX ticks are needed
+    // and anything past about 1400 px overruns. Dropping the finest level and
+    // then coarsening the PRB step degrades the axis evenly instead.
+    const int prb_span = prb_last - prb_first + 1;
+    if (prb_span > 0) {
+        if (show_re && prb_span * HEATMAP_SAMPLES_PER_PRB > max_ticks) {
+            show_re = 0;
+        }
+        while (prb_step > 0 && (prb_span / prb_step) + 1 > max_ticks) {
+            prb_step *= 2;
+        }
+    }
 
     for (int prb = prb_first; prb <= prb_last && count < max_ticks; prb++) {
         const int on_step = (prb % prb_step) == 0;
@@ -2627,7 +2654,13 @@ int visualizer_get_x_ticks(const opengl_visualizer_t* vis,
 
         const int re = prb * HEATMAP_SAMPLES_PER_PRB;
         visualizer_axis_tick_t* t = &out_ticks[count++];
-        t->position_px = plot_x + ((float)re - re_origin) * px_per_re;
+        // Centre of the cell, not its leading edge. A resource element is a
+        // discrete cell rather than a point on a continuous scale, so a tick
+        // labelled with its index has to point at the cell it names - which is
+        // also where markers, the cursor readout and the trigger line put it.
+        // Edge-aligned ticks sit half a cell away from all three, so a marker
+        // looks like it is straddling a boundary.
+        t->position_px = plot_x + ((float)re + 0.5f - re_origin) * px_per_re;
         t->level = 1;
         t->has_label = on_step;
         t->is_anchor = 0;
@@ -2645,7 +2678,7 @@ int visualizer_get_x_ticks(const opengl_visualizer_t* vis,
         }
         for (int sub = 1; sub < HEATMAP_SAMPLES_PER_PRB && count < max_ticks; sub++) {
             visualizer_axis_tick_t* st = &out_ticks[count++];
-            st->position_px = plot_x + ((float)(re + sub) - re_origin) * px_per_re;
+            st->position_px = plot_x + ((float)(re + sub) + 0.5f - re_origin) * px_per_re;
             st->level = 0;
             st->has_label = label_re;
             st->is_anchor = 0;

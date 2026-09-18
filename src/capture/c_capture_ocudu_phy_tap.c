@@ -79,6 +79,14 @@ typedef struct fh_phy_tap_packet_header {
 	uint64_t timestamp_ns;
 } __attribute__((packed)) fh_phy_tap_packet_header_t;
 
+// Mirrored by struct fh_phy_tap_packet_header in c_fronthaul_decoder.c, which
+// reads what this side writes. Both carry the same check so a change to either
+// definition alone fails the build instead of silently shifting the payload
+// offset the decoder reads from.
+_Static_assert(sizeof(fh_phy_tap_packet_header_t) == 60,
+               "phy tap packet header layout changed - update the matching "
+               "definition in c_fronthaul_decoder.c");
+
 typedef struct fh_mapped_queue {
 	int fd;
 	size_t mapped_bytes;
@@ -205,8 +213,18 @@ int fh_capture_ocudu_phy_tap_run(
 		return write_err(errbuf, errbuf_len, "invalid shared queue dimensions");
 	}
 
+	// Each sample is an ocudu cbf16_t: two bfloat16 components, 4 bytes per IQ
+	// pair. The payload is copied through untouched; the sample format is decoded
+	// downstream (see bf16_to_float in c_fronthaul_decoder.c) - these are not Q15
+	// integers despite the record's iq_bit_width of 16.
 	const size_t iq_bytes = (size_t)state->sample_count * sizeof(uint16_t) * 2U;
-	const size_t record_stride = round_up(sizeof(fh_phy_tap_record_header_t) + iq_bytes, sizeof(max_align_t));
+	// The stride must match the producer's exactly, which rounds to
+	// _Alignof(max_align_t) (16 on x86-64), not sizeof(max_align_t) (32). The two
+	// agree only when the rounded size happens to be a multiple of 32 - it is at
+	// 273 PRBs, but not at 106 or 162 - so using the size here walks the ring at
+	// the wrong pitch on those bandwidths and every record past the first fails
+	// the magic/sequence check.
+	const size_t record_stride = round_up(sizeof(fh_phy_tap_record_header_t) + iq_bytes, _Alignof(max_align_t));
 	const uint8_t* records_base = (const uint8_t*)mapped.mapping + sizeof(fh_phy_tap_state_header_t);
 
 	const size_t packet_bytes = sizeof(fh_phy_tap_packet_header_t) + iq_bytes;
