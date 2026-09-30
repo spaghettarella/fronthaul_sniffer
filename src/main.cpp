@@ -27,6 +27,8 @@
 #include <unordered_map>
 #include <vector>
 #include <algorithm>
+#include <atomic>
+#include <climits>
 #include <filesystem>
 
 namespace {
@@ -64,6 +66,13 @@ volatile sig_atomic_t g_stop = 0;
 std::mutex g_memories_mutex;  // Protects memories map structure only
 std::mutex g_memory_data_mutex;  // Global lock for per-packet save operations
 
+// The view's Freeze: while set, packets are still taken off the queue - so the
+// capture keeps running and nothing backs up - but nothing is decoded or
+// written to memory, which holds every stream at one moment. Only changed
+// while holding g_memory_data_mutex and re-checked under it before each save,
+// so no write can land after the moment the freeze takes effect.
+std::atomic<bool> g_memory_frozen{false};
+
 void wait_for_queue_drain(fh_packet_queue_t* queue) {
     while (queue != nullptr && fh_packet_queue_stats(queue).queued_packets != 0) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -74,9 +83,42 @@ void advance_all_memory_loops(
     std::unordered_map<fh_memory_key_t, fh_oran_memory_t*>& memories,
     std::mutex& memories_mutex) {
     std::lock_guard<std::mutex> lock(memories_mutex);
+
+    // One span for the whole pass, from the earliest symbol any stream saw to
+    // the latest, so every stream moves on by the same amount and they stay on
+    // the one timeline the capture recorded them on.
+    int first = INT_MAX;
+    int last = INT_MIN;
+    for (const auto& entry : memories) {
+        const fh_oran_memory_t* mem = entry.second;
+        if (mem == nullptr || mem->loop_first_symbol == INT_MIN || mem->loop_last_symbol == INT_MIN) {
+            continue;
+        }
+        first = std::min(first, mem->loop_first_symbol);
+        last = std::max(last, mem->loop_last_symbol);
+    }
+    int64_t loop_span = (first <= last) ? (int64_t)last - (int64_t)first + 1 : 0;
+
+    // Rounded up to whole radio frames, so each pass keeps every symbol's
+    // subframe / slot / symbol position from the capture - which the axis
+    // labels and the cursor readout decode from the symbol number, and which a
+    // span of, say, 7.2 frames would shift by the remainder on every pass. The
+    // price is a gap of under one frame between passes. The largest frame of
+    // any stream is a whole number of every smaller numerology's frames too.
+    int64_t symbols_per_frame = 0;
+    for (const auto& entry : memories) {
+        const fh_oran_memory_t* mem = entry.second;
+        if (mem != nullptr && mem->scs_khz >= 15) {
+            symbols_per_frame = std::max<int64_t>(symbols_per_frame, (int64_t)(mem->scs_khz / 15) * 14 * 10);
+        }
+    }
+    if (loop_span > 0 && symbols_per_frame > 0) {
+        loop_span = ((loop_span + symbols_per_frame - 1) / symbols_per_frame) * symbols_per_frame;
+    }
+
     for (auto& entry : memories) {
         if (entry.second != nullptr) {
-            fh_oran_memory_advance_loop(entry.second);
+            fh_oran_memory_advance_loop(entry.second, loop_span);
         }
     }
 }
@@ -90,6 +132,9 @@ void print_usage(const char* argv0) {
         << "Usage: " << argv0 << " [options]\n"
         << "  --iface <name>                        Interface name (default: lo)\n"
         << "  --channel <eAxC_ID> <data_direction>  eAxC_ID (uint16) and data direction (UL/DL) to filter network capture before queue\n"
+        << "  --channel-whitelist <eAxC_ID[:UL|:DL]>...\n"
+        << "                                        Keep only the listed channels (hex eAxC_IDs); a channel without\n"
+        << "                                         :UL or :DL passes in both directions. Not with --channel.\n"
         << "  --snaplen <bytes>                     Max captured bytes per packet for Jumbo Frames >9000 for Phy Tap no upper limit (default: 10000)\n"
         << "  --timeout-ms <ms>                     Exit once the stream has been silent for <ms>\n"
         << "                                         milliseconds; armed only after the first packet.\n"
@@ -144,6 +189,13 @@ int fh_memory_manage(
         return -1;
     }
 
+    // Frozen: dropped without the cost of decoding. The authoritative check is
+    // the one under the data lock below; this one only saves the work.
+    if (g_memory_frozen.load(std::memory_order_relaxed)) {
+        fh_packet_release(pkt);
+        return 0;
+    }
+
     // Decode once
     fh_decoded_packet_t decoded{};
     int rc = fh_decode_packet(pkt, &decoded, ud_comp_hdr_present, ud_iq_width, ud_iq_width_decompressed, ud_comp_method);
@@ -185,6 +237,12 @@ int fh_memory_manage(
         // Save with global data lock
         if (memory_buffer != nullptr) {
             std::lock_guard<std::mutex> lock(memory_data_mutex);
+            if (g_memory_frozen.load(std::memory_order_relaxed)) {
+                // Decoded before the freeze took hold, arriving after it.
+                fh_decoded_packet_free(&decoded);
+                fh_packet_release(pkt);
+                return rc;
+            }
             fh_oran_memory_save(memory_buffer, &decoded, effective_scs_khz);
             if (g_iq_analysis != nullptr) {
                 // Reads settled rows straight back out of the ring, so a
@@ -235,6 +293,8 @@ int main(int argc, char** argv) {
     uint16_t channel_eaxc = 0;
     bool channel_has_direction = false;
     int channel_direction = -1; // 0 = UL, 1 = DL
+    fh_channel_filter_method_t channel_filter_method = FH_CHANNEL_FILTER_SINGLE;
+    std::vector<fh_channel_whitelist_entry_t> channel_whitelist;
 
     // Parse CLI options so the capture backend and queue can be tuned without recompiling.
     for (int i = 1; i < argc; ++i) {
@@ -294,6 +354,47 @@ int main(int argc, char** argv) {
                     }
                 }
             }
+        } else if (arg == "--channel-whitelist") {
+            // One or more <eAxC_ID>[:UL|:DL|:BOTH] tokens, up to the next
+            // option. Listing an eAxC twice widens its directions, as adding it
+            // twice on the startup screen does.
+            int tokens = 0;
+            while (i + 1 < argc && std::string(argv[i + 1]).rfind("--", 0) != 0) {
+                const std::string token = argv[++i];
+                const std::size_t colon = token.find(':');
+                const std::string id_text = token.substr(0, colon);
+                std::string dir_text = (colon == std::string::npos) ? "BOTH" : token.substr(colon + 1);
+                std::transform(dir_text.begin(), dir_text.end(), dir_text.begin(), ::toupper);
+
+                uint8_t bits = 0;
+                if (dir_text == "BOTH") {
+                    bits = FH_CHANNEL_DIR_BOTH;
+                } else if (dir_text == "UL") {
+                    bits = FH_CHANNEL_DIR_UL;
+                } else if (dir_text == "DL") {
+                    bits = FH_CHANNEL_DIR_DL;
+                } else {
+                    throw std::invalid_argument("--channel-whitelist: direction must be UL, DL or BOTH in '" + token + "'");
+                }
+                const uint16_t eaxc = static_cast<uint16_t>(std::stoul(id_text, nullptr, 16) & 0xFFFFu);
+
+                auto existing = std::find_if(channel_whitelist.begin(), channel_whitelist.end(),
+                                             [eaxc](const fh_channel_whitelist_entry_t& e) { return e.eaxc == eaxc; });
+                if (existing != channel_whitelist.end()) {
+                    existing->directions = static_cast<uint8_t>(existing->directions | bits);
+                } else {
+                    channel_whitelist.push_back(fh_channel_whitelist_entry_t{eaxc, bits});
+                }
+                ++tokens;
+            }
+            if (tokens == 0) {
+                throw std::invalid_argument("--channel-whitelist requires at least one <eAxC_ID>[:UL|:DL]");
+            }
+            if (channel_whitelist.size() > static_cast<std::size_t>(FH_CHANNEL_WHITELIST_MAX)) {
+                throw std::invalid_argument("--channel-whitelist: at most " +
+                                            std::to_string(FH_CHANNEL_WHITELIST_MAX) + " channels");
+            }
+            channel_filter_method = FH_CHANNEL_FILTER_WHITELIST;
         } else if (arg == "--snaplen") {
             capture_options.snaplen = std::stoi(next_arg("--snaplen"));
             // Combine: set queue_bytes to the same value as snaplen
@@ -369,6 +470,13 @@ int main(int argc, char** argv) {
         }
     }
 
+    // The two filter methods are alternatives; a single channel and a list at
+    // once has no one meaning to settle on.
+    if (channel_filter_method == FH_CHANNEL_FILTER_WHITELIST && (channel_has_eaxc || channel_has_direction)) {
+        std::cerr << "--channel and --channel-whitelist cannot be combined\n";
+        return 1;
+    }
+
     // Register shutdown handlers; the worker loops watch this shared flag.
     std::signal(SIGINT, on_signal);
     std::signal(SIGTERM, on_signal);
@@ -410,6 +518,8 @@ int main(int argc, char** argv) {
             startup_config.channel_ru_port_id = channel_fields.ru_port_id;
         }
         startup_config.channel_direction = (channel_direction >= 0) ? channel_direction : 0;
+        startup_config.channel_filter_method = channel_filter_method;
+        startup_config.channel_whitelist = channel_whitelist;
 
         // Per-stream memory buffers keyed by (eAxC_ID, data_direction).
         std::unordered_map<fh_memory_key_t, fh_oran_memory_t*> memories;
@@ -639,6 +749,8 @@ int main(int argc, char** argv) {
             } else {
                 channel_direction = -1;
             }
+            channel_filter_method = startup_config.channel_filter_method;
+            channel_whitelist = startup_config.channel_whitelist;
             texture_height = memory_symbols;
             capture_options.interface_name = iface.c_str();
         }
@@ -712,8 +824,9 @@ int main(int argc, char** argv) {
         // Names the capture the run is reading, for the statistics window. Built
         // the same way the capture thread below picks its backend, so the label
         // can never describe a source other than the one actually running.
+        const bool pcap_source = demo_pcap_enabled || iface == "pcap";
         std::string source_name;
-        if (demo_pcap_enabled || iface == "pcap") {
+        if (pcap_source) {
             const std::string file = std::filesystem::path(demo_pcap_path).filename().string();
             source_name = "pcap " + (file.empty() ? demo_pcap_path : file);
             if (demo_pcap_loop) {
@@ -725,21 +838,43 @@ int main(int argc, char** argv) {
             source_name = "interface " + iface;
         }
 
+        // Replay speed the Live Statistics window can change mid-run, starting
+        // at the one set on the startup screen or the command line. Only
+        // accessed through __atomic builtins; see fh_pcap_stream_options.
+        int pcap_live_speed_pps = demo_pcap_speed;
+
+        // Stream Selection's "Only decode selected": the channels on screen,
+        // which every capture backend applies on top of channel_filter. 0 until
+        // the box is ticked. Only accessed through __atomic builtins; see
+        // fh_channel_selection_pack.
+        uint64_t decode_selection = 0;
+
         fh_channel_filter_t channel_filter{};
+        channel_filter.method = channel_filter_method;
         channel_filter.has_eaxc = channel_has_eaxc ? 1 : 0;
         channel_filter.eaxc = channel_eaxc;
         channel_filter.has_direction = channel_has_direction ? 1 : 0;
         channel_filter.direction = channel_direction;
+        channel_filter.whitelist_count =
+            static_cast<int>(std::min(channel_whitelist.size(), static_cast<std::size_t>(FH_CHANNEL_WHITELIST_MAX)));
+        std::copy_n(channel_whitelist.begin(), channel_filter.whitelist_count, channel_filter.whitelist);
         capture_options.filter = channel_filter;
+        capture_options.live_selection = &decode_selection;
 
         std::thread capture_thread([&] {
             char errbuf[256] = {0};
             int rc = 0;
-            if (demo_pcap_enabled || iface == "pcap") {
+            if (pcap_source) {
                 fh_pcap_stream_options_t demo_options{};
                 demo_options.pcap_path = demo_pcap_path.c_str();
                 demo_options.demo_pcap_timeout = 1.0 / static_cast<double>(demo_pcap_speed);
+                demo_options.live_speed_pps = &pcap_live_speed_pps;
+                // One schedule for the whole replay, so the queue drain between
+                // looped passes does not cost rate.
+                fh_pcap_schedule_t demo_schedule{};
+                demo_options.schedule = &demo_schedule;
                 demo_options.filter = channel_filter;
+                demo_options.live_selection = &decode_selection;
                 // Looping is controlled by the demo_pcap_loop flag.
                 if (demo_pcap_loop) {
                     rc = 0;
@@ -774,6 +909,7 @@ int main(int argc, char** argv) {
                 loopback_options.snaplen = capture_options.snaplen;
                 loopback_options.stall_timeout_ms = capture_options.stall_timeout_ms;
                 loopback_options.filter = channel_filter;
+                loopback_options.live_selection = &decode_selection;
                 rc = fh_capture_loopback_run(
                     &loopback_options,
                     queue_callback,
@@ -786,6 +922,8 @@ int main(int argc, char** argv) {
                 phy_tap_options.queue_name = ocudu_phy_tap_queue_name.c_str();
                 phy_tap_options.poll_sleep_ms = 1;
                 phy_tap_options.stall_timeout_ms = capture_options.stall_timeout_ms;
+                phy_tap_options.filter = channel_filter;
+                phy_tap_options.live_selection = &decode_selection;
                 rc = fh_capture_ocudu_phy_tap_run(
                     &phy_tap_options,
                     queue_callback,
@@ -906,9 +1044,9 @@ int main(int argc, char** argv) {
                         ui_height = 800;
                     }
 
-                    // The radar reads both directions of the selected eAxC, so
-                    // it needs the pair rather than the one stream the other
-                    // views draw.
+                    // The radar reads a DL and a UL ring - possibly from two
+                    // different eAxCs - so it needs the pair rather than the
+                    // one stream the other views draw.
                     fh_oran_memory_t* radar_dl = nullptr;
                     fh_oran_memory_t* radar_ul = nullptr;
 
@@ -923,6 +1061,8 @@ int main(int argc, char** argv) {
                         stats,
                         visualizer,
                         source_name.c_str(),
+                        pcap_source ? &pcap_live_speed_pps : nullptr,
+                        &decode_selection,
                         radar,
                         &radar_dl,
                         &radar_ul);
@@ -930,6 +1070,15 @@ int main(int argc, char** argv) {
                     // Only stores the pointers; the radar worker notices a
                     // changed pair itself and drops its accumulated frame.
                     fh_radar_submit(radar, radar_dl, radar_ul);
+
+                    // The view's Freeze, applied to the decode workers. Flipped
+                    // under the data lock, so a save in progress finishes first
+                    // and every save after it sees the new state.
+                    const bool freeze_wanted = imgui_visualizer_get_frozen(imgui_state);
+                    if (freeze_wanted != g_memory_frozen.load(std::memory_order_relaxed)) {
+                        std::lock_guard<std::mutex> lock(g_memory_data_mutex);
+                        g_memory_frozen.store(freeze_wanted, std::memory_order_relaxed);
+                    }
 
                     // A different eAxC/direction stream means accumulated
                     // persistence averages no longer correspond to what's shown.

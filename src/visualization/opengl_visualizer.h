@@ -77,6 +77,40 @@ visualizer_view_mode_t visualizer_get_view_mode(const opengl_visualizer_t* vis);
 struct fh_radar;
 void visualizer_set_radar(opengl_visualizer_t* vis, struct fh_radar* radar);
 
+// --- Radar rolling mean ---
+// The waterfall's phase-locked EMA applied to the radar's CFR magnitude: each
+// paired symbol's |H| row is folded once into the cell for
+// (symbol % period, RE), and the view shows the accumulator instead of the
+// live window. Its own accumulator and settings, since |H| and a received
+// magnitude are different quantities and must never share an average.
+//
+// Only cells that carry a channel estimate are folded - occupied in both
+// directions. An unoccupied resource element has no |H| to average, and
+// folding it as zero would make the mean follow the scheduler's allocation
+// rather than the channel. Cells that never received an estimate stay black.
+//
+// CFR output only for now; the other outputs keep drawing their live frame.
+// The accumulator starts over whenever the radar's frames stop being
+// comparable (see fh_radar_stats::epoch): a new DL/UL pair, a radar reset, or
+// a change of frequency range, lag or division.
+void visualizer_set_radar_persistence_enabled(opengl_visualizer_t* vis, int enabled);
+int visualizer_get_radar_persistence_enabled(const opengl_visualizer_t* vis);
+
+// Averaging period in symbols; reallocates and clears the accumulator.
+void visualizer_set_radar_persistence_period(opengl_visualizer_t* vis, int period_symbols);
+int visualizer_get_radar_persistence_period(const opengl_visualizer_t* vis);
+
+// EMA smoothing factor "n" (approximate rolling-mean window in periods).
+void visualizer_set_radar_persistence_n(opengl_visualizer_t* vis, int n);
+int visualizer_get_radar_persistence_n(const opengl_visualizer_t* vis);
+
+// Clears the accumulated average without changing settings.
+void visualizer_reset_radar_persistence(opengl_visualizer_t* vis);
+
+// Whole periods folded since the accumulator was last cleared, so the UI can
+// show whether the average has settled. 0 while nothing has been folded.
+int visualizer_get_radar_persistence_periods(const opengl_visualizer_t* vis);
+
 // --- Curve view: single-symbol magnitude-vs-resource-element plot ---
 // Instead of the waterfall's scrolling time axis, Curve mode plots one
 // symbol's magnitude across all resource elements. Two independent,
@@ -309,6 +343,15 @@ typedef struct visualizer_cursor_sample {
     int time_offset;            // row as a marker-style offset from the reference row
     int has_symbol;             // whether symbol is meaningful (not rolling-mean)
     int symbol;                 // absolute symbol number
+    // Where that symbol sits in the radio frame structure, split the same way
+    // the vertical axis labels it. Only when has_symbol and the stream's
+    // subcarrier spacing is known.
+    int has_timing;
+    int frame;                  // absolute frame number, never wraps
+    int frame_id;               // frame number as the 8-bit header field carries it
+    int subframe;               // 0..9
+    int slot;                   // within the subframe
+    int slot_symbol;            // 0..13
     int has_phase;              // whether phase is meaningful (rolling-mean only)
     int phase;                  // position within the averaging period
     int has_value;              // 0 when the cell holds no data
@@ -402,6 +445,9 @@ visualizer_trigger_edge_t visualizer_get_trigger_edge(const opengl_visualizer_t*
 // this below the trigger level (must drop further to reset); for falling
 // edge, keep it above (must rise further). Disabled by default - falls back
 // to using the trigger level for both.
+//
+// Off in Single mode, where it reads back as off and cannot be turned on. The
+// choice made for Repeat is kept and applies again once Repeat is selected.
 void visualizer_set_trigger_hysteresis_enabled(opengl_visualizer_t* vis, int enabled);
 int visualizer_get_trigger_hysteresis_enabled(const opengl_visualizer_t* vis);
 

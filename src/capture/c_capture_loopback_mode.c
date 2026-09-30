@@ -77,6 +77,15 @@ int fh_capture_loopback_run(
             fh_capture_monotonic_now(&last_packet_time);
             stall_armed = 1;
 
+            // The running selection only decides what gets decoded, so it comes
+            // after the stall timer: a quiet stream picked on screen must not
+            // look like a dead capture and end the run.
+            if (options->live_selection != NULL &&
+                !fh_channel_selection_accepts(__atomic_load_n(options->live_selection, __ATOMIC_RELAXED),
+                                              (const uint8_t*)packet_data, (size_t)header->caplen, datalink)) {
+                continue;
+            }
+
             fh_packet_t pkt;
             memset(&pkt, 0, sizeof(pkt));
             pkt.timestamp.tv_sec = (time_t)header->ts.tv_sec;

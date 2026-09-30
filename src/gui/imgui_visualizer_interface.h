@@ -63,10 +63,18 @@ void imgui_visualizer_present(void);
 // current_display_memory: pointer to the currently displayed memory (can be NULL)
 // source_name: human-readable capture source (interface, pcap file, tap queue)
 //   shown in the statistics window; may be NULL
+// pcap_speed_pps: replay speed of a pcap source, in packets per second, which
+//   the statistics window edits in place with __atomic builtins while the
+//   capture thread reads it. NULL when the source is not a pcap file.
+// decode_selection: the capture's running selection word (see
+//   fh_channel_selection_pack), which Stream Selection's "Only decode
+//   selected" sets to the channels on screen and to 0 when unticked. Written
+//   with __atomic_store_n. May be NULL.
 // radar: radar core the Radar Settings window edits; may be NULL
-// out_radar_dl, out_radar_ul: both directions of the selected eAxC, for the
-//   radar, which needs the pair rather than the single displayed stream. Either
-//   is set to NULL when that direction has not been seen. Optional.
+// out_radar_dl, out_radar_ul: the DL and UL rings the radar should pair, which
+//   may come from different eAxCs (picked in the Stream Selection table in
+//   radar mode). Either is set to NULL when that direction has not been seen
+//   on its eAxC. Optional.
 // window_width, window_height: current window dimensions
 // Returns the display_memory pointer (either unchanged or updated based on user selection)
 struct fh_oran_memory* imgui_visualizer_render(
@@ -80,9 +88,16 @@ struct fh_oran_memory* imgui_visualizer_render(
     fh_queue_stats_t stats,
     opengl_visualizer_t* visualizer,
     const char* source_name,
+    int* pcap_speed_pps,
+    uint64_t* decode_selection,
     struct fh_radar* radar,
     struct fh_oran_memory** out_radar_dl,
     struct fh_oran_memory** out_radar_ul);
+
+// Whether the view's Freeze is on. Frozen, the memories must not be written
+// to any more while the capture itself carries on, so that every channel and
+// view shows the same moment; the caller applies that to its decode workers.
+bool imgui_visualizer_get_frozen(const imgui_visualizer_state_t* state);
 
 // Shutdown ImGui and release resources
 void imgui_visualizer_shutdown(imgui_visualizer_state_t* state);

@@ -5,7 +5,7 @@
 #include <string.h>
 #include <limits.h>
 
-static int compute_symbol_number(uint64_t frame_counter, const fh_section_t* section, int scs_khz) {
+static int compute_symbol_number(uint64_t frame_cycle, const fh_section_t* section, int scs_khz) {
     if (section == NULL || scs_khz <= 0) {
         return -1;
     }
@@ -15,10 +15,10 @@ static int compute_symbol_number(uint64_t frame_counter, const fh_section_t* sec
         slots_per_subframe = 1;
     }
 
-    // The `frame_counter` tracks the number of 256-frame wraparounds observed.
-    // The actual absolute frame number is therefore:
-    //    full_frame = frame_counter * 256 + section->frame_id
-    uint64_t full_frame = frame_counter * 256ULL + (uint8_t)section->frame_id;
+    // `frame_cycle` is which 256-frame wraparound the section's 8-bit frame_id
+    // falls in (see resolve_frame_cycle), so the absolute frame number is:
+    //    full_frame = frame_cycle * 256 + section->frame_id
+    uint64_t full_frame = frame_cycle * 256ULL + (uint8_t)section->frame_id;
 
     // Compute a symbol index from the absolute frame number, subframe, slot and symbol.
     // Keep the final result as int for compatibility with the rest of the code.
@@ -32,6 +32,61 @@ static int compute_symbol_number(uint64_t frame_counter, const fh_section_t* sec
         return INT_MAX;
     }
     return (int)sym;
+}
+
+// How many frames behind the newest one a section may arrive and still count
+// as late, rather than as the stream having moved on. Sections do arrive out
+// of order - the decode threads finish in whatever order they finish, and
+// networks reorder - but only by a slot or so, far inside this.
+#define FRAME_REORDER_WINDOW 8
+
+// Works out which 256-frame cycle a section's 8-bit frame_id belongs to,
+// updating the stream's wraparound tracking as it goes.
+//
+// A frame_id below the newest one is not by itself a wraparound: a section
+// from frame 3 that is saved just after one from frame 4 would otherwise count
+// as the counter wrapping, and every symbol of the stream from then on would
+// land 256 frames (71 680 symbols at 30 kHz) further on - harmless to the
+// waterfall, which only ever looks at one stream, but fatal to anything that
+// lines two streams up by symbol number, like the radar's DL/UL pairing. So the
+// ids are compared the way sequence numbers are: a short step back is a late
+// section, anything else is progress, wrapping past 255 when the id is lower.
+//
+// A stream that goes silent and comes back almost exactly one cycle later can
+// be mistaken for late sections; that costs at most FRAME_REORDER_WINDOW frames
+// of data before the ids move clear of the window again.
+//
+// Returns 0 for a section that cannot be placed: one arriving late from before
+// the first cycle the stream was seen in.
+static int resolve_frame_cycle(fh_oran_memory_t* mem, uint8_t frame_id, uint64_t* out_cycle) {
+    if (!mem->frame_id_seen) {
+        mem->frame_id_seen = 1;
+        mem->last_frame_id = frame_id;
+        *out_cycle = mem->frame_counter;
+        return 1;
+    }
+
+    const uint8_t forward = (uint8_t)(frame_id - mem->last_frame_id);
+    if (forward <= 255 - FRAME_REORDER_WINDOW) {
+        if (frame_id < mem->last_frame_id) {
+            mem->frame_counter++;
+        }
+        mem->last_frame_id = frame_id;
+        *out_cycle = mem->frame_counter;
+        return 1;
+    }
+
+    // Late. An id above the newest one means the newest has since wrapped past
+    // 255, so this section belongs to the cycle before it.
+    if (frame_id > mem->last_frame_id) {
+        if (mem->frame_counter == 0) {
+            return 0;
+        }
+        *out_cycle = mem->frame_counter - 1;
+        return 1;
+    }
+    *out_cycle = mem->frame_counter;
+    return 1;
 }
 
 static int clamp_symbol_number(int64_t value) {
@@ -109,6 +164,7 @@ fh_oran_memory_t* fh_oran_memory_create(size_t max_symbols) {
     // Initialize frame tracking for wraparound detection.
     mem->frame_counter = 0;
     mem->last_frame_id = 0;
+    mem->frame_id_seen = 0;
 
     return mem;
 }
@@ -149,13 +205,13 @@ int fh_oran_memory_save(fh_oran_memory_t* mem, const fh_decoded_packet_t* pkt, i
     for (int i = 0; i < pkt->section_count; i++) {
         const fh_section_t* section = &pkt->sections[i];
 
-        // Detect frame_id wraparound (8-bit counter resets to 0 after 255)
-        if (section->frame_id < mem->last_frame_id) {
-            mem->frame_counter++;
+        // Which 256-frame cycle this section is from; see resolve_frame_cycle.
+        uint64_t frame_cycle = 0;
+        if (!resolve_frame_cycle(mem, section->frame_id, &frame_cycle)) {
+            continue;
         }
-        mem->last_frame_id = section->frame_id;
 
-        int raw_symbol_number = compute_symbol_number(mem->frame_counter, section, scs_khz);
+        int raw_symbol_number = compute_symbol_number(frame_cycle, section, scs_khz);
         if (raw_symbol_number < 0) {
             continue;
         }
@@ -244,6 +300,7 @@ int fh_oran_memory_wipe(fh_oran_memory_t* mem) {
     mem->loop_last_symbol = INT_MIN;
     mem->frame_counter = 0;
     mem->last_frame_id = 0;
+    mem->frame_id_seen = 0;
 
     return 0;
 }
@@ -263,16 +320,12 @@ fh_oran_memory_stats_t fh_oran_memory_stats(const fh_oran_memory_t* mem) {
     return stats;
 }
 
-void fh_oran_memory_advance_loop(fh_oran_memory_t* mem) {
+void fh_oran_memory_advance_loop(fh_oran_memory_t* mem, int64_t loop_span) {
     if (mem == NULL) {
         return;
     }
 
-    if (mem->loop_first_symbol != INT_MIN && mem->loop_last_symbol != INT_MIN) {
-        int64_t loop_span = (int64_t)mem->loop_last_symbol - (int64_t)mem->loop_first_symbol + 1;
-        if (loop_span < 1) {
-            loop_span = 1;
-        }
+    if (loop_span > 0) {
         mem->replay_symbol_offset += loop_span;
     }
 
@@ -280,4 +333,5 @@ void fh_oran_memory_advance_loop(fh_oran_memory_t* mem) {
     mem->loop_last_symbol = INT_MIN;
     mem->frame_counter = 0;
     mem->last_frame_id = 0;
+    mem->frame_id_seen = 0;
 }

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "capture/c_channel_filter.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -36,6 +38,13 @@ struct fh_startup_config_t {
     uint16_t channel_eaxc = 0;
     bool channel_has_direction = false;
     int channel_direction = 0;
+    // Which of the two filters above and below applies; see
+    // fh_channel_filter_method_t. Each keeps its settings while the other is
+    // selected, so switching back and forth loses nothing.
+    fh_channel_filter_method_t channel_filter_method = FH_CHANNEL_FILTER_SINGLE;
+    // eAxC plus FH_CHANNEL_DIR_* bits per entry, at most
+    // FH_CHANNEL_WHITELIST_MAX; each eAxC listed once.
+    std::vector<fh_channel_whitelist_entry_t> channel_whitelist;
 };
 
 typedef struct fh_startup_interface_state fh_startup_interface_state_t;

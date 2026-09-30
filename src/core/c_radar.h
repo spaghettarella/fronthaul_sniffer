@@ -77,6 +77,16 @@ typedef struct fh_radar_stats {
     uint64_t refresh_count;
     int have_dl;             // Whether a downlink ring was submitted
     int have_ul;
+    // The output the published frame was computed for. Trails the config for
+    // up to one pass after the output is switched, since the worker finishes
+    // the pass it is on first.
+    fh_radar_output_t output;
+    // Moves whenever published frames stop being comparable with the ones
+    // before: a new DL/UL pair, fh_radar_reset, or a config edit that changes
+    // the values themselves (frequency range, lag, division). Anything
+    // accumulated across frames, such as a rolling mean, starts over when it
+    // moves.
+    uint64_t epoch;
 } fh_radar_stats_t;
 
 typedef struct fh_radar fh_radar_t;

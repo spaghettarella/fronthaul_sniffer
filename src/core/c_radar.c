@@ -55,6 +55,10 @@ struct fh_radar {
     int reset_requested;
     int stop;
 
+    // See fh_radar_stats::epoch. Kept outside stats because a reset wipes
+    // those, and the count has to survive exactly the events it records.
+    uint64_t epoch;
+
     pthread_t worker;
     int worker_started;
 };
@@ -322,6 +326,7 @@ static void* radar_worker(void* arg) {
         }
 
         const fh_radar_config_t cfg = r->cfg;
+        const uint64_t epoch = r->epoch;
         fh_oran_memory_t* dl = r->dl;
         fh_oran_memory_t* ul = r->ul;
 
@@ -345,6 +350,11 @@ static void* radar_worker(void* arg) {
         memset(&pass, 0, sizeof(pass));
         pass.have_dl = (dl != NULL);
         pass.have_ul = (ul != NULL);
+        // Taken with the config under the same lock, so the frame is labelled
+        // with what it was actually computed from, not what is current by the
+        // time it is published.
+        pass.output = cfg.output;
+        pass.epoch = epoch;
 
         if (cfg.output == RADAR_OUT_CFR) {
             compute_cfr(&cfg, dl, ul, back, rows, cols, &pass);
@@ -495,6 +505,15 @@ void fh_radar_set_config(fh_radar_t* r, const fh_radar_config_t* cfg) {
     sanitize_config(&sane);
 
     pthread_mutex_lock(&r->lock);
+    // Only the fields that change what a cell holds move the epoch. The window
+    // depth and the transform settings reshape the frame, but a symbol's |H|
+    // stays the same number, so an average across them is still an average.
+    if (sane.freq_start_re != r->cfg.freq_start_re ||
+        sane.freq_end_re != r->cfg.freq_end_re ||
+        sane.dl_ul_lag_symbols != r->cfg.dl_ul_lag_symbols ||
+        sane.division != r->cfg.division) {
+        r->epoch++;
+    }
     r->cfg = sane;
     // Wake the worker so an edit takes effect on the next pass rather than
     // after the current idle interval expires.
@@ -522,6 +541,7 @@ void fh_radar_reset(fh_radar_t* r) {
     }
     pthread_mutex_lock(&r->lock);
     r->reset_requested = 1;
+    r->epoch++;
     pthread_cond_broadcast(&r->cv);
     pthread_mutex_unlock(&r->lock);
 }
@@ -536,6 +556,7 @@ void fh_radar_submit(fh_radar_t* r, fh_oran_memory_t* dl, fh_oran_memory_t* ul) 
         r->dl = dl;
         r->ul = ul;
         r->reset_requested = 1;
+        r->epoch++;
         pthread_cond_broadcast(&r->cv);
     }
     pthread_mutex_unlock(&r->lock);

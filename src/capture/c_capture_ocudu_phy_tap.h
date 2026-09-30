@@ -2,6 +2,7 @@
 
 #include "../core/c_fronthaul_decoder.h"
 #include "c_capture_common.h"
+#include "c_channel_filter.h"
 
 #include <signal.h>
 #include <stddef.h>
@@ -18,6 +19,13 @@ typedef struct fh_capture_ocudu_phy_tap_options {
 	// capturing forever. Only armed after the first record, so attaching before
 	// the tap starts producing does not end the run immediately.
 	int stall_timeout_ms;
+	// Optional eAxC / direction filter, checked against each record's own
+	// eAxC and direction before its payload is copied.
+	fh_channel_filter_t filter;
+	// Optional running selection on top of the filter; see
+	// fh_channel_selection_pack. Read with __atomic_load_n, so write it with
+	// __atomic_store_n. NULL, or a word of 0, decodes every channel.
+	const uint64_t* live_selection;
 } fh_capture_ocudu_phy_tap_options_t;
 
 typedef int (*fh_packet_callback_t)(const fh_packet_t* pkt, void* user_ctx);

@@ -121,6 +121,15 @@ int fh_capture_socket_run(
         fh_capture_monotonic_now(&last_packet_time);
         stall_armed = 1;
 
+        // The running selection only decides what gets decoded, so it comes
+        // after the stall timer: a quiet stream picked on screen must not look
+        // like a dead capture and end the run.
+        if (options->live_selection != NULL &&
+            !fh_channel_selection_accepts(__atomic_load_n(options->live_selection, __ATOMIC_RELAXED),
+                                          buf, (size_t)n, FH_LINKTYPE_ETHERNET)) {
+            continue;
+        }
+
         // Stamp the packet and populate the lightweight packet view.
         struct timespec ts;
         (void)timespec_get(&ts, TIME_UTC);

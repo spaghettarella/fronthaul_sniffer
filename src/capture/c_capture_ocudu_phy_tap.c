@@ -271,6 +271,29 @@ int fh_capture_ocudu_phy_tap_run(
 			continue;
 		}
 
+		// Filtered on the record header, before its payload is copied, so a
+		// channel nobody is watching costs one header read. The capture's own
+		// filter decides which channels count as the stream, and so feeds the
+		// stall timer the way it does for the network backends; the running
+		// selection only decides what gets decoded, so it comes after the
+		// timer and a quiet stream picked on screen cannot end the run. The
+		// timer is still fed only past the magic and sequence checks above, so
+		// a tap stuck republishing torn records trips the stall timeout.
+		const uint16_t record_eaxc = (uint16_t)(record->eaxc_id & 0xFFFFu);
+		const int record_direction = record->data_direction ? 1 : 0;
+		if (!fh_channel_filter_accepts_stream(&options->filter, record_eaxc, record_direction)) {
+			__atomic_store_n(&state->read_sequence, read_seq + 1ULL, __ATOMIC_RELEASE);
+			continue;
+		}
+		fh_capture_monotonic_now(&last_record_time);
+		stall_armed = 1;
+		if (options->live_selection != NULL &&
+			!fh_channel_selection_accepts_stream(__atomic_load_n(options->live_selection, __ATOMIC_RELAXED),
+												 record_eaxc, record_direction)) {
+			__atomic_store_n(&state->read_sequence, read_seq + 1ULL, __ATOMIC_RELEASE);
+			continue;
+		}
+
 		fh_phy_tap_packet_header_t* out_hdr = (fh_phy_tap_packet_header_t*)packet_storage;
 		memset(out_hdr, 0, sizeof(*out_hdr));
 		out_hdr->magic = FH_PHY_TAP_PACKET_MAGIC;
@@ -313,11 +336,6 @@ int fh_capture_ocudu_phy_tap_run(
 		if (on_packet(&pkt, user_ctx) != 0) {
 			break;
 		}
-
-		// Liveness is measured on records actually handed downstream, so a tap
-		// stuck republishing torn records still trips the stall timeout.
-		fh_capture_monotonic_now(&last_record_time);
-		stall_armed = 1;
 
 		__atomic_store_n(&state->read_sequence, read_seq + 1ULL, __ATOMIC_RELEASE);
 	}

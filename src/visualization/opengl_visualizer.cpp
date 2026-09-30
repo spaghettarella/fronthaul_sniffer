@@ -2,6 +2,8 @@
 #include "core/c_oran_memory.h"
 #include "core/c_radar.h"
 
+#include <limits.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -25,6 +27,13 @@
 
 #define CURVE_MEAN_DEFAULT_PERIOD PERSIST_DEFAULT_PERIOD
 #define CURVE_MEAN_DEFAULT_N 8
+
+#define RADAR_PERSIST_DEFAULT_PERIOD PERSIST_DEFAULT_PERIOD
+#define RADAR_PERSIST_DEFAULT_N PERSIST_DEFAULT_N
+// Slots in the radar rolling mean's folded-symbol tag ring. Has to exceed the
+// deepest radar window (4096 symbols, RADAR_MAX_TIME_SYMBOLS in c_radar.c) so
+// two symbols of one frame can never share a slot.
+#define RADAR_PERSIST_TAG_SLOTS 8192
 
 // Levels are % of an EMA of the same peak statistic being tested, so ~100%
 // means "as strong as a typical recent symbol"; see the header for the full
@@ -97,9 +106,37 @@ typedef struct opengl_visualizer {
     // which is what the radar view treats as "not available yet".
     struct fh_radar* radar;
 
+    // Radar rolling mean over the CFR frame. The radar recomputes its whole
+    // window every pass, so one symbol turns up in many consecutive frames;
+    // the tag ring records which symbols are already in, keyed by
+    // symbol % RADAR_PERSIST_TAG_SLOTS, and is what keeps each to one fold.
+    int radar_persist_enabled;
+    int radar_persist_period;
+    int radar_persist_n;
+    int radar_persist_cols;              // frame width the accumulator was sized for; 0 = not allocated
+    float* radar_persist_accum;          // radar_persist_period * radar_persist_cols |H| means
+    int* radar_persist_tags;             // RADAR_PERSIST_TAG_SLOTS folded symbol numbers
+    int radar_persist_has_epoch;         // whether radar_persist_epoch is valid yet
+    uint64_t radar_persist_epoch;        // radar epoch every folded frame belonged to
+    int radar_persist_frame_seen;        // whether radar_persist_last_refresh is valid yet
+    uint64_t radar_persist_last_refresh; // last frame folded, so each is scanned once
+    int radar_persist_has_folded;
+    int radar_persist_first_symbol;      // oldest and newest symbol folded since the last
+    int radar_persist_last_symbol;       // clear, for counting accumulated periods
+
     // Curve view: trailing raw traces (read live from the memory ring, no storage of their own)
     int curve_trace_enabled;
     int curve_trace_count;
+
+    // What the curve view draws in one frame, gathered apart from the drawing.
+    // Traces are magnitudes, newest first.
+    float* curve_frame_traces;        // curve_frame_trace_count * HEATMAP_TEXTURE_WIDTH
+    int curve_frame_trace_capacity;   // traces the buffer holds
+    int curve_frame_trace_count;      // traces in it
+    int curve_frame_trace_slots;      // trace count the fade is spread over
+    float* curve_frame_mean;          // HEATMAP_TEXTURE_WIDTH, when curve_frame_has_mean
+    int curve_frame_has_mean;
+    float curve_frame_scale;
 
     // Curve view: rolling-mean curve (own accumulator, independent of persist_accum)
     int curve_mean_enabled;
@@ -197,6 +234,10 @@ typedef struct opengl_visualizer {
     float axis_y_unit_scale;   // hertz per Doppler bin, 0 when not applicable
     int axis_y_scrolling;      // vertical axis advances with new symbols
     const char* axis_value_label;
+    // Row the trigger line marks and marker offsets count from, or -1 when no
+    // triggered window is on screen. Published with the frame, so everything
+    // reading it describes the frame actually drawn.
+    int axis_trigger_row;
 
     // Permanent per-row capture of a triggered window, independent of the
     // live ring: once a row is seen it's locked in here and never re-read,
@@ -239,6 +280,7 @@ static void axis_publish_defaults(opengl_visualizer_t* vis) {
     vis->axis_y_unit_scale = 0.0f;
     vis->axis_y_scrolling = 1;
     vis->axis_value_label = "magnitude";
+    vis->axis_trigger_row = -1;
 }
 
 // Advances the display's normalisation toward the level just measured.
@@ -445,6 +487,123 @@ void visualizer_set_radar(opengl_visualizer_t* vis, struct fh_radar* radar) {
         return;
     }
     vis->radar = radar;
+}
+
+// Marks every accumulator cell "never folded" and forgets which symbols went
+// in, without touching allocation. Also forgets the last frame folded, so the
+// frame currently published is folded afresh rather than skipped as seen.
+static void radar_persist_clear_values(opengl_visualizer_t* vis) {
+    if (vis->radar_persist_accum) {
+        const size_t cells = (size_t)vis->radar_persist_period * (size_t)vis->radar_persist_cols;
+        for (size_t i = 0; i < cells; i++) {
+            vis->radar_persist_accum[i] = PERSIST_EMPTY_CELL;
+        }
+    }
+    if (vis->radar_persist_tags) {
+        for (int i = 0; i < RADAR_PERSIST_TAG_SLOTS; i++) {
+            vis->radar_persist_tags[i] = INT_MIN;
+        }
+    }
+    vis->radar_persist_frame_seen = 0;
+    vis->radar_persist_has_folded = 0;
+}
+
+// Sizes the accumulator for frames cols wide, clearing it whenever it has to
+// be (re)allocated. The CFR is always the full resource grid, but keying on
+// the frame width means another output can reuse this later without being
+// folded into an accumulator of the wrong shape. Returns 0 when there is no
+// usable accumulator.
+static int radar_persist_ensure(opengl_visualizer_t* vis, int cols) {
+    if (vis->radar_persist_accum && vis->radar_persist_tags && vis->radar_persist_cols == cols) {
+        return 1;
+    }
+    free(vis->radar_persist_accum);
+    vis->radar_persist_accum = NULL;
+    vis->radar_persist_cols = 0;
+
+    if (vis->radar_persist_period <= 0 || cols <= 0) {
+        return 0;
+    }
+    if (!vis->radar_persist_tags) {
+        vis->radar_persist_tags = (int*)malloc(RADAR_PERSIST_TAG_SLOTS * sizeof(int));
+        if (!vis->radar_persist_tags) {
+            return 0;
+        }
+    }
+    vis->radar_persist_accum =
+        (float*)malloc((size_t)vis->radar_persist_period * (size_t)cols * sizeof(float));
+    if (!vis->radar_persist_accum) {
+        return 0;
+    }
+    vis->radar_persist_cols = cols;
+    radar_persist_clear_values(vis);
+    return 1;
+}
+
+void visualizer_set_radar_persistence_enabled(opengl_visualizer_t* vis, int enabled) {
+    if (!vis) {
+        return;
+    }
+    // Allocation waits for the first frame, which is what says how wide the
+    // accumulator has to be.
+    vis->radar_persist_enabled = enabled ? 1 : 0;
+}
+
+int visualizer_get_radar_persistence_enabled(const opengl_visualizer_t* vis) {
+    return vis ? vis->radar_persist_enabled : 0;
+}
+
+void visualizer_set_radar_persistence_period(opengl_visualizer_t* vis, int period_symbols) {
+    if (!vis) {
+        return;
+    }
+    if (period_symbols < 1) {
+        period_symbols = 1;
+    }
+    if (period_symbols == vis->radar_persist_period) {
+        return;
+    }
+    vis->radar_persist_period = period_symbols;
+    // Dropped rather than resized: every cell's phase changes with the period,
+    // so nothing accumulated so far lands in the right row any more. The next
+    // frame reallocates at the new size and refolds its whole window.
+    free(vis->radar_persist_accum);
+    vis->radar_persist_accum = NULL;
+    vis->radar_persist_cols = 0;
+    radar_persist_clear_values(vis);
+}
+
+int visualizer_get_radar_persistence_period(const opengl_visualizer_t* vis) {
+    return vis ? vis->radar_persist_period : 0;
+}
+
+void visualizer_set_radar_persistence_n(opengl_visualizer_t* vis, int n) {
+    if (!vis) {
+        return;
+    }
+    vis->radar_persist_n = (n < 1) ? 1 : n;
+}
+
+int visualizer_get_radar_persistence_n(const opengl_visualizer_t* vis) {
+    return vis ? vis->radar_persist_n : 0;
+}
+
+void visualizer_reset_radar_persistence(opengl_visualizer_t* vis) {
+    if (!vis) {
+        return;
+    }
+    radar_persist_clear_values(vis);
+}
+
+int visualizer_get_radar_persistence_periods(const opengl_visualizer_t* vis) {
+    if (!vis || !vis->radar_persist_has_folded || vis->radar_persist_period <= 0) {
+        return 0;
+    }
+    const int span = vis->radar_persist_last_symbol - vis->radar_persist_first_symbol;
+    if (span < 0) {
+        return 0;
+    }
+    return (span / vis->radar_persist_period) + 1;
 }
 
 visualizer_view_mode_t visualizer_get_view_mode(const opengl_visualizer_t* vis) {
@@ -718,15 +877,25 @@ visualizer_trigger_edge_t visualizer_get_trigger_edge(const opengl_visualizer_t*
     return vis ? vis->trigger_edge : TRIGGER_EDGE_RISING;
 }
 
+// Whether the reset level is in force. Single mode stops at its first capture
+// and waits for a manual Re-arm, so there is no run of repeated firing for a
+// reset level to steady; the stored choice is kept for Repeat.
+static int trigger_hysteresis_active(const opengl_visualizer_t* vis) {
+    return vis->trigger_hysteresis_enabled && vis->trigger_mode != TRIGGER_SINGLE;
+}
+
 void visualizer_set_trigger_hysteresis_enabled(opengl_visualizer_t* vis, int enabled) {
     if (!vis) {
         return;
+    }
+    if (enabled && vis->trigger_mode == TRIGGER_SINGLE) {
+        return;  // cannot be turned on in Single; see trigger_hysteresis_active
     }
     vis->trigger_hysteresis_enabled = enabled ? 1 : 0;
 }
 
 int visualizer_get_trigger_hysteresis_enabled(const opengl_visualizer_t* vis) {
-    return vis ? vis->trigger_hysteresis_enabled : 0;
+    return vis ? trigger_hysteresis_active(vis) : 0;
 }
 
 void visualizer_set_trigger_reset_level_pct(opengl_visualizer_t* vis, float level_pct) {
@@ -863,6 +1032,22 @@ opengl_visualizer_t* visualizer_create(int width, int height, int texture_height
     vis->persist_has_last_folded = 0;
     vis->persist_has_first_folded = 0;
     vis->persist_accum = NULL;
+
+    vis->radar_persist_enabled = 0;
+    vis->radar_persist_period = RADAR_PERSIST_DEFAULT_PERIOD;
+    vis->radar_persist_n = RADAR_PERSIST_DEFAULT_N;
+    vis->radar_persist_cols = 0;
+    vis->radar_persist_accum = NULL;
+    vis->radar_persist_tags = NULL;
+    vis->radar_persist_has_epoch = 0;
+    vis->radar_persist_frame_seen = 0;
+    vis->radar_persist_has_folded = 0;
+
+    vis->curve_frame_traces = NULL;
+    vis->curve_frame_trace_capacity = 0;
+    vis->curve_frame_trace_count = 0;
+    vis->curve_frame_mean = NULL;
+    vis->curve_frame_has_mean = 0;
 
     vis->view_mode = VIEW_MODE_WATERFALL;
     vis->last_seen_memory = NULL;
@@ -1343,21 +1528,16 @@ int visualizer_get_zoom_total_rows(const opengl_visualizer_t* vis) {
     return vis->tex_height > 0 ? vis->tex_height : 0;
 }
 
-// Draw the Curve view: a 2D plot of magnitude vs. resource-element index for
-// the newest symbol (or, with trailing-trace persistence on, the last N
-// symbols read live from the ring, older ones fading out), plus an optional
-// bold rolling-mean curve. Replaces the heatmap quad draw when view_mode ==
-// VIEW_MODE_CURVE; called from visualizer_update() after glClear.
-static void draw_curve_view(opengl_visualizer_t* vis, const fh_oran_memory_t* memory) {
-    if (!vis || !memory || !memory->symbols) {
-        return;
-    }
-    if (memory->symbol_highest < memory->symbol_lowest) {
+// Gathers what the Curve view draws this frame into curve_frame_*: magnitude
+// vs. resource element for the newest symbol (or, with trailing traces on, the
+// last N symbols read live from the ring), plus the optional rolling-mean
+// line, and the scale they are drawn against. The mean is folded
+// separately, in curve_advance.
+static void curve_build_frame(opengl_visualizer_t* vis, const fh_oran_memory_t* memory) {
+    vis->curve_frame_trace_count = 0;
+    vis->curve_frame_has_mean = 0;
+    if (!memory || !memory->symbols || memory->symbol_highest < memory->symbol_lowest) {
         return;  // no data yet
-    }
-
-    if (vis->curve_mean_enabled) {
-        curve_mean_fold_new_symbols(vis, memory);
     }
 
     int trace_count = vis->curve_trace_enabled ? vis->curve_trace_count : 1;
@@ -1366,6 +1546,23 @@ static void draw_curve_view(opengl_visualizer_t* vis, const fh_oran_memory_t* me
     }
     if (trace_count > CURVE_MAX_TRACES) {
         trace_count = CURVE_MAX_TRACES;
+    }
+    vis->curve_frame_trace_slots = trace_count;
+
+    if (trace_count > vis->curve_frame_trace_capacity) {
+        float* grown = (float*)realloc(vis->curve_frame_traces,
+                                       (size_t)trace_count * HEATMAP_TEXTURE_WIDTH * sizeof(float));
+        if (grown == NULL) {
+            return;
+        }
+        vis->curve_frame_traces = grown;
+        vis->curve_frame_trace_capacity = trace_count;
+    }
+    if (vis->curve_frame_mean == NULL) {
+        vis->curve_frame_mean = (float*)malloc(HEATMAP_TEXTURE_WIDTH * sizeof(float));
+        if (vis->curve_frame_mean == NULL) {
+            return;
+        }
     }
 
     // When trailing and mean are both on, the trail itself is built from the
@@ -1376,74 +1573,63 @@ static void draw_curve_view(opengl_visualizer_t* vis, const fh_oran_memory_t* me
     const int show_single_mean_line = vis->curve_mean_enabled && !vis->curve_trace_enabled && vis->curve_mean_accum != NULL;
     const int mean_period = vis->curve_mean_period > 0 ? vis->curve_mean_period : 1;
 
-    size_t trace_idx[CURVE_MAX_TRACES];             // raw ring rows, when !show_mean_trail
-    const float* trail_mean_rows[CURVE_MAX_TRACES];  // mean accumulator rows, when show_mean_trail
+    float max_magnitude = 1e-9f;
     int resolved = 0;
-
-    if (show_mean_trail) {
-        // Each age steps back through the phase the mean accumulator held at
-        // that point - e.g. age 0 is the current phase, age 1 the previous
-        // symbol's phase, etc. Not bounded by the raw ring, since the mean
-        // accumulator retains state independent of ring depth. In Running
-        // Average mode (period forced to 1) every age maps to the same row,
-        // so the "trail" degenerates to one visible line - expected, since
-        // that mode has no history to show a trail of.
-        for (int age = 0; age < trace_count; age++) {
+    for (int age = 0; age < trace_count; age++) {
+        float* dst = vis->curve_frame_traces + (size_t)resolved * HEATMAP_TEXTURE_WIDTH;
+        if (show_mean_trail) {
+            // Each age steps back through the phase the mean accumulator held at
+            // that point - e.g. age 0 is the current phase, age 1 the previous
+            // symbol's phase, etc. Not bounded by the raw ring, since the mean
+            // accumulator retains state independent of ring depth. In Running
+            // Average mode (period forced to 1) every age maps to the same row,
+            // so the "trail" degenerates to one visible line - expected, since
+            // that mode has no history to show a trail of.
             int phase = (memory->symbol_highest - age) % mean_period;
             if (phase < 0) {
                 phase += mean_period;
             }
-            trail_mean_rows[resolved++] = vis->curve_mean_accum + (size_t)phase * HEATMAP_TEXTURE_WIDTH;
-        }
-    } else {
-        for (int age = 0; age < trace_count; age++) {
+            const float* row = vis->curve_mean_accum + (size_t)phase * HEATMAP_TEXTURE_WIDTH;
+            for (int col = 0; col < HEATMAP_TEXTURE_WIDTH; col++) {
+                dst[col] = (row[col] < 0.0f) ? 0.0f : row[col];  // never-folded sentinel
+            }
+        } else {
             size_t idx;
             if (!ring_row_for_symbol(memory, memory->symbol_highest - age, &idx)) {
                 break;
             }
-            trace_idx[resolved++] = idx;
+            for (int col = 0; col < HEATMAP_TEXTURE_WIDTH; col++) {
+                float i_val, q_val;
+                extract_iq(memory->symbols[idx][col], i_val, q_val);
+                dst[col] = sqrtf(i_val * i_val + q_val * q_val);
+            }
         }
+        for (int col = 0; col < HEATMAP_TEXTURE_WIDTH; col++) {
+            if (dst[col] > max_magnitude) {
+                max_magnitude = dst[col];
+            }
+        }
+        resolved++;
     }
+    vis->curve_frame_trace_count = resolved;
 
-    const float* single_mean_row = NULL;
     if (show_single_mean_line) {
         int phase = memory->symbol_highest % mean_period;
         if (phase < 0) {
             phase += mean_period;
         }
-        single_mean_row = vis->curve_mean_accum + (size_t)phase * HEATMAP_TEXTURE_WIDTH;
+        const float* row = vis->curve_mean_accum + (size_t)phase * HEATMAP_TEXTURE_WIDTH;
+        for (int col = 0; col < HEATMAP_TEXTURE_WIDTH; col++) {
+            vis->curve_frame_mean[col] = (row[col] < 0.0f) ? 0.0f : row[col];
+            if (vis->curve_frame_mean[col] > max_magnitude) {
+                max_magnitude = vis->curve_frame_mean[col];
+            }
+        }
+        vis->curve_frame_has_mean = 1;
     }
 
-    if (resolved == 0 && single_mean_row == NULL) {
+    if (resolved == 0 && !vis->curve_frame_has_mean) {
         return;
-    }
-
-    // Pass 1: max magnitude across everything about to be drawn, for scaling.
-    float max_magnitude = 1e-9f;
-    for (int t = 0; t < resolved; t++) {
-        for (int col = 0; col < HEATMAP_TEXTURE_WIDTH; col++) {
-            float magnitude;
-            if (show_mean_trail) {
-                magnitude = trail_mean_rows[t][col];
-                if (magnitude < 0.0f) {
-                    magnitude = 0.0f;  // never-folded sentinel
-                }
-            } else {
-                float i_val, q_val;
-                extract_iq(memory->symbols[trace_idx[t]][col], i_val, q_val);
-                magnitude = sqrtf(i_val * i_val + q_val * q_val);
-            }
-            if (magnitude > max_magnitude) {
-                max_magnitude = magnitude;
-            }
-        }
-    }
-    if (single_mean_row != NULL) {
-        for (int col = 0; col < HEATMAP_TEXTURE_WIDTH; col++) {
-            if (single_mean_row[col] > max_magnitude) {
-                max_magnitude = single_mean_row[col];
-            }
-        }
     }
 
     // Smooth magnitude scaling, same rise/fall EMA convention as the
@@ -1454,11 +1640,34 @@ static void draw_curve_view(opengl_visualizer_t* vis, const fh_oran_memory_t* me
     } else {
         vis->curve_magnitude_scale_ema = magnitude_scale_step(vis->curve_magnitude_scale_ema, max_magnitude);
     }
-    const float render_scale = (vis->curve_magnitude_scale_ema > 1e-6f) ? vis->curve_magnitude_scale_ema : 1e-6f;
+    vis->curve_frame_scale = (vis->curve_magnitude_scale_ema > 1e-6f) ? vis->curve_magnitude_scale_ema : 1e-6f;
+}
 
-    // Pass 2: draw. glLineWidth persists across frames (unlike blend/texture
-    // enable state, which ImGui's own glPushAttrib/glPopAttrib restores), so
-    // it is set explicitly before every glBegin(GL_LINE_STRIP) call below.
+// Folds new symbols into the Curve view's rolling mean.
+static void curve_advance(opengl_visualizer_t* vis, const fh_oran_memory_t* memory) {
+    if (!memory || !memory->symbols || memory->symbol_highest < memory->symbol_lowest) {
+        return;
+    }
+    if (vis->curve_mean_enabled) {
+        curve_mean_fold_new_symbols(vis, memory);
+    }
+}
+
+// Draws the frame in curve_frame_* as a 2D plot, replacing the heatmap quad
+// when view_mode == VIEW_MODE_CURVE; called from visualizer_update() after
+// glClear.
+static void curve_draw_frame(opengl_visualizer_t* vis) {
+    const int resolved = vis->curve_frame_trace_count;
+    const float* single_mean_row = vis->curve_frame_has_mean ? vis->curve_frame_mean : NULL;
+    if (resolved == 0 && single_mean_row == NULL) {
+        return;
+    }
+    const int trace_count = vis->curve_frame_trace_slots > 0 ? vis->curve_frame_trace_slots : 1;
+    const float render_scale = vis->curve_frame_scale;
+
+    // glLineWidth persists across frames (unlike blend/texture enable state,
+    // which ImGui's own glPushAttrib/glPopAttrib restores), so it is set
+    // explicitly before every glBegin(GL_LINE_STRIP) call below.
     glDisable(GL_TEXTURE_2D);
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
@@ -1532,22 +1741,12 @@ static void draw_curve_view(opengl_visualizer_t* vis, const fh_oran_memory_t* me
             b = TRACE_HUE_B * brightness;
         }
 
+        const float* trace = vis->curve_frame_traces + (size_t)t * HEATMAP_TEXTURE_WIDTH;
         glLineWidth(line_width);
         glColor4f(r, g, b, alpha);
         glBegin(GL_LINE_STRIP);
         for (int col = col_first; col <= col_last; col++) {
-            float magnitude;
-            if (show_mean_trail) {
-                magnitude = trail_mean_rows[t][col];
-                if (magnitude < 0.0f) {
-                    magnitude = 0.0f;  // never-folded sentinel
-                }
-            } else {
-                float i_val, q_val;
-                extract_iq(memory->symbols[trace_idx[t]][col], i_val, q_val);
-                magnitude = sqrtf(i_val * i_val + q_val * q_val);
-            }
-            float norm = magnitude / render_scale;
+            float norm = trace[col] / render_scale;
             if (norm > 1.0f) {
                 norm = 1.0f;
             }
@@ -1562,11 +1761,7 @@ static void draw_curve_view(opengl_visualizer_t* vis, const fh_oran_memory_t* me
         glColor4f(1.00f, 0.85f, 0.25f, 1.0f);
         glBegin(GL_LINE_STRIP);
         for (int col = col_first; col <= col_last; col++) {
-            float magnitude = single_mean_row[col];
-            if (magnitude < 0.0f) {
-                magnitude = 0.0f;  // never-folded sentinel
-            }
-            float norm = magnitude / render_scale;
+            float norm = single_mean_row[col] / render_scale;
             if (norm > 1.0f) {
                 norm = 1.0f;
             }
@@ -1733,7 +1928,7 @@ static void trigger_scan_mean_new_symbols(opengl_visualizer_t* vis, const fh_ora
 
         const float baseline_ref = (vis->trigger_baseline_ema > 1e-6f) ? vis->trigger_baseline_ema : 1e-6f;
         const float fire_threshold = (vis->trigger_level_pct / 100.0f) * baseline_ref;
-        const float reset_threshold = vis->trigger_hysteresis_enabled
+        const float reset_threshold = trigger_hysteresis_active(vis)
                                            ? (vis->trigger_reset_level_pct / 100.0f) * baseline_ref
                                            : fire_threshold;
 
@@ -1921,7 +2116,7 @@ static void trigger_scan_new_symbols(opengl_visualizer_t* vis, const fh_oran_mem
         // (original behavior). With it, a separate, more-conservative level
         // must be cleared first, so a brief dip/spike right at the trigger
         // level doesn't look like a fresh crossing and refire immediately.
-        const float reset_threshold = vis->trigger_hysteresis_enabled
+        const float reset_threshold = trigger_hysteresis_active(vis)
                                            ? (vis->trigger_reset_level_pct / 100.0f) * baseline_ref
                                            : fire_threshold;
 
@@ -2079,10 +2274,12 @@ const char* visualizer_get_marker_reference_label(const opengl_visualizer_t* vis
     if (!vis) {
         return "newest symbol";
     }
-    if (vis->trigger_mode != TRIGGER_OFF && vis->trigger_captured_symbol != TRIGGER_NO_SYMBOL) {
+    // Follows what the last frame drew rather than the live settings, the same
+    // way markers_evaluate picks its reference row.
+    if (vis->axis_trigger_row >= 0) {
         return "trigger point";
     }
-    return vis->persist_enabled ? "last row in period" : "newest symbol";
+    return vis->axis_phase_mode ? "last row in period" : "newest symbol";
 }
 
 void visualizer_set_axes_enabled(opengl_visualizer_t* vis, int enabled) {
@@ -2718,6 +2915,29 @@ static int display_cell_magnitude(const opengl_visualizer_t* vis,
     // lookup is a mutex pair for a handful of cells per frame; the alternative
     // is keeping a second copy of a matrix that can run to tens of megabytes.
     if (vis->axis_radar_mode) {
+        // With the rolling mean on screen, a cell reads back from the
+        // accumulator, not from the live frame underneath it.
+        if (vis->axis_phase_mode) {
+            if (vis->radar_persist_accum == NULL || vis->axis_period <= 0 || re >= vis->radar_persist_cols) {
+                return 0;
+            }
+            int phase = (vis->axis_row0_value + row) % vis->axis_period;
+            if (phase < 0) {
+                phase += vis->axis_period;
+            }
+            // The period can be edited between the frame that published the
+            // axes and this lookup.
+            if (phase >= vis->radar_persist_period) {
+                return 0;
+            }
+            const float value = vis->radar_persist_accum[(size_t)phase * (size_t)vis->radar_persist_cols + re];
+            if (value < 0.0f) {
+                return 0;  // no estimate has reached this cell yet
+            }
+            *out_magnitude = value;
+            return 1;
+        }
+
         if (vis->radar == NULL) {
             return 0;
         }
@@ -2736,8 +2956,7 @@ static int display_cell_magnitude(const opengl_visualizer_t* vis,
         return found;
     }
 
-    const int showing_triggered = vis->trigger_mode != TRIGGER_OFF &&
-                                   vis->trigger_captured_symbol != TRIGGER_NO_SYMBOL;
+    const int showing_triggered = vis->axis_trigger_row >= 0;
 
     if (vis->axis_phase_mode && vis->persist_accum && vis->axis_period > 0) {
         int phase = (vis->axis_row0_value + row) % vis->axis_period;
@@ -2788,12 +3007,9 @@ static void markers_evaluate(opengl_visualizer_t* vis, const fh_oran_memory_t* m
 
     const int rows = vis->axis_rows > 0 ? vis->axis_rows : 1;
     const int columns = vis->axis_x_count > 0 ? vis->axis_x_count : HEATMAP_TEXTURE_WIDTH;
-    const int showing_triggered = vis->trigger_mode != TRIGGER_OFF &&
-                                   vis->trigger_captured_symbol != TRIGGER_NO_SYMBOL &&
-                                   !vis->axis_radar_mode;
-    // Offsets are measured from the trigger row when one is held, otherwise
-    // from the bottom row, which carries the newest symbol.
-    const int reference_row = showing_triggered ? (vis->trigger_capture_depth / 2) : (rows - 1);
+    // Offsets are measured from the trigger row when one is on screen,
+    // otherwise from the bottom row, which carries the newest symbol.
+    const int reference_row = (vis->axis_trigger_row >= 0) ? vis->axis_trigger_row : (rows - 1);
 
     const float baseline = display_baseline(vis);
 
@@ -2835,6 +3051,27 @@ static void markers_evaluate(opengl_visualizer_t* vis, const fh_oran_memory_t* m
             m->percent_of_baseline = (baseline > 0.0f) ? (100.0f * magnitude / baseline) : 0.0f;
         }
     }
+}
+
+// Splits an absolute symbol number into the frame / subframe / slot / symbol
+// position the O-RAN header gives it, for the stream's subcarrier spacing -
+// the same split the vertical axis labels use, so a readout and the axis
+// never disagree. Returns 0 when it cannot: spacing not known yet, or a
+// negative symbol, which the ring's not-yet-filled start can produce.
+static int symbol_timing(int symbol, int scs_khz, visualizer_cursor_sample_t* out) {
+    const int slots_per_subframe = scs_khz / 15;
+    if (slots_per_subframe <= 0 || symbol < 0) {
+        return 0;
+    }
+    const int symbols_per_subframe = slots_per_subframe * SYMBOLS_PER_SLOT;
+    const int symbols_per_frame = symbols_per_subframe * 10;
+    const int in_frame = symbol % symbols_per_frame;
+    out->frame = symbol / symbols_per_frame;
+    out->frame_id = out->frame % 256;
+    out->subframe = in_frame / symbols_per_subframe;
+    out->slot = (in_frame % symbols_per_subframe) / SYMBOLS_PER_SLOT;
+    out->slot_symbol = symbol % SYMBOLS_PER_SLOT;
+    return 1;
 }
 
 int visualizer_sample_at_screen(const opengl_visualizer_t* vis,
@@ -2882,10 +3119,7 @@ int visualizer_sample_at_screen(const opengl_visualizer_t* vis,
 
     // Same reference row markers measure their offsets from, so a cursor
     // reading can be compared with marker offsets directly.
-    const int showing_triggered = vis->trigger_mode != TRIGGER_OFF &&
-                                   vis->trigger_captured_symbol != TRIGGER_NO_SYMBOL &&
-                                   !vis->axis_radar_mode;
-    const int reference_row = showing_triggered ? (vis->trigger_capture_depth / 2) : (rows - 1);
+    const int reference_row = (vis->axis_trigger_row >= 0) ? vis->axis_trigger_row : (rows - 1);
     out_sample->time_offset = row - reference_row;
 
     if (vis->axis_y_unit == AXIS_UNIT_DOPPLER_BIN) {
@@ -2901,6 +3135,7 @@ int visualizer_sample_at_screen(const opengl_visualizer_t* vis,
     } else {
         out_sample->has_symbol = 1;
         out_sample->symbol = vis->axis_row0_value + row;
+        out_sample->has_timing = symbol_timing(out_sample->symbol, memory ? memory->scs_khz : 0, out_sample);
     }
 
     float magnitude = 0.0f;
@@ -2914,10 +3149,13 @@ int visualizer_sample_at_screen(const opengl_visualizer_t* vis,
     return 1;
 }
 
-// Update heatmap texture with IQ data from ring buffer (or, in persistence
-// mode, from the rolling-mean accumulator).
-static void update_heatmap_texture(opengl_visualizer_t* vis, const fh_oran_memory_t* memory) {
-    if (!vis || !vis->texture_data || !memory || !memory->symbols) {
+// The waterfall's state that has to advance before a frame is drawn: folding
+// new symbols into the rolling mean, and the trigger -
+// scanning for crossings, locking rows into a capture, and completing it once
+// its post-trigger half has arrived. Runs before the texture is built, so a
+// crossing detected this very frame is already reflected in what is drawn.
+static void advance_waterfall_state(opengl_visualizer_t* vis, const fh_oran_memory_t* memory) {
+    if (!memory || !memory->symbols) {
         return;
     }
 
@@ -2926,11 +3164,54 @@ static void update_heatmap_texture(opengl_visualizer_t* vis, const fh_oran_memor
         if (vis->trigger_mode != TRIGGER_OFF) {
             trigger_scan_mean_new_symbols(vis, memory);
         }
-    } else if (vis->trigger_mode != TRIGGER_OFF) {
-        // Scanned here (before sizing) so that a crossing detected this very
-        // frame is already reflected in trigger_captured_symbol below.
-        trigger_scan_new_symbols(vis, memory);
-        trigger_snapshot_capture_new_rows(vis, memory);
+        return;
+    }
+    if (vis->trigger_mode == TRIGGER_OFF) {
+        return;
+    }
+
+    trigger_scan_new_symbols(vis, memory);
+    trigger_snapshot_capture_new_rows(vis, memory);
+
+    // Completion check: has an active capture's post-trigger half now fully
+    // arrived (i.e. is the bottom of the centered window available)?
+    int trigger_half_height = vis->trigger_capture_depth / 2;
+    if (vis->trigger_capture_active) {
+        if (vis->trigger_captured_symbol + trigger_half_height <= memory->symbol_highest) {
+            vis->trigger_capture_active = 0;
+            if (vis->trigger_mode == TRIGGER_SINGLE) {
+                vis->trigger_single_done = 1;
+            }
+
+            int pre_valid = 0, post_valid = 0;
+            if (vis->trigger_snapshot_symbol) {
+                for (int row = 0; row < trigger_half_height; row++) {
+                    if (vis->trigger_snapshot_symbol[row] != TRIGGER_NO_SYMBOL) {
+                        pre_valid++;
+                    }
+                }
+                for (int row = trigger_half_height; row < vis->trigger_capture_depth; row++) {
+                    if (vis->trigger_snapshot_symbol[row] != TRIGGER_NO_SYMBOL) {
+                        post_valid++;
+                    }
+                }
+            }
+            fprintf(stderr,
+                    "[trigger] COMPLETE captured=%d capture_depth=%d symbol_lowest=%d symbol_highest=%d "
+                    "pre_valid=%d/%d post_valid=%d/%d (permanent snapshot)\n",
+                    vis->trigger_captured_symbol, vis->trigger_capture_depth, memory->symbol_lowest,
+                    memory->symbol_highest, pre_valid, trigger_half_height, post_valid,
+                    vis->trigger_capture_depth - trigger_half_height);
+        }
+    }
+}
+
+// Update heatmap texture with IQ data from ring buffer (or, in persistence
+// mode, from the rolling-mean accumulator). Only draws: the state it draws
+// from is brought up to date by advance_waterfall_state.
+static void render_heatmap_texture(opengl_visualizer_t* vis, const fh_oran_memory_t* memory) {
+    if (!vis || !vis->texture_data || !memory || !memory->symbols) {
+        return;
     }
 
     // Render only a sliding window of the most recent symbols (raw mode), or
@@ -2999,6 +3280,7 @@ static void update_heatmap_texture(opengl_visualizer_t* vis, const fh_oran_memor
         vis->axis_rows = vis->tex_height;
         vis->axis_phase_mode = 1;
         vis->axis_period = period;
+        vis->axis_trigger_row = mean_triggered ? (vis->trigger_capture_depth / 2) : -1;
 
         int display_height;
         int phase_offset = 0;
@@ -3075,42 +3357,6 @@ static void update_heatmap_texture(opengl_visualizer_t* vis, const fh_oran_memor
 
         #undef PERSIST_ROW_PHASE
     } else {
-        // Trigger completion check: has an active capture's post-trigger
-        // half now fully arrived (i.e. is the bottom of the centered window
-        // available)? Uses tex_height *after* the resize above, so
-        // half_height reflects trigger_capture_depth, not the live view's
-        // memory-size-tied height. The crossing scan itself already ran
-        // earlier, before sizing.
-        int trigger_half_height = vis->trigger_capture_depth / 2;
-        if (vis->trigger_mode != TRIGGER_OFF && vis->trigger_capture_active) {
-            if (vis->trigger_captured_symbol + trigger_half_height <= memory->symbol_highest) {
-                vis->trigger_capture_active = 0;
-                if (vis->trigger_mode == TRIGGER_SINGLE) {
-                    vis->trigger_single_done = 1;
-                }
-
-                int pre_valid = 0, post_valid = 0;
-                if (vis->trigger_snapshot_symbol) {
-                    for (int row = 0; row < trigger_half_height; row++) {
-                        if (vis->trigger_snapshot_symbol[row] != TRIGGER_NO_SYMBOL) {
-                            pre_valid++;
-                        }
-                    }
-                    for (int row = trigger_half_height; row < vis->trigger_capture_depth; row++) {
-                        if (vis->trigger_snapshot_symbol[row] != TRIGGER_NO_SYMBOL) {
-                            post_valid++;
-                        }
-                    }
-                }
-                fprintf(stderr,
-                        "[trigger] COMPLETE captured=%d capture_depth=%d symbol_lowest=%d symbol_highest=%d "
-                        "pre_valid=%d/%d post_valid=%d/%d (permanent snapshot)\n",
-                        vis->trigger_captured_symbol, vis->trigger_capture_depth, memory->symbol_lowest,
-                        memory->symbol_highest, pre_valid, trigger_half_height, post_valid,
-                        vis->trigger_capture_depth - trigger_half_height);
-            }
-        }
-
         int showing_triggered = (vis->trigger_mode != TRIGGER_OFF && vis->trigger_captured_symbol != TRIGGER_NO_SYMBOL);
 
         int symbol_count = memory->symbol_highest - memory->symbol_lowest + 1;
@@ -3119,6 +3365,7 @@ static void update_heatmap_texture(opengl_visualizer_t* vis, const fh_oran_memor
         axis_publish_defaults(vis);
         vis->axis_valid = 1;
         vis->axis_rows = vis->tex_height;
+        vis->axis_trigger_row = showing_triggered ? (vis->trigger_capture_depth / 2) : -1;
         // A triggered window is centred on the captured symbol; the live view
         // scrolls with the newest symbol pinned to the bottom row.
         vis->axis_row0_value = showing_triggered
@@ -3235,17 +3482,126 @@ static void update_heatmap_texture(opengl_visualizer_t* vis, const fh_oran_memor
         }
     }
 
-    markers_evaluate(vis, memory);
-
     // Upload texture to GPU
     glBindTexture(GL_TEXTURE_2D, vis->texture_id);
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, vis->tex_width, vis->tex_height, GL_RGBA, GL_UNSIGNED_BYTE, vis->texture_data);
 }
 
+// Folds every symbol row of a published CFR frame that has not been folded
+// yet, keyed by phase = symbol % period like the waterfall mean. A row is only
+// tagged once it contributed at least one estimate, so a symbol whose uplink
+// had not arrived when the pass ran is picked up by a later frame rather than
+// lost. A symbol caught half-written - some sections of either direction still
+// in flight - folds the resource elements it has; the missing ones read zero
+// and are skipped like any unoccupied cell, so a partial row costs a few
+// samples but never pulls the mean down.
+static void radar_persist_fold_frame(opengl_visualizer_t* vis,
+                                     const float* frame,
+                                     int rows,
+                                     int cols,
+                                     const fh_radar_stats_t* stats) {
+    if (vis->radar_persist_frame_seen && vis->radar_persist_last_refresh == stats->refresh_count) {
+        return;  // already folded; the render loop outpaces the worker
+    }
+
+    if (!stats->window_first_valid || rows <= 0 || cols <= 0) {
+        return;
+    }
+    if (!radar_persist_ensure(vis, cols)) {
+        return;
+    }
+    vis->radar_persist_frame_seen = 1;
+    vis->radar_persist_last_refresh = stats->refresh_count;
+
+    const int period = vis->radar_persist_period;
+    const float alpha = 1.0f / (float)vis->radar_persist_n;
+    // Only the newest RADAR_PERSIST_TAG_SLOTS rows can be told apart by their
+    // tags. The radar's own window limit keeps every frame inside that; this
+    // just makes the assumption safe rather than silent.
+    const int first_row = (rows > RADAR_PERSIST_TAG_SLOTS) ? rows - RADAR_PERSIST_TAG_SLOTS : 0;
+
+    for (int row = first_row; row < rows; row++) {
+        const int symbol = stats->window_first_symbol + row;
+        int slot = symbol % RADAR_PERSIST_TAG_SLOTS;
+        if (slot < 0) {
+            slot += RADAR_PERSIST_TAG_SLOTS;
+        }
+        if (vis->radar_persist_tags[slot] == symbol) {
+            continue;
+        }
+
+        int phase = symbol % period;
+        if (phase < 0) {
+            phase += period;
+        }
+        float* accum_row = vis->radar_persist_accum + (size_t)phase * (size_t)cols;
+        const float* src = frame + (size_t)row * (size_t)cols;
+
+        int folded = 0;
+        for (int col = 0; col < cols; col++) {
+            const float value = src[col];
+            // Written so a NaN fails it too, not just zero.
+            if (!(value > 0.0f)) {
+                continue;
+            }
+            if (accum_row[col] < 0.0f) {
+                accum_row[col] = value;  // first estimate ever seen at this phase
+            } else {
+                accum_row[col] += (value - accum_row[col]) * alpha;
+            }
+            folded = 1;
+        }
+        if (!folded) {
+            continue;  // unpaired so far; a later frame may still pair it
+        }
+
+        vis->radar_persist_tags[slot] = symbol;
+        if (!vis->radar_persist_has_folded) {
+            vis->radar_persist_first_symbol = symbol;
+            vis->radar_persist_last_symbol = symbol;
+            vis->radar_persist_has_folded = 1;
+        } else {
+            if (symbol < vis->radar_persist_first_symbol) {
+                vis->radar_persist_first_symbol = symbol;
+            }
+            if (symbol > vis->radar_persist_last_symbol) {
+                vis->radar_persist_last_symbol = symbol;
+            }
+        }
+    }
+}
+
+// Brings the radar rolling mean up to date with a borrowed frame; the frame
+// and its stats must describe the same pass.
+static void radar_persist_take_frame(opengl_visualizer_t* vis,
+                                     const float* frame,
+                                     int rows,
+                                     int cols,
+                                     const fh_radar_stats_t* stats) {
+    // A different pair, a reset, or a change to what the cells measure: nothing
+    // averaged so far describes the frames arriving now. Checked on every
+    // frame, not only the ones that get folded, so switching output back to
+    // CFR after such a change never shows the old mean for the pass it takes a
+    // CFR frame to arrive.
+    if (!vis->radar_persist_has_epoch || vis->radar_persist_epoch != stats->epoch) {
+        radar_persist_clear_values(vis);
+        vis->radar_persist_epoch = stats->epoch;
+        vis->radar_persist_has_epoch = 1;
+    }
+
+    // Folding goes by the output the frame was computed for, drawing by the one
+    // selected now. Right after switching output the two differ for a pass,
+    // and a frame of another output must never be folded into the CFR mean.
+    if (vis->radar_persist_enabled && stats->output == RADAR_OUT_CFR) {
+        radar_persist_fold_frame(vis, frame, rows, cols, stats);
+    }
+}
+
 // Build the texture from the radar core's most recent finished frame. Unlike
 // the waterfall this reads no symbol ring at all: the radar worker has already
 // reduced two rings to one magnitude matrix, and the render thread only borrows
-// it for as long as the copy takes.
+// it for as long as the copy takes. With the rolling mean on, the frame is
+// folded into the accumulator and the accumulator is drawn instead.
 //
 // Returns 1 when a frame was drawn, 0 when the radar has nothing yet - the
 // caller distinguishes "no data" from "no radar" for the on-screen notice.
@@ -3316,12 +3672,36 @@ static int update_radar_texture(opengl_visualizer_t* vis) {
         return 0;
     }
 
+    // Read while the frame is still borrowed: the worker cannot publish in the
+    // meantime, so these describe exactly the frame in hand.
+    fh_radar_stats_t stats;
+    fh_radar_get_stats(vis->radar, &stats);
+
+    radar_persist_take_frame(vis, result, rows, cols, &stats);
+    const int show_mean = vis->radar_persist_enabled && rcfg.output == RADAR_OUT_CFR;
+
+    // What goes on screen: the live frame, or the accumulator. The accumulator
+    // is the visualizer's own memory, so the frame can go back to the worker
+    // straight away instead of being held through the copy below.
+    const float* source = result;
+    int source_rows = rows;
+    int source_cols = cols;
+    if (show_mean) {
+        fh_radar_release_result(vis->radar);
+        if (vis->radar_persist_accum == NULL || vis->radar_persist_cols <= 0) {
+            return 0;
+        }
+        source = vis->radar_persist_accum;
+        source_rows = vis->radar_persist_period;
+        source_cols = vis->radar_persist_cols;
+    }
+
     // The cell counts come from the published frame, never from the config the
     // axes were described with. The two can briefly disagree - the worker may
     // still be finishing a pass under the previous settings - and letting the
     // axis claim a size the pixels do not have is how a plot starts lying.
-    int desired_width = cols;
-    int desired_height = rows;
+    int desired_width = source_cols;
+    int desired_height = source_rows;
     const int cap = vis->tex_max_height > 0 ? vis->tex_max_height : 4096;
     if (desired_height > cap) {
         desired_height = cap;
@@ -3340,7 +3720,9 @@ static int update_radar_texture(opengl_visualizer_t* vis) {
     }
 
     if (vis->texture_data == NULL) {
-        fh_radar_release_result(vis->radar);
+        if (!show_mean) {
+            fh_radar_release_result(vis->radar);
+        }
         return 0;
     }
 
@@ -3352,7 +3734,7 @@ static int update_radar_texture(opengl_visualizer_t* vis) {
     double mean_sum = 0.0;
     uint64_t mean_count = 0;
     for (int row = 0; row < vis->tex_height; row++) {
-        const float* src = result + (size_t)row * cols;
+        const float* src = source + (size_t)row * source_cols;
         for (int col = 0; col < vis->tex_width; col++) {
             const float v = src[col];
             if (v > max_magnitude) {
@@ -3378,13 +3760,19 @@ static int update_radar_texture(opengl_visualizer_t* vis) {
     }
     const float render_scale = (vis->magnitude_scale_ema > 1e-6f) ? vis->magnitude_scale_ema : 1e-6f;
 
-    // Row 0 is the oldest symbol in the window, which is the waterfall's
-    // top-to-bottom time order, so rows map straight across.
+    // Live, row 0 is the oldest symbol in the window, which is the waterfall's
+    // top-to-bottom time order, so rows map straight across. The mean runs
+    // phase 0 downward through the period, like the untriggered waterfall mean.
     for (int row = 0; row < vis->tex_height; row++) {
-        const float* src = result + (size_t)row * cols;
+        const float* src = source + (size_t)row * source_cols;
         for (int col = 0; col < vis->tex_width; col++) {
-            uint8_t r, g, b;
-            magnitude_to_rgb(src[col], render_scale, &r, &g, &b);
+            // Only the accumulator holds negatives: cells no estimate ever
+            // reached. Black, as in the waterfall mean, so they cannot be
+            // mistaken for a measured |H| near zero at the bottom of the scale.
+            uint8_t r = 0, g = 0, b = 0;
+            if (src[col] >= 0.0f) {
+                magnitude_to_rgb(src[col], render_scale, &r, &g, &b);
+            }
 
             const size_t pixel_idx = ((size_t)row * vis->tex_width + col) * 4;
             vis->texture_data[pixel_idx + 0] = r;
@@ -3394,14 +3782,22 @@ static int update_radar_texture(opengl_visualizer_t* vis) {
         }
     }
 
-    fh_radar_stats_t stats;
-    fh_radar_get_stats(vis->radar, &stats);
-    fh_radar_release_result(vis->radar);
+    if (!show_mean) {
+        fh_radar_release_result(vis->radar);
+    }
 
     vis->axis_valid = 1;
     vis->axis_rows = vis->tex_height;
     vis->axis_x_count = vis->tex_width;
-    vis->axis_row0_value = stats.window_first_valid ? stats.window_first_symbol : 0;
+    if (show_mean) {
+        // Rows are phases, so ticks, markers and the cursor readout all switch
+        // to the offset-in-period reading the waterfall mean uses.
+        vis->axis_phase_mode = 1;
+        vis->axis_period = vis->radar_persist_period;
+        vis->axis_row0_value = 0;
+    } else {
+        vis->axis_row0_value = stats.window_first_valid ? stats.window_first_symbol : 0;
+    }
 
     glBindTexture(GL_TEXTURE_2D, vis->texture_id);
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, vis->tex_width, vis->tex_height, GL_RGBA, GL_UNSIGNED_BYTE, vis->texture_data);
@@ -3505,7 +3901,9 @@ int visualizer_update(opengl_visualizer_t* vis, const fh_oran_memory_t* memory) 
     // view mode is added, which is how the radar mode was found to need one.
     switch (vis->view_mode) {
     case VIEW_MODE_CURVE:
-        draw_curve_view(vis, memory);
+        curve_advance(vis, memory);
+        curve_build_frame(vis, memory);
+        curve_draw_frame(vis);
         // Clears any marker readouts left over from the waterfall, which has
         // no counterpart here.
         markers_evaluate(vis, memory);
@@ -3523,14 +3921,15 @@ int visualizer_update(opengl_visualizer_t* vis, const fh_oran_memory_t* memory) 
 
     case VIEW_MODE_WATERFALL:
     case VIEW_MODE_COUNT: {
-        // Update texture from memory
-        update_heatmap_texture(vis, memory);
+        advance_waterfall_state(vis, memory);
+        render_heatmap_texture(vis, memory);
 
         // Re-clamp now that the row count for this frame is settled. The
         // vertical minimum is a row count, so a window that was legal at one
         // extent can be too narrow after Memory size, the averaging period or a
         // trigger capture changes it - and nothing else would notice.
         zoom_normalize(vis);
+        markers_evaluate(vis, memory);
 
         // Zooming the waterfall is exactly a narrowing of the texture
         // coordinates: the same quad fills the same plot rect, sampling a
@@ -3541,11 +3940,12 @@ int visualizer_update(opengl_visualizer_t* vis, const fh_oran_memory_t* memory) 
         // Trigger line: marks the row carrying the captured symbol once a
         // capture has fired. Drawn in screen space (like the curve view's
         // lines) so it stays crisp regardless of the texture's row height.
-        if (vis->trigger_mode != TRIGGER_OFF && vis->trigger_captured_symbol != TRIGGER_NO_SYMBOL) {
+        // Goes by the row published with the frame on screen.
+        if (vis->axis_trigger_row >= 0) {
             float plot_x = 0.0f, plot_y = 0.0f, plot_w = 1.0f, plot_h = 1.0f;
             visualizer_get_plot_rect(vis, &plot_x, &plot_y, &plot_w, &plot_h);
             const int rows = vis->tex_height > 0 ? vis->tex_height : 1;
-            const int centre_row = vis->trigger_capture_depth / 2;
+            const int centre_row = vis->axis_trigger_row;
             const float row_norm = ((float)centre_row + 0.5f) / (float)rows;
             const float line_y = zoom_y_to_px(vis, row_norm, plot_y, plot_h);
             // Zooming can put the trigger row outside the window; drawing it
@@ -3608,6 +4008,10 @@ void visualizer_destroy(opengl_visualizer_t* vis) {
     if (vis->curve_mean_accum) {
         free(vis->curve_mean_accum);
     }
+    free(vis->radar_persist_accum);
+    free(vis->radar_persist_tags);
+    free(vis->curve_frame_traces);
+    free(vis->curve_frame_mean);
     if (vis->trigger_snapshot_symbol) {
         free(vis->trigger_snapshot_symbol);
     }

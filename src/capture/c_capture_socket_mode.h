@@ -21,6 +21,10 @@ typedef struct fh_capture_socket_options {
     int stall_timeout_ms;
     // Optional eAxC / direction filter, applied before packets reach the queue.
     fh_channel_filter_t filter;
+    // Optional running selection on top of the filter; see
+    // fh_channel_selection_pack. Read with __atomic_load_n, so write it with
+    // __atomic_store_n. NULL, or a word of 0, decodes every channel.
+    const uint64_t* live_selection;
 } fh_capture_socket_options_t;
 
 typedef int (*fh_packet_callback_t)(const fh_packet_t* pkt, void* user_ctx);

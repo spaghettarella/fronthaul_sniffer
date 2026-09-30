@@ -25,12 +25,13 @@ typedef struct fh_oran_memory {
     int index_symbol_highest;
     size_t max_symbols;
     uint64_t frame_counter;  // Continuous frame counter (tracks wraparounds of 8-bit frame_id)
-    uint8_t last_frame_id;   // Previous frame_id; used to detect wraparound
+    uint8_t last_frame_id;   // Newest frame_id seen; late sections never move it back
+    int frame_id_seen;       // Whether last_frame_id holds a real frame yet
     int scs_khz;             // Subcarrier spacing this stream was last saved with. Recorded per
                              // stream because the PHY tap can override it from each record's
                              // numerology; consumers need it to map symbol numbers back to
                              // frame/subframe/slot positions. 0 until the first save.
-    int64_t replay_symbol_offset;  // Per-stream offset added on each pcap replay loop
+    int64_t replay_symbol_offset;  // Offset added on each pcap replay loop; the same for every stream
     int loop_first_symbol;         // First raw symbol number seen in the current replay loop
     int loop_last_symbol;          // Last raw symbol number seen in the current replay loop
 } fh_oran_memory_t;
@@ -46,7 +47,13 @@ void fh_oran_memory_destroy(fh_oran_memory_t* mem);
 
 int fh_oran_memory_save(fh_oran_memory_t* mem, const fh_decoded_packet_t* pkt, int scs_khz);
 int fh_oran_memory_wipe(fh_oran_memory_t* mem);
-void fh_oran_memory_advance_loop(fh_oran_memory_t* mem);
+// Moves a stream on to the next pass of a looped replay: shifts its numbering by
+// loop_span symbols and restarts its per-pass tracking. loop_span has to be the
+// span of the whole pass across every stream, not this stream's own, and the
+// same for all of them - streams cover different parts of a capture (DL and UL
+// occupy different slots), so per-stream spans would move them apart by the
+// difference on every pass, and DL/UL pairing along with them.
+void fh_oran_memory_advance_loop(fh_oran_memory_t* mem, int64_t loop_span);
 
 fh_oran_memory_stats_t fh_oran_memory_stats(const fh_oran_memory_t* mem);
 
