@@ -7,10 +7,15 @@
 #include <string>
 #include <vector>
 
+// Ceiling on decode workers and radar FFT threads together. Leaves the render,
+// capture and radar worker threads cores of their own on a 24-thread machine.
+// Applied to both entry paths: the startup screen and the command line.
+#define FH_MAX_DECODE_FFT_THREADS 20
+
 struct fh_startup_config_t {
-    std::string iface = "lo";
-    std::string demo_pcap_path = "../src/capture/demo.pcap";
-    int demo_pcap_speed = 25;
+    std::string iface = "pcap";
+    std::string demo_pcap_path = "../src/capture/ofdm_radar_test.pcap";
+    int demo_pcap_speed = 25000;
     bool demo_pcap_loop = true;
     std::string ocudu_phy_tap_queue_name = "/ocudu_phy_tap_queue";
     int snaplen = 10000;

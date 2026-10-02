@@ -130,7 +130,7 @@ void on_signal(int) {
 void print_usage(const char* argv0) {
     std::cout
         << "Usage: " << argv0 << " [options]\n"
-        << "  --iface <name>                        Interface name (default: lo)\n"
+        << "  --iface <name>                        Interface name, or pcap to replay a file (default: pcap)\n"
         << "  --channel <eAxC_ID> <data_direction>  eAxC_ID (uint16) and data direction (UL/DL) to filter network capture before queue\n"
         << "  --channel-whitelist <eAxC_ID[:UL|:DL]>...\n"
         << "                                        Keep only the listed channels (hex eAxC_IDs); a channel without\n"
@@ -144,6 +144,7 @@ void print_usage(const char* argv0) {
         << "  --pcap-loop <bool>                    Loop demo pcap playback (default: true)\n"
         << "  --decode-threads <count>              Number of parallel decode worker threads (default: 8)\n"
         << "  --fft-threads <count>                 Threads for the radar transforms (default: 4)\n"
+        << "  (NOTE) --decode-threads plus --fft-threads must not exceed " << FH_MAX_DECODE_FFT_THREADS << "\n"
         << "  --memory-size <symbols>               Max symbols buffered per eAxC_ID and Direction (max: 573440; default: 1120)\n"
         << "  --ud-comp-hdr-present <bool>          Whether user data compression header is present (default: false)\n"
         << "  --ud-iq-width <bits>                  Width of user data IQ samples (default: 9)\n"
@@ -157,6 +158,7 @@ void print_usage(const char* argv0) {
         << "                                         numerology; has no effect on other capture backends (default: true)\n"
         << "  --ocudu-phy-tap-queue-name <name>     Shared-memory queue name for ocudu phy tap (default: /ocudu_phy_tap_queue)\n"
         << "  --demo-pcap <path> <speed>            Stream packets from a pcap file in <path> (instead of live capture) with <speed> packets per second\n"
+        << "                                         (default: ../src/capture/ofdm_radar_test.pcap at 25000)\n"
         << "  --help, -h                            Show this help message\n";
 }
 
@@ -261,7 +263,7 @@ int fh_memory_manage(
 
 int main(int argc, char** argv) {
     fh_capture_socket_options_t capture_options{};
-    std::string iface = "lo";
+    std::string iface = "pcap";
     capture_options.interface_name = iface.c_str();
     capture_options.snaplen = 20000;
     capture_options.stall_timeout_ms = 0;  // never give up unless asked to
@@ -281,8 +283,8 @@ int main(int argc, char** argv) {
     int scs_khz = 30;
     bool phy_tap_scs_override = true;
     bool demo_pcap_enabled = false;
-    std::string demo_pcap_path = "../src/capture/demo.pcap";
-    int demo_pcap_speed = 25;
+    std::string demo_pcap_path = "../src/capture/ofdm_radar_test.pcap";
+    int demo_pcap_speed = 25000;
     bool demo_pcap_loop = true;
     std::string ocudu_phy_tap_queue_name = "/ocudu_phy_tap_queue";
 
@@ -474,6 +476,13 @@ int main(int argc, char** argv) {
     // once has no one meaning to settle on.
     if (channel_filter_method == FH_CHANNEL_FILTER_WHITELIST && (channel_has_eaxc || channel_has_direction)) {
         std::cerr << "--channel and --channel-whitelist cannot be combined\n";
+        return 1;
+    }
+
+    // Both counts share one thread budget; see FH_MAX_DECODE_FFT_THREADS.
+    if (decode_threads + fft_threads > static_cast<std::size_t>(FH_MAX_DECODE_FFT_THREADS)) {
+        std::cerr << "--decode-threads + --fft-threads must not exceed " << FH_MAX_DECODE_FFT_THREADS
+                  << " (got " << decode_threads << " + " << fft_threads << ")\n";
         return 1;
     }
 
@@ -729,6 +738,16 @@ int main(int argc, char** argv) {
             fft_threads = static_cast<std::size_t>(startup_config.fft_threads);
             if (fft_threads < 1) {
                 fft_threads = 1;
+            }
+            // The startup widgets already hold the shared budget; this only
+            // keeps it whatever path the values took. FFT threads give way
+            // first, since decode is what keeps up with the packet rate.
+            const std::size_t thread_budget = static_cast<std::size_t>(FH_MAX_DECODE_FFT_THREADS);
+            if (decode_threads > thread_budget - 1) {
+                decode_threads = thread_budget - 1;
+            }
+            if (decode_threads + fft_threads > thread_budget) {
+                fft_threads = thread_budget - decode_threads;
             }
             memory_symbols = static_cast<std::size_t>(startup_config.memory_symbols);
             ud_comp_hdr_present = startup_config.ud_comp_hdr_present;
@@ -1070,6 +1089,8 @@ int main(int argc, char** argv) {
                     // Only stores the pointers; the radar worker notices a
                     // changed pair itself and drops its accumulated frame.
                     fh_radar_submit(radar, radar_dl, radar_ul);
+                    // The transforms only run while their output is on screen.
+                    fh_radar_set_active(radar, visualizer_get_view_mode(visualizer) == VIEW_MODE_RADAR);
 
                     // The view's Freeze, applied to the decode workers. Flipped
                     // under the data lock, so a save in progress finishes first

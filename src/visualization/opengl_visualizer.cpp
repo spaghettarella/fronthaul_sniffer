@@ -217,6 +217,10 @@ typedef struct opengl_visualizer {
     int axis_valid;
     int axis_rows;         // texture rows spanning the plot height
     int axis_phase_mode;   // rows are phases within the averaging period, not absolute symbols
+    // The radar view is drawing this visualizer's own CFR mean, so a cell reads
+    // back from radar_persist_accum. The radar core's Range-Time mean has
+    // phase rows too, but those live in the published frame itself.
+    int axis_radar_own_mean;
     int axis_curve_mode;   // rows are magnitude, not time
     int axis_row0_value;   // absolute symbol (or phase) shown by row 0
     int axis_period;       // averaging period, phase mode only
@@ -270,6 +274,7 @@ static void error_callback(int error, const char* description) {
 // and nothing carries over from the previous frame's view.
 static void axis_publish_defaults(opengl_visualizer_t* vis) {
     vis->axis_phase_mode = 0;
+    vis->axis_radar_own_mean = 0;
     vis->axis_curve_mode = 0;
     vis->axis_radar_mode = 0;
     vis->axis_period = 0;
@@ -2915,9 +2920,9 @@ static int display_cell_magnitude(const opengl_visualizer_t* vis,
     // lookup is a mutex pair for a handful of cells per frame; the alternative
     // is keeping a second copy of a matrix that can run to tens of megabytes.
     if (vis->axis_radar_mode) {
-        // With the rolling mean on screen, a cell reads back from the
+        // With the CFR rolling mean on screen, a cell reads back from the
         // accumulator, not from the live frame underneath it.
-        if (vis->axis_phase_mode) {
+        if (vis->axis_radar_own_mean) {
             if (vis->radar_persist_accum == NULL || vis->axis_period <= 0 || re >= vis->radar_persist_cols) {
                 return 0;
             }
@@ -3632,7 +3637,8 @@ static int update_radar_texture(opengl_visualizer_t* vis) {
     case RADAR_OUT_RANGE_TIME:
         vis->axis_x_unit = AXIS_UNIT_DELAY_TAP;
         vis->axis_x_count = rcfg.ifft_size;
-        vis->axis_value_label = "|CIR|";
+        // dB cells are offsets above the floor, not levels, and say so.
+        vis->axis_value_label = rcfg.db_scale ? "dB above floor" : "|CIR|";
         if (subcarrier_hz > 0.0) {
             vis->axis_x_unit_scale =
                 (float)(299792458.0 / (2.0 * (double)rcfg.ifft_size * subcarrier_hz));
@@ -3642,7 +3648,7 @@ static int update_radar_texture(opengl_visualizer_t* vis) {
     case RADAR_OUT_RANGE_DOPPLER:
         vis->axis_x_unit = AXIS_UNIT_DELAY_TAP;
         vis->axis_x_count = rcfg.cir_depth_taps;
-        vis->axis_value_label = "|RD|";
+        vis->axis_value_label = rcfg.db_scale ? "dB above floor" : "|RD|";
         if (subcarrier_hz > 0.0) {
             vis->axis_x_unit_scale =
                 (float)(299792458.0 / (2.0 * (double)rcfg.ifft_size * subcarrier_hz));
@@ -3652,12 +3658,9 @@ static int update_radar_texture(opengl_visualizer_t* vis) {
         // rather than scrolling with arriving symbols.
         vis->axis_y_unit = AXIS_UNIT_DOPPLER_BIN;
         vis->axis_y_scrolling = 0;
-        if (scs_khz > 0 && rcfg.time_symbols > 0) {
-            // A slot is 14 symbols and 1 ms / (scs / 15 kHz); one Doppler bin
-            // is the reciprocal of the whole interval's duration.
-            const double symbol_s = 0.001 / ((double)scs_khz / 15.0) / 14.0;
-            vis->axis_y_unit_scale = (float)(1.0 / ((double)rcfg.time_symbols * symbol_s));
-        }
+        // The bin width is set once the frame is in hand: it depends on how
+        // many symbols the worker actually used, which the ring's depth can
+        // hold below the configured window.
         break;
     }
 
@@ -3676,6 +3679,14 @@ static int update_radar_texture(opengl_visualizer_t* vis) {
     // meantime, so these describe exactly the frame in hand.
     fh_radar_stats_t stats;
     fh_radar_get_stats(vis->radar, &stats);
+
+    if (rcfg.output == RADAR_OUT_RANGE_DOPPLER && scs_khz > 0) {
+        // A slot is 14 symbols and 1 ms / (scs / 15 kHz); one Doppler bin is
+        // the reciprocal of the whole interval's duration, and the interval
+        // is one symbol per row.
+        const double symbol_s = 0.001 / ((double)scs_khz / 15.0) / 14.0;
+        vis->axis_y_unit_scale = (float)(1.0 / ((double)rows * symbol_s));
+    }
 
     radar_persist_take_frame(vis, result, rows, cols, &stats);
     const int show_mean = vis->radar_persist_enabled && rcfg.output == RADAR_OUT_CFR;
@@ -3793,7 +3804,14 @@ static int update_radar_texture(opengl_visualizer_t* vis) {
         // Rows are phases, so ticks, markers and the cursor readout all switch
         // to the offset-in-period reading the waterfall mean uses.
         vis->axis_phase_mode = 1;
+        vis->axis_radar_own_mean = 1;
         vis->axis_period = vis->radar_persist_period;
+        vis->axis_row0_value = 0;
+    } else if (stats.persist_phase_rows && stats.persist_period > 0) {
+        // The radar core's Range-Time mean: the same phase reading, but the
+        // frame itself is the accumulator.
+        vis->axis_phase_mode = 1;
+        vis->axis_period = stats.persist_period;
         vis->axis_row0_value = 0;
     } else {
         vis->axis_row0_value = stats.window_first_valid ? stats.window_first_symbol : 0;

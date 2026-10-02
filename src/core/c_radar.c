@@ -1,4 +1,5 @@
 #include "c_radar.h"
+#include "c_radar_dsp.h"
 
 #include <fftw3.h>
 #include <math.h>
@@ -8,16 +9,24 @@
 #include <time.h>
 
 // --- Defaults -------------------------------------------------------------
-// The processing window matches the symbol ring's own default depth, so the
-// radar spans everything the ring holds unless told otherwise.
-#define RADAR_DEFAULT_TIME_SYMBOLS 1120
+// One frame at 30 kHz: a quarter of the symbol ring's default depth, which
+// leaves a batch-aligned window room to stay whole while the next batch fills
+// in behind it. A window as deep as the ring would already have lost its first
+// symbols by the time its last one has settled.
+#define RADAR_DEFAULT_TIME_SYMBOLS 280
 #define RADAR_DEFAULT_IFFT_SIZE 4096
 #define RADAR_DEFAULT_CIR_DEPTH 128
 #define RADAR_DEFAULT_BLANK_TAPS 2
+#define RADAR_DEFAULT_DB_RANGE 60.0f
+// The same starting point as the visualizer's CFR mean, since the settings
+// window edits the two through one set of fields.
+#define RADAR_DEFAULT_PERSIST_PERIOD 1120
+#define RADAR_DEFAULT_PERSIST_N 8
 
-// Hard ceiling on the window. Each of the two result buffers costs
-// time_symbols * 3276 * sizeof(float), so this bounds the radar at roughly
-// 54 MB per buffer rather than letting a typo allocate gigabytes.
+// Hard ceiling on the window, so a typo cannot allocate gigabytes. The widest
+// frame is a Range-Time at the largest IFFT: each of the two result buffers
+// then costs 4096 * 8192 * sizeof(float) = 128 MB, and the complex delay
+// matrix behind them 256 MB. The defaults (1120 x 4096) need about a tenth.
 #define RADAR_MAX_TIME_SYMBOLS 4096
 #define RADAR_MIN_TIME_SYMBOLS 14
 
@@ -26,11 +35,26 @@
 
 #define RADAR_MAX_LAG_SYMBOLS 4096
 
+#define RADAR_MIN_DB_RANGE 10.0f
+#define RADAR_MAX_DB_RANGE 200.0f
+
 // How long the worker idles between passes when nothing new has arrived.
 #define RADAR_IDLE_SLEEP_MS 25
 
+// Batch-aligned windows: how long the worker waits before looking again for a
+// newly completed batch, and how far past a batch's last symbol both rings
+// have to be before it counts as complete. The decode workers finish packets
+// out of order, so the newest symbol can be saved before the ones just ahead
+// of it; one subframe at 30 kHz is far beyond how far that reaches.
+#define RADAR_BATCH_POLL_MS 2
+#define RADAR_BATCH_SETTLE_SYMBOLS 28
+
 struct fh_radar {
     size_t fft_threads;
+
+    // Transform buffers and plans. Created with the radar but only ever used
+    // by the worker, so it needs no lock of its own.
+    fh_radar_dsp_t* dsp;
 
     pthread_mutex_t lock;
     pthread_cond_t cv;
@@ -53,11 +77,29 @@ struct fh_radar {
     int borrowed;
 
     int reset_requested;
+    // fh_radar_reset_persistence: handed to the workspace by the worker,
+    // which is the only thread that may touch it.
+    int persist_reset_requested;
     int stop;
+    // Whether anyone is looking at the output. An inactive worker computes
+    // nothing and keeps its last frame; see fh_radar_set_active.
+    int active;
 
     // See fh_radar_stats::epoch. Kept outside stats because a reset wipes
     // those, and the count has to survive exactly the events it records.
     uint64_t epoch;
+
+    // Moves on every fh_radar_set_config, so a batch already on screen is
+    // computed again when any setting changes.
+    uint64_t cfg_generation;
+
+    // Batch-aligned windows; worker-only. The batch last published and the
+    // config generation it was computed under, and the running count of
+    // batches passed over. Cleared by a reset.
+    int batch_valid;
+    int64_t batch_last;
+    uint64_t batch_cfg_generation;
+    uint64_t batches_skipped;
 
     pthread_t worker;
     int worker_started;
@@ -70,16 +112,53 @@ void fh_radar_config_defaults(fh_radar_config_t* cfg) {
         return;
     }
     cfg->time_symbols = RADAR_DEFAULT_TIME_SYMBOLS;
+    cfg->batch_aligned = 1;
     cfg->freq_start_re = 0;
     cfg->freq_end_re = FH_RADAR_RE_COUNT - 1;
     cfg->dl_ul_lag_symbols = 0;
     cfg->division = RADAR_DIV_UL_OVER_DL;
     cfg->ifft_size = RADAR_DEFAULT_IFFT_SIZE;
     cfg->cir_depth_taps = RADAR_DEFAULT_CIR_DEPTH;
+    cfg->range_window = RADAR_WINDOW_HANN;
+    cfg->doppler_window = RADAR_WINDOW_HANN;
     cfg->mti_enabled = 1;
     cfg->blank_taps_enabled = 0;
     cfg->blank_taps = RADAR_DEFAULT_BLANK_TAPS;
+    cfg->db_scale = 1;
+    cfg->db_range = RADAR_DEFAULT_DB_RANGE;
+    cfg->persist_enabled = 0;
+    cfg->persist_period = RADAR_DEFAULT_PERSIST_PERIOD;
+    cfg->persist_n = RADAR_DEFAULT_PERSIST_N;
     cfg->output = RADAR_OUT_CFR;
+}
+
+int fh_radar_min_ring_symbols(const fh_radar_config_t* cfg) {
+    if (cfg == NULL || cfg->time_symbols <= 0) {
+        return 0;
+    }
+    // Two batches - the one being read and the one filling in behind it - plus
+    // the settle margin, and as much again for symbols that arrive while the
+    // oldest rows of the batch are still being read.
+    return 2 * cfg->time_symbols + 2 * RADAR_BATCH_SETTLE_SYMBOLS;
+}
+
+void fh_radar_used_re_range(const fh_radar_config_t* cfg, int* out_start, int* out_end) {
+    if (cfg == NULL) {
+        return;
+    }
+    const int start = cfg->freq_start_re;
+    int end = cfg->freq_end_re;
+    // Cropped from the start rather than centred, so the first RE used is
+    // always the one the start field names.
+    if (cfg->ifft_size > 0 && end - start + 1 > cfg->ifft_size) {
+        end = start + cfg->ifft_size - 1;
+    }
+    if (out_start != NULL) {
+        *out_start = start;
+    }
+    if (out_end != NULL) {
+        *out_end = end;
+    }
 }
 
 static int clamp_int(int value, int low, int high) {
@@ -109,6 +188,7 @@ static int snap_pow2(int value) {
 // Every bound lives here so the GUI can hand raw widget values straight over.
 static void sanitize_config(fh_radar_config_t* cfg) {
     cfg->time_symbols = clamp_int(cfg->time_symbols, RADAR_MIN_TIME_SYMBOLS, RADAR_MAX_TIME_SYMBOLS);
+    cfg->batch_aligned = cfg->batch_aligned ? 1 : 0;
 
     cfg->freq_start_re = clamp_int(cfg->freq_start_re, 0, FH_RADAR_RE_COUNT - 1);
     cfg->freq_end_re = clamp_int(cfg->freq_end_re, cfg->freq_start_re, FH_RADAR_RE_COUNT - 1);
@@ -125,9 +205,29 @@ static void sanitize_config(fh_radar_config_t* cfg) {
     // the IFFT cannot leave a depth that reads past the end of a CIR.
     cfg->cir_depth_taps = clamp_int(cfg->cir_depth_taps, 1, cfg->ifft_size);
 
+    if (cfg->range_window != RADAR_WINDOW_HANN) {
+        cfg->range_window = RADAR_WINDOW_RECT;
+    }
+    if (cfg->doppler_window != RADAR_WINDOW_HANN) {
+        cfg->doppler_window = RADAR_WINDOW_RECT;
+    }
+
     cfg->mti_enabled = cfg->mti_enabled ? 1 : 0;
     cfg->blank_taps_enabled = cfg->blank_taps_enabled ? 1 : 0;
     cfg->blank_taps = clamp_int(cfg->blank_taps, 0, cfg->ifft_size - 1);
+
+    cfg->db_scale = cfg->db_scale ? 1 : 0;
+    // Written so a NaN from a widget lands on the default rather than passing
+    // both comparisons.
+    if (!(cfg->db_range >= RADAR_MIN_DB_RANGE && cfg->db_range <= RADAR_MAX_DB_RANGE)) {
+        cfg->db_range = (cfg->db_range > RADAR_MAX_DB_RANGE) ? RADAR_MAX_DB_RANGE
+                      : (cfg->db_range < RADAR_MIN_DB_RANGE) ? RADAR_MIN_DB_RANGE
+                      : RADAR_DEFAULT_DB_RANGE;
+    }
+
+    cfg->persist_enabled = cfg->persist_enabled ? 1 : 0;
+    cfg->persist_period = clamp_int(cfg->persist_period, 1, FH_RADAR_MAX_PERSIST_PERIOD);
+    cfg->persist_n = clamp_int(cfg->persist_n, 1, FH_RADAR_MAX_PERSIST_N);
 
     if (cfg->output != RADAR_OUT_RANGE_TIME && cfg->output != RADAR_OUT_RANGE_DOPPLER) {
         cfg->output = RADAR_OUT_CFR;
@@ -172,10 +272,140 @@ static float complex_abs2(fh_complex_t v) {
 
 // --- CFR stage ------------------------------------------------------------
 
-// One full pass: pair each symbol of the window across the two rings, divide,
-// and write |H| into dst. Resource elements outside the configured frequency
-// range stay zero, which keeps the output on the same 3276-wide grid the
-// heatmap and its RE axis already use.
+// Where a CFR pass writes. The CFR view takes |H| on the 3276-wide RE grid.
+// The transform outputs take the complex, windowed H of the used REs packed
+// from bin 0 of an ifft_size-wide row, so the delay IFFT runs in place on it.
+// Exactly one of the two is set.
+typedef struct cfr_sink {
+    float* magnitude;         // rows x FH_RADAR_RE_COUNT
+    fh_complex_t* cplx;       // rows x cplx_cols
+    int cplx_cols;
+    int used_start;           // First RE packed into bin 0
+    int used_count;           // REs packed; never more than cplx_cols
+    const float* window;      // used_count weights, or NULL for rectangular
+    unsigned char* row_valid; // rows; written alongside cplx
+} cfr_sink_t;
+
+// Clears one output row: a symbol without a channel estimate.
+static void cfr_sink_clear_row(const cfr_sink_t* sink, int row) {
+    if (sink->magnitude != NULL) {
+        memset(sink->magnitude + (size_t)row * FH_RADAR_RE_COUNT, 0, FH_RADAR_RE_COUNT * sizeof(float));
+    } else {
+        memset(sink->cplx + (size_t)row * (size_t)sink->cplx_cols, 0, (size_t)sink->cplx_cols * sizeof(fh_complex_t));
+        sink->row_valid[row] = 0;
+    }
+}
+
+// |H| of one paired row over [re_start, re_end] into out_row, which arrives
+// zeroed. Returns whether the DL carried anything in that range.
+static int cfr_row_magnitude(const fh_complex_t* dl_row,
+                             const fh_complex_t* ul_row,
+                             int re_start,
+                             int re_end,
+                             int ul_over_dl,
+                             float* out_row,
+                             double* mag_sum,
+                             uint64_t* mag_count) {
+    int occupied_in_row = 0;
+
+    for (int re = re_start; re <= re_end; re++) {
+        const float dl_p = complex_abs2(dl_row[re]);
+        const float ul_p = complex_abs2(ul_row[re]);
+
+        if (dl_p > 0.0f) {
+            occupied_in_row = 1;
+        }
+
+        // |H| = |numerator| / |denominator|; the CFR view needs no phase.
+        const float num_p = ul_over_dl ? ul_p : dl_p;
+        const float den_p = ul_over_dl ? dl_p : ul_p;
+
+        // An unoccupied resource element divides 0 by 0. That is a normal,
+        // expected intermediate here, so it is detected and skipped rather
+        // than allowed to put a NaN into the display buffer.
+        if (den_p <= 0.0f) {
+            continue;
+        }
+
+        const float mag = sqrtf(num_p / den_p);
+        out_row[re] = mag;
+
+        // Only resource elements occupied in both directions say anything
+        // about the channel, so only those feed the mean.
+        if (num_p > 0.0f) {
+            *mag_sum += (double)mag;
+            (*mag_count)++;
+        }
+    }
+    return occupied_in_row;
+}
+
+// Complex H of one paired row into the sink's row: the used REs from bin 0,
+// windowed, and zeros up to cplx_cols. Returns whether the DL carried
+// anything in the used range.
+static int cfr_row_complex(const fh_complex_t* dl_row,
+                           const fh_complex_t* ul_row,
+                           const cfr_sink_t* sink,
+                           int ul_over_dl,
+                           fh_complex_t* out_row,
+                           double* mag_sum,
+                           uint64_t* mag_count) {
+    // C11 lays a complex out as float[2], re then im. Working on the halves
+    // keeps the divide a few multiplies: complex '*' and '/' would go through
+    // libgcc's NaN-handling helpers, a call per resource element.
+    const float* num = (const float*)(ul_over_dl ? ul_row : dl_row);
+    const float* den = (const float*)(ul_over_dl ? dl_row : ul_row);
+    const float* dl = (const float*)dl_row;
+    float* out = (float*)out_row;
+
+    int occupied_in_row = 0;
+
+    for (int i = 0; i < sink->used_count; i++) {
+        const int re = sink->used_start + i;
+        const float nr = num[2 * re];
+        const float ni = num[2 * re + 1];
+        const float dr = den[2 * re];
+        const float di = den[2 * re + 1];
+        const float num_p = nr * nr + ni * ni;
+        const float den_p = dr * dr + di * di;
+
+        if (dl[2 * re] != 0.0f || dl[2 * re + 1] != 0.0f) {
+            occupied_in_row = 1;
+        }
+
+        float hr = 0.0f;
+        float hi = 0.0f;
+        // A positive test rather than '<= 0 skip', so a NaN denominator is
+        // skipped as well as 0/0.
+        if (den_p > 0.0f) {
+            // H = num * conj(den) / |den|^2
+            const float inv = 1.0f / den_p;
+            hr = (nr * dr + ni * di) * inv;
+            hi = (ni * dr - nr * di) * inv;
+
+            if (num_p > 0.0f) {
+                *mag_sum += (double)sqrtf(num_p * inv);
+                (*mag_count)++;
+            }
+
+            if (sink->window != NULL) {
+                hr *= sink->window[i];
+                hi *= sink->window[i];
+            }
+        }
+        out[2 * i] = hr;
+        out[2 * i + 1] = hi;
+    }
+
+    // Zero padding up to the transform size.
+    memset(out_row + sink->used_count, 0, (size_t)(sink->cplx_cols - sink->used_count) * sizeof(fh_complex_t));
+    return occupied_in_row;
+}
+
+// One full pass: pair each symbol of the window - rows symbols from oldest -
+// across the two rings, divide, and write the result into the sink. Every row
+// of the sink is written, whether or not its symbol paired. have_window is 0
+// while there is nothing to place a window on yet.
 //
 // The rings are read without taking the decode-side data lock, matching how
 // the renderer already samples the same memory every frame. A row torn by a
@@ -183,12 +413,11 @@ static float complex_abs2(fh_complex_t v) {
 static void compute_cfr(const fh_radar_config_t* cfg,
                         const fh_oran_memory_t* dl,
                         const fh_oran_memory_t* ul,
-                        float* dst,
+                        int have_window,
+                        int oldest,
                         int rows,
-                        int cols,
+                        const cfr_sink_t* sink,
                         fh_radar_stats_t* stats) {
-    memset(dst, 0, (size_t)rows * (size_t)cols * sizeof(float));
-
     stats->paired_symbols = 0;
     stats->window_symbols = rows;
     stats->window_first_symbol = 0;
@@ -197,23 +426,30 @@ static void compute_cfr(const fh_radar_config_t* cfg,
     stats->skipped_ul_missing = 0;
     stats->mean_cfr_magnitude = 0.0f;
 
-    if (dl == NULL || ul == NULL) {
-        return;
-    }
-    if (dl->symbol_highest < dl->symbol_lowest) {
-        return; // nothing captured yet
+    // Resource elements outside the configured frequency range stay zero,
+    // which keeps the CFR view on the same 3276-wide grid the heatmap and its
+    // RE axis already use.
+    if (sink->magnitude != NULL) {
+        memset(sink->magnitude, 0, (size_t)rows * FH_RADAR_RE_COUNT * sizeof(float));
     }
 
-    // The window ends at the newest downlink symbol and runs backwards.
-    const int newest = dl->symbol_highest;
-    const int oldest = newest - rows + 1;
+    if (dl == NULL || ul == NULL || !have_window) {
+        // No pair, or nothing captured yet.
+        if (sink->cplx != NULL) {
+            for (int row = 0; row < rows; row++) {
+                cfr_sink_clear_row(sink, row);
+            }
+        }
+        return;
+    }
+
+    const int newest = oldest + rows - 1;
 
     // Lets the vertical axis label real symbol numbers rather than row indices.
     stats->window_first_symbol = oldest;
     stats->window_first_valid = 1;
 
-    const int re_start = cfg->freq_start_re;
-    const int re_end = cfg->freq_end_re;
+    const int ul_over_dl = (cfg->division == RADAR_DIV_UL_OVER_DL);
 
     double mag_sum = 0.0;
     uint64_t mag_count = 0;
@@ -226,67 +462,109 @@ static void compute_cfr(const fh_radar_config_t* cfg,
         size_t dl_idx = 0;
         if (!ring_row_for_symbol(dl, sym, &dl_idx)) {
             stats->skipped_dl_empty++;
+            cfr_sink_clear_row(sink, row);
             continue;
         }
 
         size_t ul_idx = 0;
         if (!ring_row_for_symbol(ul, sym + cfg->dl_ul_lag_symbols, &ul_idx)) {
             stats->skipped_ul_missing++;
+            cfr_sink_clear_row(sink, row);
             continue;
         }
 
         const fh_complex_t* dl_row = dl->symbols[dl_idx];
         const fh_complex_t* ul_row = ul->symbols[ul_idx];
-        float* out_row = dst + (size_t)row * (size_t)cols;
 
-        int occupied_in_row = 0;
-
-        const int ul_over_dl = (cfg->division == RADAR_DIV_UL_OVER_DL);
-
-        for (int re = re_start; re <= re_end; re++) {
-            const float dl_p = complex_abs2(dl_row[re]);
-            const float ul_p = complex_abs2(ul_row[re]);
-
-            if (dl_p > 0.0f) {
-                occupied_in_row = 1;
-            }
-
-            // |H| = |numerator| / |denominator|; the complex quotient itself is
-            // only needed once the delay IFFT stage lands.
-            const float num_p = ul_over_dl ? ul_p : dl_p;
-            const float den_p = ul_over_dl ? dl_p : ul_p;
-
-            // An unoccupied resource element divides 0 by 0. That is a normal,
-            // expected intermediate here, so it is detected and skipped rather
-            // than allowed to put a NaN into the display buffer.
-            if (den_p <= 0.0f) {
-                continue;
-            }
-
-            const float mag = sqrtf(num_p / den_p);
-            out_row[re] = mag;
-
-            // Only resource elements occupied in both directions say anything
-            // about the channel, so only those feed the mean.
-            if (num_p > 0.0f) {
-                mag_sum += (double)mag;
-                mag_count++;
-            }
+        int occupied_in_row;
+        if (sink->magnitude != NULL) {
+            occupied_in_row = cfr_row_magnitude(dl_row, ul_row, cfg->freq_start_re, cfg->freq_end_re, ul_over_dl,
+                                                sink->magnitude + (size_t)row * FH_RADAR_RE_COUNT,
+                                                &mag_sum, &mag_count);
+        } else {
+            occupied_in_row = cfr_row_complex(dl_row, ul_row, sink, ul_over_dl,
+                                              sink->cplx + (size_t)row * (size_t)sink->cplx_cols,
+                                              &mag_sum, &mag_count);
         }
 
         if (!occupied_in_row) {
             // The rows paired, but the downlink carried nothing to divide by,
             // so this symbol contributes no channel estimate.
-            memset(out_row, 0, (size_t)cols * sizeof(float));
+            cfr_sink_clear_row(sink, row);
             stats->skipped_dl_empty++;
             continue;
         }
 
+        if (sink->cplx != NULL) {
+            sink->row_valid[row] = 1;
+        }
         stats->paired_symbols++;
     }
 
     if (mag_count > 0) {
         stats->mean_cfr_magnitude = (float)(mag_sum / (double)mag_count);
+    }
+}
+
+// A Range-Time or Range-Doppler pass: the CFR stage into the delay matrix,
+// then the transform stages into dst (rows x cols).
+static void compute_transform_frame(fh_radar_dsp_t* dsp,
+                                    const fh_radar_config_t* cfg,
+                                    const fh_oran_memory_t* dl,
+                                    const fh_oran_memory_t* ul,
+                                    int have_window,
+                                    int oldest,
+                                    float* dst,
+                                    int rows,
+                                    int out_rows,
+                                    int cols,
+                                    fh_radar_stats_t* stats) {
+    int used_start = 0;
+    int used_end = 0;
+    fh_radar_used_re_range(cfg, &used_start, &used_end);
+    stats->used_re_start = used_start;
+    stats->used_re_end = used_end;
+    stats->window_symbols = rows;
+
+    const double started = monotonic_ms();
+
+    unsigned char* row_valid = NULL;
+    fh_complex_t* cir = fh_radar_dsp_begin(dsp, rows, cfg->ifft_size, &row_valid);
+    if (cir == NULL) {
+        memset(dst, 0, (size_t)out_rows * (size_t)cols * sizeof(float));
+        return;
+    }
+
+    cfr_sink_t sink;
+    memset(&sink, 0, sizeof(sink));
+    sink.cplx = cir;
+    sink.cplx_cols = cfg->ifft_size;
+    sink.used_start = used_start;
+    sink.used_count = used_end - used_start + 1;
+    sink.window = fh_radar_dsp_range_window(dsp, cfg->range_window, sink.used_count);
+    sink.row_valid = row_valid;
+
+    compute_cfr(cfg, dl, ul, have_window, oldest, rows, &sink, stats);
+
+    const double cfr_done = monotonic_ms();
+    stats->cfr_ms = cfr_done - started;
+
+    // Run even when nothing paired: the transforms are skipped then, but a
+    // rolling mean still has to be drawn.
+    fh_radar_dsp_pass_t pass;
+    memset(&pass, 0, sizeof(pass));
+    pass.used_re = sink.used_count;
+    pass.paired_symbols = stats->paired_symbols;
+    pass.first_symbol = oldest;
+    pass.epoch = stats->epoch;
+    pass.out_rows = out_rows;
+    fh_radar_dsp_run(dsp, cfg, &pass, dst);
+    stats->transform_ms = monotonic_ms() - cfr_done;
+
+    if (cfg->persist_enabled) {
+        stats->persist_phase_rows = (cfg->output == RADAR_OUT_RANGE_TIME);
+        stats->persist_period = stats->persist_phase_rows ? out_rows : 0;
+        stats->persist_folds = pass.persist_folds;
     }
 }
 
@@ -309,6 +587,57 @@ static int ensure_back_buffer(fh_radar_t* r, int rows, int cols) {
     return 1;
 }
 
+// Waits on r->cv for at most ms, with r->lock held. Returns early when woken:
+// by a config change, a reset, a new pair, stop, or a released frame.
+static void wait_locked(fh_radar_t* r, int ms) {
+    if (r->stop) {
+        return;
+    }
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_nsec += (long)ms * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec += deadline.tv_nsec / 1000000000L;
+        deadline.tv_nsec %= 1000000000L;
+    }
+    pthread_cond_timedwait(&r->cv, &r->lock, &deadline);
+}
+
+// Rounds toward minus infinity, so batch indices stay right below symbol 0.
+static int64_t floor_div(int64_t a, int64_t b) {
+    int64_t q = a / b;
+    if ((a % b != 0) && ((a < 0) != (b < 0))) {
+        q--;
+    }
+    return q;
+}
+
+// The newest batch of rows symbols that has settled in both rings: the DL up
+// to its last symbol, and the UL up to that symbol plus the lag, each with
+// RADAR_BATCH_SETTLE_SYMBOLS to spare. Returns 0 while there is none.
+static int newest_complete_batch(const fh_radar_config_t* cfg,
+                                 const fh_oran_memory_t* dl,
+                                 const fh_oran_memory_t* ul,
+                                 int rows,
+                                 int64_t* out_batch) {
+    if (dl->symbol_highest < dl->symbol_lowest || ul->symbol_highest < ul->symbol_lowest) {
+        return 0; // nothing captured yet
+    }
+    const int64_t dl_settled = (int64_t)dl->symbol_highest - RADAR_BATCH_SETTLE_SYMBOLS;
+    const int64_t ul_settled =
+        (int64_t)ul->symbol_highest - (int64_t)cfg->dl_ul_lag_symbols - RADAR_BATCH_SETTLE_SYMBOLS;
+    const int64_t settled = (dl_settled < ul_settled) ? dl_settled : ul_settled;
+
+    // Batch k ends at (k + 1) * rows - 1, so the newest one ending at or
+    // before the settled symbol is:
+    const int64_t batch = floor_div(settled + 1, rows) - 1;
+    if (batch < 0) {
+        return 0;
+    }
+    *out_batch = batch;
+    return 1;
+}
+
 static void* radar_worker(void* arg) {
     fh_radar_t* r = (fh_radar_t*)arg;
 
@@ -323,10 +652,21 @@ static void* radar_worker(void* arg) {
             r->reset_requested = 0;
             r->have_result = 0;
             memset(&r->stats, 0, sizeof(r->stats));
+            r->batch_valid = 0;
+            r->batches_skipped = 0;
+        }
+
+        // Nobody is looking: sleep until something changes rather than run
+        // transforms whose frames would never be drawn.
+        if (!r->active) {
+            pthread_cond_wait(&r->cv, &r->lock);
+            pthread_mutex_unlock(&r->lock);
+            continue;
         }
 
         const fh_radar_config_t cfg = r->cfg;
         const uint64_t epoch = r->epoch;
+        const uint64_t cfg_generation = r->cfg_generation;
         fh_oran_memory_t* dl = r->dl;
         fh_oran_memory_t* ul = r->ul;
 
@@ -335,9 +675,56 @@ static void* radar_worker(void* arg) {
         if (dl != NULL && dl->max_symbols > 0 && (size_t)rows > dl->max_symbols) {
             rows = (int)dl->max_symbols;
         }
-        const int cols = FH_RADAR_RE_COUNT;
 
-        if (!ensure_back_buffer(r, rows, cols)) {
+        // Where the window sits, settled before the pass so the batch check
+        // and the frame agree on it. Without a pair there is nothing to align
+        // to, and the pass below only reports what is missing.
+        const int batched = cfg.batch_aligned && dl != NULL && ul != NULL;
+        int have_window = 0;
+        int oldest = 0;
+        int64_t batch = 0;
+        if (batched) {
+            if (!newest_complete_batch(&cfg, dl, ul, rows, &batch)) {
+                r->stats.batch_waiting = 1;
+                r->stats.have_dl = 1;
+                r->stats.have_ul = 1;
+                wait_locked(r, RADAR_BATCH_POLL_MS);
+                pthread_mutex_unlock(&r->lock);
+                continue;
+            }
+            if (r->batch_valid && batch == r->batch_last && cfg_generation == r->batch_cfg_generation) {
+                // Already on screen, computed with these settings.
+                wait_locked(r, RADAR_BATCH_POLL_MS);
+                pthread_mutex_unlock(&r->lock);
+                continue;
+            }
+            oldest = (int)(batch * (int64_t)rows);
+            have_window = 1;
+        } else if (dl != NULL && dl->symbol_highest >= dl->symbol_lowest) {
+            // Sliding: the window ends at the newest downlink symbol.
+            oldest = dl->symbol_highest - rows + 1;
+            have_window = 1;
+        }
+
+        // Every output has one row per symbol of the window (Range-Doppler's
+        // are Doppler bins, as many as there are symbols) - except a
+        // Range-Time mean, which has one per phase of its period. The width
+        // is what differs between outputs.
+        int out_rows = rows;
+        int cols = FH_RADAR_RE_COUNT;
+        if (cfg.output == RADAR_OUT_RANGE_TIME) {
+            cols = cfg.ifft_size;
+            if (cfg.persist_enabled) {
+                out_rows = cfg.persist_period;
+            }
+        } else if (cfg.output == RADAR_OUT_RANGE_DOPPLER) {
+            cols = cfg.cir_depth_taps;
+        }
+
+        const int persist_reset = r->persist_reset_requested;
+        r->persist_reset_requested = 0;
+
+        if (!ensure_back_buffer(r, out_rows, cols)) {
             pthread_mutex_unlock(&r->lock);
             break; // out of memory; stop rather than spin
         }
@@ -356,12 +743,18 @@ static void* radar_worker(void* arg) {
         pass.output = cfg.output;
         pass.epoch = epoch;
 
+        if (persist_reset) {
+            fh_radar_dsp_reset_persistence(r->dsp);
+        }
+
         if (cfg.output == RADAR_OUT_CFR) {
-            compute_cfr(&cfg, dl, ul, back, rows, cols, &pass);
+            cfr_sink_t sink;
+            memset(&sink, 0, sizeof(sink));
+            sink.magnitude = back;
+            compute_cfr(&cfg, dl, ul, have_window, oldest, rows, &sink, &pass);
+            pass.cfr_ms = monotonic_ms() - started;
         } else {
-            // Range-Time and Range-Doppler arrive with the transform stages.
-            memset(back, 0, (size_t)rows * (size_t)cols * sizeof(float));
-            pass.window_symbols = rows;
+            compute_transform_frame(r->dsp, &cfg, dl, ul, have_window, oldest, back, rows, out_rows, cols, &pass);
         }
         pass.last_refresh_ms = monotonic_ms() - started;
 
@@ -385,7 +778,7 @@ static void* radar_worker(void* arg) {
         const int old_cols = r->cols;
 
         r->front = r->back;
-        r->rows = rows;
+        r->rows = out_rows;
         r->cols = cols;
 
         r->back = old_front;
@@ -394,19 +787,26 @@ static void* radar_worker(void* arg) {
 
         r->have_result = 1;
 
+        if (batched) {
+            // Only a step under the same settings is a skip: a new window depth
+            // renumbers every batch.
+            if (r->batch_valid && cfg_generation == r->batch_cfg_generation && batch > r->batch_last + 1) {
+                r->batches_skipped += (uint64_t)(batch - r->batch_last - 1);
+            }
+            r->batch_valid = 1;
+            r->batch_last = batch;
+            r->batch_cfg_generation = cfg_generation;
+            pass.batch_index = batch;
+        }
+        pass.batches_skipped = r->batches_skipped;
         pass.refresh_count = r->stats.refresh_count + 1;
         r->stats = pass;
 
-        // Idle until the next pass, but stay responsive to stop and reset.
-        struct timespec deadline;
-        clock_gettime(CLOCK_REALTIME, &deadline);
-        deadline.tv_nsec += (long)RADAR_IDLE_SLEEP_MS * 1000000L;
-        if (deadline.tv_nsec >= 1000000000L) {
-            deadline.tv_sec += deadline.tv_nsec / 1000000000L;
-            deadline.tv_nsec %= 1000000000L;
-        }
-        if (!r->stop) {
-            pthread_cond_timedwait(&r->cv, &r->lock, &deadline);
+        // A sliding window idles between passes. A batch goes straight back to
+        // watching for the next one, which the check above turns into a short
+        // wait while there is none.
+        if (!batched) {
+            wait_locked(r, RADAR_IDLE_SLEEP_MS);
         }
         pthread_mutex_unlock(&r->lock);
     }
@@ -435,12 +835,20 @@ fh_radar_t* fh_radar_create(size_t fft_threads) {
 
     fh_radar_config_defaults(&r->cfg);
 
+    r->dsp = fh_radar_dsp_create((int)r->fft_threads);
+    if (r->dsp == NULL) {
+        free(r);
+        return NULL;
+    }
+
     if (pthread_mutex_init(&r->lock, NULL) != 0) {
+        fh_radar_dsp_destroy(r->dsp);
         free(r);
         return NULL;
     }
     if (pthread_cond_init(&r->cv, NULL) != 0) {
         pthread_mutex_destroy(&r->lock);
+        fh_radar_dsp_destroy(r->dsp);
         free(r);
         return NULL;
     }
@@ -448,6 +856,7 @@ fh_radar_t* fh_radar_create(size_t fft_threads) {
     if (pthread_create(&r->worker, NULL, radar_worker, r) != 0) {
         pthread_cond_destroy(&r->cv);
         pthread_mutex_destroy(&r->lock);
+        fh_radar_dsp_destroy(r->dsp);
         free(r);
         return NULL;
     }
@@ -472,6 +881,9 @@ void fh_radar_destroy(fh_radar_t* r) {
 
     free(r->front);
     free(r->back);
+
+    // Its plans have to go before FFTW's threads do.
+    fh_radar_dsp_destroy(r->dsp);
 
     pthread_cond_destroy(&r->cv);
     pthread_mutex_destroy(&r->lock);
@@ -515,6 +927,7 @@ void fh_radar_set_config(fh_radar_t* r, const fh_radar_config_t* cfg) {
         r->epoch++;
     }
     r->cfg = sane;
+    r->cfg_generation++;
     // Wake the worker so an edit takes effect on the next pass rather than
     // after the current idle interval expires.
     pthread_cond_broadcast(&r->cv);
@@ -543,6 +956,32 @@ void fh_radar_reset(fh_radar_t* r) {
     r->reset_requested = 1;
     r->epoch++;
     pthread_cond_broadcast(&r->cv);
+    pthread_mutex_unlock(&r->lock);
+}
+
+void fh_radar_reset_persistence(fh_radar_t* r) {
+    if (r == NULL) {
+        return;
+    }
+    pthread_mutex_lock(&r->lock);
+    r->persist_reset_requested = 1;
+    // Counts as a settings change, so a batch already on screen is computed
+    // again and the emptied mean shows straight away.
+    r->cfg_generation++;
+    pthread_cond_broadcast(&r->cv);
+    pthread_mutex_unlock(&r->lock);
+}
+
+void fh_radar_set_active(fh_radar_t* r, int active) {
+    if (r == NULL) {
+        return;
+    }
+    active = active ? 1 : 0;
+    pthread_mutex_lock(&r->lock);
+    if (r->active != active) {
+        r->active = active;
+        pthread_cond_broadcast(&r->cv);
+    }
     pthread_mutex_unlock(&r->lock);
 }
 

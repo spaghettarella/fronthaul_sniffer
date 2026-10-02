@@ -1,4 +1,5 @@
 #include "gui/imgui_startup_interface.h"
+#include "gui/imgui_hint.h"
 
 #include "capture/c_pcap_demo_stream.h"
 
@@ -161,7 +162,10 @@ void draw_channel_whitelist(fh_startup_interface_state_t* state, fh_startup_conf
         ImGui::SameLine();
         ImGui::TextDisabled("list full (%d)", FH_CHANNEL_WHITELIST_MAX);
     }
-    ImGui::TextDisabled("Adding an eAxC that is already listed adds the direction to its entry.");
+    ImGui::SameLine();
+    gui_hint("merges duplicates",
+             "Adding an eAxC that is already listed adds the direction to its existing entry instead of "
+             "listing it twice.");
 }
 
 std::string shell_quote(const std::string& value) {
@@ -262,7 +266,7 @@ fh_startup_interface_state_t* imgui_startup_init(const fh_startup_config_t* init
         (void)snprintf(state->ocudu_phy_tap_queue_buffer.data(), state->ocudu_phy_tap_queue_buffer.size(), "%s", initial_config->ocudu_phy_tap_queue_name.c_str());
     } else {
         state->selected_interface_index = 0;
-        (void)snprintf(state->demo_pcap_path_buffer.data(), state->demo_pcap_path_buffer.size(), "%s", "../src/capture/demo.pcap");
+        (void)snprintf(state->demo_pcap_path_buffer.data(), state->demo_pcap_path_buffer.size(), "%s", "../src/capture/ofdm_radar_test.pcap");
         (void)snprintf(state->ocudu_phy_tap_queue_buffer.data(), state->ocudu_phy_tap_queue_buffer.size(), "%s", "/ocudu_phy_tap_queue");
     }
 
@@ -340,7 +344,10 @@ bool imgui_startup_render(
             ImGui::EndCombo();
         }
         ImGui::SameLine();
-        ImGui::TextDisabled("select 'pcap' to replay from a pcap file");
+        gui_hint("'pcap' replays a file",
+                 "Where packets come from. A network interface is captured live ('lo' through the loopback "
+                 "backend). 'pcap' replays a capture file instead, and 'ocudu phy tap' reads the OCUDU PHY "
+                 "tap's shared-memory queue.");
 
         config->iface = state->interfaces[state->selected_interface_index];
 
@@ -363,18 +370,26 @@ bool imgui_startup_render(
             ImGui::InputInt("PCAP speed (packets/sec)", &config->demo_pcap_speed);
             clamp_int(config->demo_pcap_speed, 1, FH_PCAP_MAX_SPEED_PPS);
             ImGui::SameLine();
-            ImGui::TextDisabled("replay speed; also adjustable while running, in Live Statistics");
+            gui_hint("live-adjustable",
+                     "Replay rate in packets per second, over every channel in the file. Real time is 28 000 "
+                     "packets/s per stream at 30 kHz with one packet per symbol - 224 000 for four antennas "
+                     "with DL and UL. Can be changed while running, in Live Statistics.");
 
             ImGui::Checkbox("Loop PCAP playback", &config->demo_pcap_loop);
             ImGui::SameLine();
-            ImGui::TextDisabled("enabled by default");
+            gui_hint("default on",
+                     "Start the file again when it ends. Symbol numbers keep counting up across passes, "
+                     "rounded to whole frames, so the views carry on instead of jumping back. Off ends the "
+                     "run after one pass.");
         
         } else if (config->iface == "ocudu phy tap") {
             ImGui::SetNextItemWidth(448.0f);
             ImGui::InputText("PHY tap queue name", state->ocudu_phy_tap_queue_buffer.data(), state->ocudu_phy_tap_queue_buffer.size());
             config->ocudu_phy_tap_queue_name = state->ocudu_phy_tap_queue_buffer.data();
             ImGui::SameLine();
-            ImGui::TextDisabled("shared-memory queue name");
+            gui_hint("shared-memory queue",
+                     "Name of the shared-memory queue the OCUDU PHY tap writes into. Has to match the name the "
+                     "gNB side was configured with.");
         }
     }
 
@@ -382,7 +397,10 @@ bool imgui_startup_render(
         ImGui::InputInt("Snaplen (bytes)", &config->snaplen, 1, 1000);
         clamp_int(config->snaplen, 1, 1000000);
         ImGui::SameLine();
-        ImGui::TextDisabled("bytes reserved for each packet (>9000 for Jumbo Frames, >20000 for PHY tap)");
+        gui_hint("bytes per packet",
+                 "Bytes reserved for each captured packet; anything longer is cut off. Needs more than 9000 "
+                 "for jumbo frames and more than 20000 for the PHY tap. The queue's per-packet buffer "
+                 "follows this value.");
 
         // Keep queue_bytes in code but combine in the GUI: set queue_bytes to snaplen
         config->queue_bytes = static_cast<unsigned long long>(config->snaplen);
@@ -396,18 +414,36 @@ bool imgui_startup_render(
             config->queue_packets = 1ULL;
         }
         ImGui::SameLine();
-        ImGui::TextDisabled("capture buffer before processing");
+        gui_hint("buffer before decode",
+                 "How many packets the queue between capture and decode holds. Once the decoders fall "
+                 "behind and it is full, new packets are dropped and counted in Live Statistics.");
 
         // GUI exposes only Snaplen; Queue bytes follows Snaplen automatically.
 
         const unsigned long long decode_threads_step = 1ULL;
         const unsigned long long decode_threads_step_fast = 4ULL;
         ImGui::InputScalar("Decode threads", ImGuiDataType_U64, &config->decode_threads, &decode_threads_step, &decode_threads_step_fast, "%llu");
+        // Shares one budget with the FFT threads, which keep at least one. The
+        // min keeps the subtraction from wrapping if the other count ever
+        // arrives over the cap.
+        const unsigned long long decode_threads_max =
+            FH_MAX_DECODE_FFT_THREADS - std::min<unsigned long long>(config->fft_threads, FH_MAX_DECODE_FFT_THREADS - 1);
         if (config->decode_threads < 1ULL) {
             config->decode_threads = 1ULL;
         }
+        if (config->decode_threads > decode_threads_max) {
+            config->decode_threads = decode_threads_max;
+        }
         ImGui::SameLine();
-        ImGui::TextDisabled("number of threads for packet decoding (increase for high packet rates)");
+        // The FFT count lives in the folded Radar section, so the other half of
+        // the budget is spelled out here.
+        char decode_threads_help[256];
+        snprintf(decode_threads_help, sizeof(decode_threads_help),
+                 "Threads decoding packets in parallel; raise for high packet rates. Each handles about "
+                 "20 000 full-symbol packets/s, and past about 16 more stop helping. Shares a budget of %d "
+                 "with the radar's FFT threads (now %llu).",
+                 FH_MAX_DECODE_FFT_THREADS, config->fft_threads);
+        gui_hint("decode + FFT <= 20", decode_threads_help);
 
         const unsigned long long memory_size_step = 1ULL;
         const unsigned long long memory_size_step_fast = 100ULL;
@@ -416,39 +452,38 @@ bool imgui_startup_render(
             config->memory_symbols = 1ULL;
         }
         ImGui::SameLine();
-        ImGui::TextDisabled("number of symbols to keep in memory (vertical resolution)");
+        gui_hint("symbols per stream",
+                 "Symbols each stream keeps, which is also the waterfall's height. Costs about 26 KB per "
+                 "symbol per stream. The radar's batch-aligned windows need at least twice their time "
+                 "range plus 56.");
 
         // Place stream-stop control at the bottom of the Capture section
         ImGui::Spacing();
         ImGui::Checkbox("Exit when stream stops", &config->timeout_enabled);
         ImGui::SameLine();
-        ImGui::TextDisabled("end the run once the capture goes silent");
+        gui_hint("on silence",
+                 "End the run by itself once the capture has been silent for the time below.");
         if (config->timeout_enabled) {
             ImGui::InputInt("Silence before exit (ms)", &config->timeout_ms, 1, 1000);
             clamp_int(config->timeout_ms, 1, 1000000);
             ImGui::SameLine();
-            ImGui::TextDisabled("armed only after the first packet arrives");
+            gui_hint("after first packet",
+                     "Only armed once the first packet has arrived, so starting the sniffer before the gNB "
+                     "or RU does not end the run early.");
         }
     }
 
     if (section_header("Decoder", true)) {
         ImGui::Checkbox("Force user data compression header", &config->ud_comp_hdr_present);
         ImGui::SameLine();
-        ImGui::TextDisabled("(?)");
-        if (ImGui::IsItemHovered()) {
-            ImGui::BeginTooltip();
-            ImGui::TextUnformatted(
-                "When compression parameters travel in band, each U-Plane section header is\n"
-                "followed by a udCompHdr octet and a reserved octet, and the PRB data starts\n"
-                "two bytes later.\n\n"
-                "Leave this off to detect it automatically, separately per eAxC and direction:\n"
-                "the octets have to match the settings below several times in a row before\n"
-                "they are trusted, and a note is printed when that happens.\n\n"
-                "Tick it to skip detection and always parse them, for a sender whose header\n"
-                "does not match the configured width or method.");
-            ImGui::EndTooltip();
-        }
-        ImGui::TextDisabled("Off = detect automatically per stream");
+        gui_hint("off = auto-detect",
+                 "When compression parameters travel in band, each U-Plane section header is followed by a "
+                 "udCompHdr octet and a reserved octet, and the PRB data starts two bytes later.\n\n"
+                 "Off detects this automatically, separately per eAxC and direction: the octets have to "
+                 "match the settings below several times in a row before they are trusted, and a note is "
+                 "printed when that happens.\n\n"
+                 "On skips detection and always parses them, for a sender whose header does not match the "
+                 "configured width or method.");
 
         if (ImGui::BeginCombo("Compression Method", config->ud_comp_method.c_str())) {
             for (const char* method : kCompMethods) {
@@ -471,20 +506,24 @@ bool imgui_startup_render(
             ImGui::EndCombo();
         }
         ImGui::SameLine();
-        ImGui::TextDisabled("for now only 'BFP' or 'NONE' (uncompressed) supported");
+        gui_hint("BFP or NONE",
+                 "Block floating point (BFP) or uncompressed (NONE); other O-RAN methods are not supported "
+                 "yet. Switching to NONE sets the IQ width to 16.");
 
         ImGui::InputInt("UD IQ-Width (bits)", &config->ud_iq_width);
         ImGui::SameLine();
         if (config->ud_comp_method == "NONE") {
-            ImGui::TextDisabled("uncompressed: 16 unless the sender says otherwise, range 1-16");
+            gui_hint("usually 16",
+                     "Width of the uncompressed samples, 1-16. 16 unless the sender says otherwise.");
         } else {
-            ImGui::TextDisabled("default 9, range 1-16");
+            gui_hint("default 9",
+                     "Mantissa width of the BFP-compressed samples, 1-16. Default 9.");
         }
         clamp_int(config->ud_iq_width, 1, 16);
 
         ImGui::InputInt("UD IQ-Width Decompressed (bits)", &config->ud_iq_width_decompressed);
         ImGui::SameLine();
-        ImGui::TextDisabled("default 16, range 1-16");
+        gui_hint("default 16", "Width the samples are expanded to after decompression, 1-16. Default 16.");
         clamp_int(config->ud_iq_width_decompressed, 1, 16);
 
         if (ImGui::BeginCombo("SCS (kHz)", std::to_string(config->scs_khz).c_str())) {
@@ -501,12 +540,15 @@ bool imgui_startup_render(
             ImGui::EndCombo();
         }
         ImGui::SameLine();
-        ImGui::TextDisabled("subcarrier spacing (default 30, values 15/30/60/120/240)");
+        gui_hint("subcarrier spacing",
+                 "Subcarrier spacing of the carrier: 15, 30, 60, 120 or 240 kHz, default 30. Sets how "
+                 "symbol numbers map to slots and frames, and the radar's range and Doppler scales.");
 
         if (config->iface == "ocudu phy tap") {
             ImGui::Checkbox("Override SCS from PHY tap numerology", &config->phy_tap_scs_override);
             ImGui::SameLine();
-            ImGui::TextDisabled("use each record's own numerology instead of the SCS above");
+            gui_hint("per-record numerology",
+                     "Use the numerology each PHY tap record carries instead of the SCS above.");
         }
     }
 
@@ -515,13 +557,22 @@ bool imgui_startup_render(
         const unsigned long long fft_threads_step = 1ULL;
         const unsigned long long fft_threads_step_fast = 4ULL;
         ImGui::InputScalar("FFT threads", ImGuiDataType_U64, &config->fft_threads, &fft_threads_step, &fft_threads_step_fast, "%llu");
+        const unsigned long long fft_threads_max =
+            FH_MAX_DECODE_FFT_THREADS - std::min<unsigned long long>(config->decode_threads, FH_MAX_DECODE_FFT_THREADS - 1);
         if (config->fft_threads < 1ULL) {
             config->fft_threads = 1ULL;
         }
+        if (config->fft_threads > fft_threads_max) {
+            config->fft_threads = fft_threads_max;
+        }
         ImGui::SameLine();
-        ImGui::TextDisabled("threads for the radar transforms; fixed for the run");
-        ImGui::TextDisabled("Only used by the Radar view. Everything else about the radar");
-        ImGui::TextDisabled("is configured live, in the Radar Settings window.");
+        char fft_threads_help[320];
+        snprintf(fft_threads_help, sizeof(fft_threads_help),
+                 "Threads the radar's FFTs are split across; fixed for the run. Only the Radar view uses "
+                 "them - everything else about the radar is set live, in the Radar Settings window. Shares "
+                 "a budget of %d with the decode threads (now %llu).",
+                 FH_MAX_DECODE_FFT_THREADS, config->decode_threads);
+        gui_hint("decode + FFT <= 20", fft_threads_help);
     }
 
     // Open when a filter is already set, e.g. passed on the command line,
@@ -536,18 +587,20 @@ bool imgui_startup_render(
         ImGui::RadioButton("Whitelist", &method, FH_CHANNEL_FILTER_WHITELIST);
         config->channel_filter_method = static_cast<fh_channel_filter_method_t>(method);
         ImGui::SameLine();
-        if (config->channel_filter_method == FH_CHANNEL_FILTER_WHITELIST) {
-            ImGui::TextDisabled("keep only the listed channels, each with its own direction");
-        } else {
-            ImGui::TextDisabled("one eAxC and/or one direction");
-        }
+        gui_hint(config->channel_filter_method == FH_CHANNEL_FILTER_WHITELIST ? "listed channels only"
+                                                                              : "one eAxC and/or direction",
+                 "Applied in the capture backend, before the queue, so filtered packets cost no decode "
+                 "time. Single channel keeps one eAxC, one direction, or both. Whitelist keeps up to 64 "
+                 "eAxCs, each with its own directions.");
 
         if (config->channel_filter_method == FH_CHANNEL_FILTER_WHITELIST) {
             draw_channel_whitelist(state, config);
         } else {
             ImGui::Checkbox("Filter by eAxC ID", &config->channel_has_eaxc);
             ImGui::SameLine();
-            ImGui::TextDisabled("aka PC_ID (other formats only in CLI supported)");
+            gui_hint("aka PC_ID",
+                     "Keep only one eAxC, entered by its four fields below. The eAxC is the eCPRI PC_ID; "
+                     "other ways of writing it are only accepted on the command line (--channel).");
 
             if (config->channel_has_eaxc) {
                 ImGui::SetNextItemWidth(180.0f);
@@ -577,7 +630,7 @@ bool imgui_startup_render(
 
             ImGui::Checkbox("Filter by Data Direction", &config->channel_has_direction);
             ImGui::SameLine();
-            ImGui::TextDisabled("'UL' (uplink) / 'DL' (downlink)");
+            gui_hint("UL or DL", "Keep only uplink or only downlink packets.");
             if (config->channel_has_direction) {
                 int direction_index = config->channel_direction;
                 if (ImGui::BeginCombo("##direction_combo", kDirections[direction_index])) {

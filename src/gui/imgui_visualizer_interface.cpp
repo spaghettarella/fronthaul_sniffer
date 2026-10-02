@@ -1,4 +1,5 @@
 #include "imgui_visualizer_interface.h"
+#include "gui/imgui_hint.h"
 #include "capture/c_pcap_demo_stream.h"
 #include "core/c_oran_memory.h"
 #include "core/c_radar.h"
@@ -10,6 +11,7 @@
 #include <imgui_impl_opengl2.h>
 #include <GLFW/glfw3.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -555,8 +557,9 @@ void draw_zoom_window(opengl_visualizer_t* visualizer) {
                                 (int)x_total, delay_x ? "taps" : "RE",
                                 total_rows, doppler_y ? "bins" : "rows");
         }
-        ImGui::TextDisabled("Display only - memory size, averaging period and");
-        ImGui::TextDisabled("capture depth are untouched by anything here.");
+        gui_hint("display only",
+                 "Zooming only changes which part of the plot is on screen. Memory size, the averaging period "
+                 "and the trigger's capture depth are untouched by anything here.");
     }
 
     zoom_window_t w = zoom_window_in_units(visualizer, x_total, y_total);
@@ -636,8 +639,9 @@ void draw_zoom_window(opengl_visualizer_t* visualizer) {
             } else {
                 ImGui::TextDisabled("showing bins %d-%d of %d", bin_first, bin_last, total_rows);
             }
-            ImGui::TextDisabled("Zero Doppler is the centre row. The whole matrix is");
-            ImGui::TextDisabled("replaced each interval, so this axis does not scroll.");
+            gui_hint("centre row = 0 Hz",
+                     "Zero Doppler is the centre row, approaching targets above it. The whole map is replaced "
+                     "each processing interval, so this axis does not scroll.");
         } else if (curve_view) {
             // Normalized y runs downward, so the window's leading edge is the high
             // end of the magnitude scale; present it the way it reads on screen.
@@ -674,9 +678,9 @@ void draw_zoom_window(opengl_visualizer_t* visualizer) {
                                 row_first,
                                 row_first + (row_count > 0 ? row_count - 1 : 0),
                                 total_rows);
-            ImGui::TextDisabled("Row count follows Memory size / averaging period /");
-            ImGui::TextDisabled("capture depth, so the window is kept as a fraction");
-            ImGui::TextDisabled("of it and survives those changing.");
+            gui_hint("kept as a fraction",
+                     "The row count follows Memory size, the averaging period or the trigger's capture depth, so "
+                     "the zoom window is kept as a fraction of it and survives those changing.");
         }
     }
 
@@ -685,9 +689,9 @@ void draw_zoom_window(opengl_visualizer_t* visualizer) {
     }
 
     if (section_header("Mouse and keys", false)) {
-        ImGui::TextDisabled("Wheel over the plot zooms both axes; Shift+wheel");
-        ImGui::TextDisabled("only horizontally, Ctrl+wheel only vertically.");
-        ImGui::TextDisabled("Drag the plot or use the arrow keys to move the window.");
+        gui_hint("wheel zooms, drag moves",
+                 "Wheel over the plot zooms both axes; Shift+wheel only horizontally, Ctrl+wheel only "
+                 "vertically. Drag the plot or use the arrow keys to move the window.");
     }
 
     ImGui::End();
@@ -710,6 +714,17 @@ static double radar_symbol_seconds(int scs_khz) {
         return 0.0;
     }
     return 0.001 / slots_per_subframe / 14.0;
+}
+
+// Rectangular / Hann picker for one of the radar's transform windows.
+static bool radar_window_combo(const char* label, fh_radar_window_t* window) {
+    static const char* names[] = { "Rectangular", "Hann" };
+    int index = (*window == RADAR_WINDOW_HANN) ? 1 : 0;
+    if (ImGui::Combo(label, &index, names, IM_ARRAYSIZE(names))) {
+        *window = (index == 1) ? RADAR_WINDOW_HANN : RADAR_WINDOW_RECT;
+        return true;
+    }
+    return false;
 }
 
 // Reads the radar config, runs the widgets against a local copy, and commits
@@ -746,6 +761,10 @@ static void draw_radar_window(fh_radar_t* radar,
         ? dl->scs_khz
         : ((ul != nullptr && ul->scs_khz > 0) ? ul->scs_khz : 0);
     const double subcarrier_hz = (double)scs_khz * 1000.0;
+    const double symbol_s = radar_symbol_seconds(scs_khz);
+    // Rows the worker actually ran with: the window is clamped to the ring's
+    // depth, so the setting alone can overstate it.
+    const int window_rows = (st.window_symbols > 0) ? st.window_symbols : cfg.time_symbols;
 
     // --- Stream -----------------------------------------------------------
     if (section_header("Stream", true)) {
@@ -769,16 +788,60 @@ static void draw_radar_window(fh_radar_t* radar,
                 ImGui::TextColored(warn_color, "not captured");
             }
             if (dl_eaxc != ul_eaxc) {
-                ImGui::TextDisabled("Split pair: receiving on another eAxC than transmitting.");
+                gui_hint("split pair", "Receiving on another eAxC than transmitting.");
             }
         }
-        ImGui::TextDisabled("In Stream Selection, click an eAxC to pair its own DL and");
-        ImGui::TextDisabled("UL, or a UL / DL cell to take that direction from another eAxC.");
+        gui_hint("pick in Stream Selection",
+                 "In Stream Selection, click an eAxC to pair its own DL and UL, or a UL / DL cell to take that "
+                 "direction from another eAxC - for receiving on another antenna than transmitting.");
     }
 
     // --- Processing window ------------------------------------------------
     if (section_header("Processing window", true)) {
         changed |= ImGui::InputInt("Time range (symbols)", &cfg.time_symbols);
+        ImGui::SameLine();
+        gui_hint("y-depth",
+                 "Symbols per processing window: Range-Time's rows and the Doppler FFT's length. 280 is one "
+                 "frame at 30 kHz. A longer window gives finer Doppler bins but needs a larger Memory size.");
+        if (symbol_s > 0.0 && cfg.time_symbols > 0) {
+            // A frame is 10 ms whatever the numerology.
+            const double window_ms = (double)cfg.time_symbols * symbol_s * 1000.0;
+            ImGui::TextDisabled("y-depth: %.1f ms = %.2f frames per batch", window_ms, window_ms / 10.0);
+        }
+        if (st.window_symbols > 0 && st.window_symbols < cfg.time_symbols) {
+            ImGui::TextColored(warn_color, "Ring holds only %d symbols (Memory size, set at startup).",
+                               st.window_symbols);
+        }
+
+        bool batch_aligned = cfg.batch_aligned != 0;
+        if (ImGui::Checkbox("Batch-aligned", &batch_aligned)) {
+            cfg.batch_aligned = batch_aligned ? 1 : 0;
+            changed = true;
+        }
+        ImGui::SameLine();
+        gui_hint("whole batches",
+                 "On: each frame is one whole batch of Time range symbols, starting at a multiple of it, "
+                 "computed once. A radar slower than the data skips batches, but every frame it shows is "
+                 "complete and frame-aligned.\n\n"
+                 "Off: the newest Time range symbols, recomputed every pass. Scrolls smoothly while the radar "
+                 "keeps up; once the data outruns it, every frame starts somewhere new.");
+        if (cfg.batch_aligned) {
+            if (st.batch_waiting) {
+                ImGui::TextDisabled("Waiting for the first complete batch.");
+            } else if (st.window_symbols > 0) {
+                ImGui::TextDisabled("Batch %lld (symbols %lld-%lld), %llu skipped",
+                                    (long long)st.batch_index,
+                                    (long long)st.batch_index * st.window_symbols,
+                                    (long long)(st.batch_index + 1) * st.window_symbols - 1,
+                                    (unsigned long long)st.batches_skipped);
+            }
+            const int min_ring = fh_radar_min_ring_symbols(&cfg);
+            if (dl != nullptr && min_ring > 0 && dl->max_symbols < (size_t)min_ring) {
+                ImGui::TextColored(warn_color, "Memory size %zu < %d: a late batch can lose", dl->max_symbols, min_ring);
+                ImGui::TextColored(warn_color, "its first symbols before it is read.");
+            }
+        }
+
         changed |= ImGui::InputInt("Freq. start (RE index)", &cfg.freq_start_re);
         changed |= ImGui::InputInt("Freq. end (RE index)", &cfg.freq_end_re);
 
@@ -798,8 +861,10 @@ static void draw_radar_window(fh_radar_t* radar,
     // --- Symbol pairing ---------------------------------------------------
     if (section_header("Symbol pairing", true)) {
         changed |= ImGui::InputInt("DL->UL lag (symbols)", &cfg.dl_ul_lag_symbols);
-        ImGui::TextDisabled("UL symbol n+lag is divided against DL symbol n. Sweep this");
-        ImGui::TextDisabled("if the paired count below stays low or mean |H| is wrong.");
+        ImGui::SameLine();
+        gui_hint("UL n+lag / DL n",
+                 "UL symbol n+lag is divided against DL symbol n. Sweep this if the paired count below stays "
+                 "low or mean |H| is wrong.");
 
         int division_int = (int)cfg.division;
         ImGui::TextUnformatted("Division");
@@ -810,9 +875,10 @@ static void draw_radar_window(fh_radar_t* radar,
             cfg.division = (fh_radar_division_t)division_int;
             changed = true;
         }
-        ImGui::TextDisabled("UL/DL is the physical channel. DL/UL is its reciprocal and");
-        ImGui::TextDisabled("mirrors the delay axis - both read ~1 on occupied REs, so");
-        ImGui::TextDisabled("the mean below cannot tell them apart.");
+        ImGui::SameLine();
+        gui_hint("UL/DL = channel",
+                 "UL/DL is the physical channel. DL/UL is its reciprocal and mirrors the delay axis - both "
+                 "read about 1 on occupied REs, so the mean below cannot tell them apart.");
 
         ImGui::Text("Paired: %d / %d symbols", st.paired_symbols, st.window_symbols);
         ImGui::Text("Skipped: %d (DL empty), %d (UL missing)",
@@ -842,6 +908,33 @@ static void draw_radar_window(fh_radar_t* radar,
             cfg.ifft_size = ifft_sizes[ifft_index];
             changed = true;
         }
+        ImGui::SameLine();
+        gui_hint("pads or crops",
+                 "Length of the per-symbol delay transform. Taps are c / (2 N SCS) apart, but the resolution "
+                 "itself is set by the occupied bandwidth, so a size above the RE span only interpolates. A "
+                 "span wider than the transform is cropped to its first N REs.");
+
+        // Widget edits this frame are not clamped yet, so an end before the
+        // start has to be caught here rather than assumed away.
+        const int span = cfg.freq_end_re - cfg.freq_start_re + 1;
+        if (span > 0) {
+            int used_start = 0;
+            int used_end = 0;
+            fh_radar_used_re_range(&cfg, &used_start, &used_end);
+            const int used = used_end - used_start + 1;
+            if (used < span) {
+                ImGui::TextColored(warn_color, "Span cropped to RE %d-%d (%d of %d) to fit the IFFT",
+                                   used_start, used_end, used, span);
+            } else {
+                ImGui::TextDisabled("RE %d-%d, zero-padded %d -> %d", used_start, used_end, used, cfg.ifft_size);
+            }
+        }
+        changed |= radar_window_combo("Range window", &cfg.range_window);
+        ImGui::SameLine();
+        gui_hint("sidelobes vs width",
+                 "Taper across the used REs before the IFFT. Rectangular keeps the full resolution but leaves "
+                 "-13 dB sidelobes that smear strong paths over other taps; Hann widens the main lobe for "
+                 "-31 dB sidelobes.");
 
         // Only the Doppler stage truncates: Range-Time plots the full transform.
         const bool depth_applies = (cfg.output == RADAR_OUT_RANGE_DOPPLER);
@@ -852,14 +945,14 @@ static void draw_radar_window(fh_radar_t* radar,
         if (!depth_applies) {
             ImGui::EndDisabled();
         }
+        ImGui::SameLine();
+        gui_hint("x-depth, Range-Doppler",
+                 "Keeps the nearest taps of each CIR for the Doppler stage: one slow-time FFT per kept tap, so "
+                 "it sets both the map's range extent and its cost. Range-Time always shows every tap.");
         if (depth_applies) {
             // One slow-time transform per kept tap, so this field is what sets the
             // refresh cost.
-            ImGui::TextDisabled("%d slow-time FFTs of %d points per refresh",
-                                cfg.cir_depth_taps, cfg.time_symbols);
-        } else {
-            ImGui::TextDisabled("Truncation feeds the Doppler stage only; Range-Time");
-            ImGui::TextDisabled("plots all %d taps.", cfg.ifft_size);
+            ImGui::TextDisabled("%d slow-time FFTs of %d points per refresh", cfg.cir_depth_taps, window_rows);
         }
 
         if (subcarrier_hz > 0.0) {
@@ -872,13 +965,24 @@ static void draw_radar_window(fh_radar_t* radar,
                                 tap_spacing_m, tap_spacing_m * (double)extent_taps);
         }
 
-        const double symbol_s = radar_symbol_seconds(scs_khz);
-        if (symbol_s > 0.0 && cfg.time_symbols > 0) {
-            const double doppler_res_hz = 1.0 / ((double)cfg.time_symbols * symbol_s);
+        if (symbol_s > 0.0 && window_rows > 0) {
+            const double doppler_res_hz = 1.0 / ((double)window_rows * symbol_s);
             const double doppler_span_hz = 1.0 / (2.0 * symbol_s);
             ImGui::TextDisabled("Doppler: %.1f Hz resolution, +/- %.1f kHz unambiguous",
                                 doppler_res_hz, doppler_span_hz / 1000.0);
         }
+
+        if (!depth_applies) {
+            ImGui::BeginDisabled();
+        }
+        changed |= radar_window_combo("Doppler window", &cfg.doppler_window);
+        if (!depth_applies) {
+            ImGui::EndDisabled();
+        }
+        ImGui::SameLine();
+        gui_hint("across symbols",
+                 "Taper across the window's symbols before the Doppler FFT - the same trade as the range "
+                 "window, along the Doppler axis. Range-Doppler only.");
     }
 
     // --- Cancellation -----------------------------------------------------
@@ -888,14 +992,20 @@ static void draw_radar_window(fh_radar_t* radar,
             cfg.mti_enabled = mti ? 1 : 0;
             changed = true;
         }
-        ImGui::TextDisabled("Subtracts each tap's mean over the window. Removes the");
-        ImGui::TextDisabled("Tx->Rx leakage and anything stationary; moving targets stay.");
+        ImGui::SameLine();
+        gui_hint("removes static paths",
+                 "Subtracts each tap's mean over the window. Removes the Tx->Rx leakage and anything "
+                 "stationary; moving targets stay.");
 
         bool blank = cfg.blank_taps_enabled != 0;
         if (ImGui::Checkbox("Blank leading taps", &blank)) {
             cfg.blank_taps_enabled = blank ? 1 : 0;
             changed = true;
         }
+        ImGui::SameLine();
+        gui_hint("kills the direct path",
+                 "Zeroes the first K taps. Kills the direct path even when it drifts, which MTI alone leaves as "
+                 "a residual - at the cost of any target that close.");
         if (!blank) {
             ImGui::BeginDisabled();
         }
@@ -903,87 +1013,147 @@ static void draw_radar_window(fh_radar_t* radar,
         if (!blank) {
             ImGui::EndDisabled();
         }
-        ImGui::TextDisabled("Kills the direct path even when it drifts, which MTI alone");
-        ImGui::TextDisabled("leaves as a residual - at the cost of any target that close.");
     }
 
     // --- Output -----------------------------------------------------------
     if (section_header("Output", true)) {
         int output_int = (int)cfg.output;
         ImGui::RadioButton("CFR magnitude", &output_int, RADAR_OUT_CFR);
+        ImGui::SameLine();
+        gui_hint("symbol x RE",
+                 "|H| per resource element, no transform involved - the view that says whether the DL/UL "
+                 "pairing itself is right.");
         ImGui::RadioButton("Range-Time", &output_int, RADAR_OUT_RANGE_TIME);
+        ImGui::SameLine();
+        gui_hint("symbol x delay", "One CIR per symbol, every tap of the IFFT.");
         ImGui::RadioButton("Range-Doppler", &output_int, RADAR_OUT_RANGE_DOPPLER);
+        ImGui::SameLine();
+        gui_hint("Doppler x delay",
+                 "Doppler bin x delay tap over the whole window. Zero Doppler is the centre row, approaching "
+                 "targets above it.");
         if (output_int != (int)cfg.output) {
             cfg.output = (fh_radar_output_t)output_int;
             changed = true;
         }
 
-        if (cfg.output == RADAR_OUT_CFR) {
-            ImGui::TextDisabled("Symbol x RE. No transform involved - this is the view");
-            ImGui::TextDisabled("that says whether the pairing itself is right.");
-        } else {
-            ImGui::TextColored(warn_color, "Not implemented yet - the transform stages");
-            ImGui::TextColored(warn_color, "are the next step. The plot stays blank.");
+        if (cfg.output != RADAR_OUT_CFR) {
+            bool db = cfg.db_scale != 0;
+            if (ImGui::Checkbox("dB scale", &db)) {
+                cfg.db_scale = db ? 1 : 0;
+                changed = true;
+            }
+            ImGui::SameLine();
+            gui_hint("dB above floor",
+                     "Cells read dB above a floor Dynamic range below the frame's peak; everything under it reads "
+                     "0. The CFR view always stays linear, since |H| near 1 is its check.");
+            if (!db) {
+                ImGui::BeginDisabled();
+            }
+            changed |= ImGui::InputFloat("Dynamic range (dB)", &cfg.db_range, 5.0f, 10.0f, "%.0f");
+            if (!db) {
+                ImGui::EndDisabled();
+            }
         }
     }
 
     // --- Rolling mean -----------------------------------------------------
-    // Lives in the visualizer rather than the radar core, like the waterfall's:
-    // it is a way of displaying frames, not a processing stage. Its settings
-    // are separate from the waterfall's because the two average different
-    // quantities.
+    // One set of fields, two means: the CFR view's lives in the visualizer,
+    // the transform outputs' in the radar core, where it can average power
+    // before the dB step. The visualizer holds the values; they are mirrored
+    // into the radar config below.
     if (visualizer != nullptr &&
         section_header("Rolling mean", visualizer_get_radar_persistence_enabled(visualizer) != 0)) {
-        const bool mean_applies = (cfg.output == RADAR_OUT_CFR);
-        if (!mean_applies) {
-            ImGui::BeginDisabled();
-        }
+        const bool range_doppler = (cfg.output == RADAR_OUT_RANGE_DOPPLER);
 
         bool mean_enabled = visualizer_get_radar_persistence_enabled(visualizer) != 0;
         if (ImGui::Checkbox("Rolling mean (persistence)", &mean_enabled)) {
             visualizer_set_radar_persistence_enabled(visualizer, mean_enabled ? 1 : 0);
         }
+        ImGui::SameLine();
+        if (cfg.output == RADAR_OUT_CFR) {
+            gui_hint("per symbol % period",
+                     "Averages |H| per (symbol % period, RE). REs without an estimate in both directions are "
+                     "skipped and stay black. Starts over on a new pair, a Reset, or a change of frequency "
+                     "range, lag or division.");
+        } else {
+            gui_hint(range_doppler ? "per batch" : "per symbol % period",
+                     range_doppler
+                         ? "Averages whole maps, cell by cell, one per batch. Power is averaged before the dB "
+                           "step. Starts over on a new pair, a Reset, or a change of what the cells measure: "
+                           "frequency range, lag, division, IFFT, windows, MTI, blanking."
+                         : "Averages per (symbol % period, tap); rows show the offset in the period and stay "
+                           "black until a symbol reaches them. Power is averaged before the dB step. Starts over "
+                           "on a new pair, a Reset, or a change of what the cells measure: frequency range, lag, "
+                           "division, IFFT, windows, MTI, blanking.");
+        }
 
+        // A Range-Doppler map has no symbol rows to take a phase of.
+        if (range_doppler) {
+            ImGui::BeginDisabled();
+        }
         int mean_period = visualizer_get_radar_persistence_period(visualizer);
         if (ImGui::InputInt("Averaging period (symbols)", &mean_period)) {
-            visualizer_set_radar_persistence_period(visualizer, mean_period);
+            visualizer_set_radar_persistence_period(
+                visualizer, std::clamp(mean_period, 1, FH_RADAR_MAX_PERSIST_PERIOD));
+        }
+        ImGui::SameLine();
+        gui_hint("14 = one slot",
+                 "Multiples of 14 align to slot boundaries; 280 is one frame at 30 kHz. Range-Doppler maps "
+                 "have no symbol rows, so it does not apply to them.");
+        if (range_doppler) {
+            ImGui::EndDisabled();
         }
 
         int mean_n = visualizer_get_radar_persistence_n(visualizer);
-        if (ImGui::InputInt("n (periods to average)", &mean_n)) {
-            visualizer_set_radar_persistence_n(visualizer, mean_n);
+        if (ImGui::InputInt(range_doppler ? "n (maps to average)" : "n (periods to average)", &mean_n)) {
+            visualizer_set_radar_persistence_n(visualizer, std::clamp(mean_n, 1, FH_RADAR_MAX_PERSIST_N));
         }
 
         // Labelled apart from the radar's own Reset below, which drops the
         // computed frame as well; ImGui also needs the two IDs to differ.
         if (ImGui::Button("Reset mean")) {
             visualizer_reset_radar_persistence(visualizer);
+            fh_radar_reset_persistence(radar);
         }
         if (mean_enabled) {
             ImGui::SameLine();
-            ImGui::Text("Periods accumulated: %d (n = %d)",
-                        visualizer_get_radar_persistence_periods(visualizer),
-                        visualizer_get_radar_persistence_n(visualizer));
+            if (cfg.output == RADAR_OUT_CFR) {
+                ImGui::Text("Periods accumulated: %d (n = %d)",
+                            visualizer_get_radar_persistence_periods(visualizer), mean_n);
+            } else if (st.output == cfg.output) {
+                ImGui::Text(range_doppler ? "Maps folded: %d (n = %d)" : "Periods accumulated: %d (n = %d)",
+                            st.persist_folds, mean_n);
+            }
         }
+    }
 
-        if (!mean_applies) {
-            ImGui::EndDisabled();
-            ImGui::TextDisabled("CFR magnitude only for now.");
-        } else {
-            ImGui::TextDisabled("Averages |H| per (symbol %% period, RE). REs without an");
-            ImGui::TextDisabled("estimate in both directions are skipped and stay black.");
-            ImGui::TextDisabled("Starts over on a new pair, a Reset, or a change of");
-            ImGui::TextDisabled("frequency range, lag or division.");
-            ImGui::TextDisabled("Tip: multiples of 14 align to slot boundaries");
+    // Mirrored every frame, so the two means can never drift apart. The
+    // clamps match the core's own, so the values come back unchanged and this
+    // settles after one write.
+    if (visualizer != nullptr) {
+        const int want_enabled = visualizer_get_radar_persistence_enabled(visualizer) ? 1 : 0;
+        const int want_period =
+            std::clamp(visualizer_get_radar_persistence_period(visualizer), 1, FH_RADAR_MAX_PERSIST_PERIOD);
+        const int want_n = std::clamp(visualizer_get_radar_persistence_n(visualizer), 1, FH_RADAR_MAX_PERSIST_N);
+        if (cfg.persist_enabled != want_enabled || cfg.persist_period != want_period || cfg.persist_n != want_n) {
+            cfg.persist_enabled = want_enabled;
+            cfg.persist_period = want_period;
+            cfg.persist_n = want_n;
+            changed = true;
         }
     }
 
     // --- Compute ----------------------------------------------------------
     if (section_header("Compute", true)) {
         ImGui::Text("FFT threads: %zu", fh_radar_get_fft_threads(radar));
-        ImGui::TextDisabled("Fixed at startup, like decode threads.");
+        ImGui::SameLine();
+        gui_hint("set at startup",
+                 "Fixed for the run, like the decode threads, and shares the same budget of 20 with them.");
         ImGui::Text("Last refresh: %.1f ms   Frames: %llu",
                     st.last_refresh_ms, (unsigned long long)st.refresh_count);
+        if (st.output != RADAR_OUT_CFR) {
+            ImGui::TextDisabled("CFR %.1f ms, transforms %.1f ms", st.cfr_ms, st.transform_ms);
+        }
 
         if (ImGui::Button("Reset")) {
             fh_radar_reset(radar);
@@ -1710,7 +1880,10 @@ fh_oran_memory_t* imgui_visualizer_render(
             }
         }
         // Outside the list's scroll region, where it costs no table rows.
-        ImGui::TextDisabled("eAxC: its own UL+DL. UL/DL cell: that direction only.");
+        gui_hint("click eAxC or UL/DL cell",
+                 "Clicking an eAxC pairs its own UL and DL for the radar. Clicking a UL or DL cell takes only "
+                 "that direction from that eAxC, so the radar can receive on another antenna than it "
+                 "transmits on.");
     } else if (state->selected_eaxc_id_index < num_unique_streams) {
         const char* direction_str = data_direction_to_string(state->selected_data_direction);
         ImGui::Text("Selected: 0x%04X / %s",
@@ -1719,11 +1892,12 @@ fh_oran_memory_t* imgui_visualizer_render(
 
     ImGui::Separator();
     ImGui::Checkbox("Only decode selected", &state->only_decode_selected);
-    if (state->only_decode_selected) {
-        ImGui::TextDisabled(radar_selection ? "Decoding the radar's DL and UL only, on top of"
-                                            : "Decoding the stream on screen only, on top of");
-        ImGui::TextDisabled("the startup filter. The rest hold still until selected.");
-    }
+    ImGui::SameLine();
+    gui_hint(radar_selection ? "radar pair only" : "stream on screen only",
+             radar_selection ? "Decodes only the radar's DL and UL, on top of the startup filter. The other "
+                               "streams hold still until selected."
+                             : "Decodes only the stream on screen, on top of the startup filter. The other "
+                               "streams hold still until selected.");
     if (switch_locked) {
         ImGui::TextColored(ImVec4(0.47f, 0.90f, 1.00f, 1.0f), "Channels locked while frozen - unfreeze to switch.");
     }
@@ -1808,7 +1982,9 @@ fh_oran_memory_t* imgui_visualizer_render(
                 speed_changed = true;
             }
             ImGui::SameLine();
-            ImGui::TextDisabled("Ctrl+click the slider to type a value");
+            gui_hint("Ctrl+click to type",
+                     "Ctrl+click the slider to type an exact value; Half and Double step it by factors of two. "
+                     "Real time is 28 000 packets/s per stream at 30 kHz with one packet per symbol.");
             if (speed_changed) {
                 __atomic_store_n(pcap_speed_pps, speed, __ATOMIC_RELAXED);
             }
@@ -1828,9 +2004,10 @@ fh_oran_memory_t* imgui_visualizer_render(
     if (section_header("Timing Info", true)) {
         if (have_frame_info) {
             ImGui::Text("Frame number: %u", static_cast<unsigned>(current_frame_id));
+            ImGui::SameLine();
+            gui_hint("wraps at 256", "The O-RAN frame ID wraps at 256; Frames since start keeps counting.");
             ImGui::Text("Frames since start: %llu",
                         static_cast<unsigned long long>(state->frames_since_start));
-            ImGui::TextDisabled("Frame number wraps at 256; the total does not.");
         } else {
             ImGui::TextDisabled("No stream selected");
         }
@@ -1888,11 +2065,15 @@ fh_oran_memory_t* imgui_visualizer_render(
         }
         ImGui::SameLine();
         if (!freeze_available) {
-            ImGui::TextDisabled("off while the trigger holds the view");
+            gui_hint("off while triggered",
+                     "A waterfall trigger already decides what the view holds, so Freeze is unavailable while "
+                     "one is set. Turn the trigger off to freeze.");
         } else if (state->frozen) {
             ImGui::TextColored(ImVec4(0.47f, 0.90f, 1.00f, 1.0f), "Memory frozen - capture carries on");
         } else {
-            ImGui::TextDisabled("or press Space");
+            gui_hint("or press Space",
+                     "Freezes the data, not just the picture: nothing new is decoded or written while frozen, "
+                     "but the capture keeps running, so nothing backs up.");
         }
 
         ImGui::End();
@@ -1918,6 +2099,10 @@ fh_oran_memory_t* imgui_visualizer_render(
                 if (ImGui::InputInt("Averaging period (symbols)", &period)) {
                     visualizer_set_persistence_period(visualizer, period);
                 }
+                ImGui::SameLine();
+                gui_hint("14 = one slot",
+                         "Multiples of 14 align to slot boundaries; slots per subframe x 14 to subframes, and "
+                         "10 times that to frames.");
 
                 int n = visualizer_get_persistence_n(visualizer);
                 if (ImGui::InputInt("n (periods to average)", &n)) {
@@ -1928,13 +2113,12 @@ fh_oran_memory_t* imgui_visualizer_render(
                     visualizer_reset_persistence(visualizer);
                 }
 
-                ImGui::TextDisabled("Tip: multiples of 14 align to slot boundaries");
-                ImGui::TextDisabled("(also multiples of slots/subframe*14, or *10 for frames)");
             }
 
             if (section_header("Trigger", visualizer_get_trigger_mode(visualizer) != TRIGGER_OFF)) {
                 if (persist_enabled) {
-                    ImGui::TextDisabled("Rolling mean is on: triggering on averaged rows");
+                    gui_hint("on averaged rows",
+                             "The rolling mean is on, so the trigger judges averaged rows rather than raw ones.");
                 }
 
                 visualizer_trigger_mode_t trigger_mode = visualizer_get_trigger_mode(visualizer);
@@ -1967,10 +2151,11 @@ fh_oran_memory_t* imgui_visualizer_render(
                 if (ImGui::InputFloat("Trigger level (% of baseline)", &trigger_level_pct, 5.0f, 25.0f, "%.1f")) {
                     visualizer_set_trigger_level_pct(visualizer, trigger_level_pct);
                 }
-                ImGui::TextDisabled("100%% = as strong as a typical recent symbol. Below 100%% fires when");
-                ImGui::TextDisabled("the signal returns after a gap (start of a TDD burst); above 100%%");
-                ImGui::TextDisabled("only on unusually strong ones. Raise it far past the live peak");
-                ImGui::TextDisabled("below to stop firing entirely.");
+                ImGui::SameLine();
+                gui_hint("100% = typical symbol",
+                         "100% is as strong as a typical recent symbol. Below 100% fires when the signal returns "
+                         "after a gap (the start of a TDD burst); above 100% only on unusually strong ones. "
+                         "Raise it far past the live peak below to stop firing entirely.");
 
                 // Reads back off in Single, which has no use for it, and cannot be
                 // ticked there; the Repeat choice returns with Repeat.
@@ -1997,8 +2182,10 @@ fh_oran_memory_t* imgui_visualizer_render(
                 if (!hysteresis_enabled) {
                     ImGui::EndDisabled();
                 }
-                ImGui::TextDisabled("Must clear this level before a new crossing counts as fresh -");
-                ImGui::TextDisabled("keep it below Trigger level for rising edge, above for falling.");
+                ImGui::SameLine();
+                gui_hint("re-arm threshold",
+                         "The signal has to clear this level before a new crossing counts as fresh. Keep it below "
+                         "Trigger level for a rising edge, above it for a falling one.");
 
                 int trigger_freq_start = visualizer_get_trigger_freq_start(visualizer);
                 int trigger_freq_end = visualizer_get_trigger_freq_end(visualizer);
@@ -2008,16 +2195,20 @@ fh_oran_memory_t* imgui_visualizer_render(
                 if (freq_changed) {
                     visualizer_set_trigger_freq_range(visualizer, trigger_freq_start, trigger_freq_end);
                 }
-                ImGui::TextDisabled("Restricts where triggering searches (0-3275); does not");
-                ImGui::TextDisabled("affect what's displayed once triggered.");
+                ImGui::SameLine();
+                gui_hint("search range only",
+                         "Restricts where triggering searches (RE 0-3275). Does not affect what is displayed once "
+                         "triggered.");
 
                 int trigger_capture_depth = visualizer_get_trigger_capture_depth(visualizer);
                 if (ImGui::InputInt("Trigger capture depth (symbols)", &trigger_capture_depth)) {
                     visualizer_set_trigger_capture_depth(visualizer, trigger_capture_depth);
                 }
-                ImGui::TextDisabled("Rows used by a capture (half before/half after the trigger) -");
-                ImGui::TextDisabled("keep well under Memory size, or the post-trigger wait will");
-                ImGui::TextDisabled("evict the pre-trigger half before it completes.");
+                ImGui::SameLine();
+                gui_hint("half before, half after",
+                         "Rows a capture uses, half before and half after the trigger. Keep it well under Memory "
+                         "size, or waiting for the post-trigger half evicts the pre-trigger half before it "
+                         "completes.");
 
                 if (trigger_mode == TRIGGER_OFF) {
                     ImGui::BeginDisabled();
@@ -2116,6 +2307,8 @@ fh_oran_memory_t* imgui_visualizer_render(
                     if (ImGui::InputInt("Averaging period (symbols)", &mean_period)) {
                         visualizer_set_curve_mean_period(visualizer, mean_period);
                     }
+                    ImGui::SameLine();
+                    gui_hint("14 = one slot", "Multiples of 14 align to slot boundaries.");
                 }
 
                 int mean_n = visualizer_get_curve_mean_n(visualizer);
@@ -2130,8 +2323,6 @@ fh_oran_memory_t* imgui_visualizer_render(
                 if (!mean_enabled) {
                     ImGui::EndDisabled();
                 }
-
-                ImGui::TextDisabled("Tip: multiples of 14 align to slot boundaries");
             }
 
             ImGui::End();
@@ -2145,7 +2336,8 @@ fh_oran_memory_t* imgui_visualizer_render(
 
         if (section_header("Marker list", visualizer_get_marker_count(visualizer) > 0)) {
             ImGui::Text("Offset from: %s", visualizer_get_marker_reference_label(visualizer));
-            ImGui::TextDisabled("Positive offset = newer (further down)");
+            ImGui::SameLine();
+            gui_hint("+ = newer", "Positive offsets are newer symbols, further down the plot.");
 
             const int marker_count = visualizer_get_marker_count(visualizer);
             if (ImGui::Button("Add marker")) {
@@ -2246,7 +2438,8 @@ fh_oran_memory_t* imgui_visualizer_render(
                 ImGui::EndTable();
             }
 
-            ImGui::TextDisabled("Baseline = mean magnitude currently on screen");
+            gui_hint("% base = vs. screen mean",
+                     "% base compares each marker with the mean magnitude currently on screen.");
         }
 
         // Value at cursor: the same readout a marker gives, but following the
@@ -2270,8 +2463,7 @@ fh_oran_memory_t* imgui_visualizer_render(
                 const float readout_h = ImGui::GetTextLineHeightWithSpacing() * 4.0f;
                 ImGui::BeginChild("cursor_readout", ImVec2(320.0f, readout_h), false);
                 if (curve_view_active) {
-                    ImGui::TextDisabled("Not available in Curve view: the");
-                    ImGui::TextDisabled("vertical axis is magnitude, not time.");
+                    gui_hint("not in Curve view", "The Curve view's vertical axis is magnitude, not time.");
                 } else if (!cursor_sample.valid) {
                     ImGui::TextDisabled("Hover the plot to read a cell");
                 } else {

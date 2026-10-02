@@ -38,6 +38,7 @@ add_executable(fronthaul_sniffer
     src/core/bfp_decompress.c
     src/core/c_oran_memory.c
     src/core/c_radar.c
+    src/core/c_radar_dsp.c
     src/analysis/c_iq_analysis.c
     src/visualization/opengl_visualizer.cpp
     src/gui/imgui_startup_interface.cpp
@@ -96,5 +97,5 @@ target_link_libraries(fronthaul_sniffer PRIVATE ${FFTW3F_THREADS_LIBRARY})
 if(FH_NATIVE_ARCH)
     # Scoped to the DSP core alone: FFTW already picks its SIMD codelets at
     # runtime, so -march=native only reaches the loops written here.
-    set_source_files_properties(src/core/c_radar.c PROPERTIES COMPILE_OPTIONS "-march=native")
+    set_source_files_properties(src/core/c_radar.c src/core/c_radar_dsp.c PROPERTIES COMPILE_OPTIONS "-march=native")
 endif()
