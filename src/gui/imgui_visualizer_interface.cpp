@@ -1,5 +1,6 @@
 #include "imgui_visualizer_interface.h"
 #include "gui/imgui_hint.h"
+#include "gui/imgui_theme.h"
 #include "capture/c_pcap_demo_stream.h"
 #include "core/c_oran_memory.h"
 #include "core/c_radar.h"
@@ -40,6 +41,10 @@ struct imgui_visualizer_state {
     // channel and view shows one moment. Owned here; main applies it to the
     // decode workers - see imgui_visualizer_get_frozen.
     bool frozen;
+
+    // IQ Constellation: whether its window is wanted. Owned here, opened and
+    // closed by main - see imgui_visualizer_get_constellation_enabled.
+    bool constellation_enabled;
 
     int selected_marker;
 
@@ -473,9 +478,51 @@ void handle_zoom_input(opengl_visualizer_t* visualizer) {
     }
 }
 
+// Curve view's preview in the minimap: its newest trace, red as in the view,
+// and the mean line in its yellow while it is shown. Vertically in the same
+// normalised coordinates as the zoom window, full scale at the top. Returns
+// whether there was anything to draw.
+bool draw_curve_preview(const opengl_visualizer_t* visualizer, ImDrawList* dl, ImVec2 p0, ImVec2 p1) {
+    // One point per minimap pixel column.
+    const int MAX_COLUMNS = 512;
+    int columns = (int)(p1.x - p0.x);
+    if (columns > MAX_COLUMNS) {
+        columns = MAX_COLUMNS;
+    }
+    if (columns < 2) {
+        return false;
+    }
+    float trace[MAX_COLUMNS];
+    float mean[MAX_COLUMNS];
+    const int filled = visualizer_get_curve_overview(visualizer, columns, trace, mean);
+    if (filled == 0) {
+        return false;
+    }
+
+    const float w = p1.x - p0.x;
+    const float h = p1.y - p0.y;
+    ImVec2 points[MAX_COLUMNS];
+    const auto draw_line = [&](const float* values, ImU32 color) {
+        for (int k = 0; k < columns; k++) {
+            points[k] = ImVec2(p0.x + ((float)k + 0.5f) * w / (float)columns, p0.y + (1.0f - values[k]) * h);
+        }
+        dl->AddPolyline(points, columns, color, 0, 1.0f);
+    };
+    dl->PushClipRect(p0, p1, true);
+    if (filled & 1) {
+        draw_line(trace, IM_COL32(255, 60, 60, 255));
+    }
+    if (filled & 2) {
+        draw_line(mean, IM_COL32(255, 217, 64, 255));
+    }
+    dl->PopClipRect();
+    return true;
+}
+
 // An overview of where the zoom window sits inside the whole display extent:
-// outer box is everything the view could show, inner box is what it is showing.
-// Quarter gridlines give the eye something to judge the position against.
+// outer box is everything the view could show, drawn in miniature underneath,
+// inner box is what it is showing. Quarter gridlines give the eye something to
+// judge the position against.
 void draw_zoom_minimap(opengl_visualizer_t* visualizer) {
     const float MINIMAP_W = 260.0f;
     const float MINIMAP_H = 110.0f;
@@ -495,10 +542,22 @@ void draw_zoom_minimap(opengl_visualizer_t* visualizer) {
     ImDrawList* dl = ImGui::GetWindowDrawList();
     dl->AddRectFilled(p0, p1, IM_COL32(24, 24, 28, 255));
 
+    // The preview is the whole view stretched to the box, the same mapping the
+    // window marker below uses, so the marker frames exactly what is on screen.
+    bool have_preview = false;
+    const unsigned int preview = visualizer_get_overview_texture(visualizer, (int)w, (int)h);
+    if (preview != 0) {
+        dl->AddImage((ImTextureID)(intptr_t)preview, p0, p1);
+        have_preview = true;
+    } else {
+        have_preview = draw_curve_preview(visualizer, dl, p0, p1);
+    }
+
+    // Faint over a preview, so the grid does not hide what it divides.
+    const ImU32 grid = have_preview ? IM_COL32(200, 200, 210, 45) : IM_COL32(70, 70, 78, 255);
     for (int q = 1; q < 4; q++) {
         const float fx = p0.x + w * (float)q * 0.25f;
         const float fy = p0.y + h * (float)q * 0.25f;
-        const ImU32 grid = IM_COL32(70, 70, 78, 255);
         dl->AddLine(ImVec2(fx, p0.y), ImVec2(fx, p1.y), grid);
         dl->AddLine(ImVec2(p0.x, fy), ImVec2(p1.x, fy), grid);
     }
@@ -576,8 +635,9 @@ void draw_zoom_window(opengl_visualizer_t* visualizer) {
                                 total_rows, doppler_y ? "bins" : "rows");
         }
         gui_hint("display only",
-                 "Zooming only changes which part of the plot is on screen. Memory size, the averaging period "
-                 "and the trigger's capture depth are untouched by anything here.");
+                 "The map shows the whole view in miniature, with the part on screen marked; it refreshes a "
+                 "little behind the plot. Zooming only changes which part of the plot is on screen. Memory "
+                 "size, the averaging period and the trigger's capture depth are untouched by anything here.");
     }
 
     zoom_window_t w = zoom_window_in_units(visualizer, x_total, y_total);
@@ -1506,6 +1566,7 @@ imgui_visualizer_state_t* imgui_visualizer_init(int window_width, int window_hei
     state->radar_ul_eaxc = 0;
     state->only_decode_selected = false;
     state->frozen = false;
+    state->constellation_enabled = false;
     state->selected_marker = -1;
     state->cursor_value_enabled = false;
     state->cursor_value_at_cursor = true;
@@ -1605,15 +1666,7 @@ fh_oran_memory_t* imgui_visualizer_render(
     ImGui::SetNextWindowSize(ImVec2(300, 200), ImGuiCond_FirstUseEver);
 
     // Apply startup-specific theme: purple background, green accents
-    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.4f, 0.2f, 0.5f, 0.95f));       // Purple
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.2f, 0.9f, 0.2f, 1.0f));             // Green text
-    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.7f, 0.2f, 0.8f));           // Green button
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.3f, 0.9f, 0.3f, 1.0f));    // Bright green hover
-    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.1f, 0.6f, 0.1f, 1.0f));     // Dark green active
-    ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0.2f, 0.6f, 0.2f, 0.8f));           // Green header
-    ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0.3f, 0.8f, 0.3f, 0.9f));    // Bright green header hover
-    ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.15f, 0.15f, 0.2f, 0.8f));        // Dark frame
-    ImGui::PushStyleColor(ImGuiCol_CheckMark, ImVec4(0.3f, 0.9f, 0.3f, 1.0f));        // Green checkmark
+    gui_push_theme();
 
     ImGui::Begin("Stream Selection", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
 
@@ -2080,6 +2133,14 @@ fh_oran_memory_t* imgui_visualizer_render(
             visualizer_set_view_mode(visualizer, (visualizer_view_mode_t)mode_int);
             view_mode = (visualizer_view_mode_t)mode_int;
         }
+
+        // Not a fourth radio: the constellation lives in a window of its own,
+        // next to whichever of the three views stays on screen here.
+        ImGui::Checkbox("IQ Constellation", &state->constellation_enabled);
+        ImGui::SameLine();
+        gui_hint("own window",
+                 "Opens a second window plotting every IQ sample of the stream on screen on the complex plane. "
+                 "It can be moved to another monitor and resized freely; closing it unticks this.");
 
         // Freezes the data, not just the picture: see imgui_visualizer_get_frozen.
         // Lit while frozen, the same way a selected stream button is. Only
@@ -2573,7 +2634,7 @@ fh_oran_memory_t* imgui_visualizer_render(
     }
 
     // Pop the theme colors
-    ImGui::PopStyleColor(9);
+    gui_pop_theme();
 
     // Finalize the frame so the caller can submit draw data after the heatmap pass.
     ImGui::Render();
@@ -2626,6 +2687,16 @@ fh_oran_memory_t* imgui_visualizer_render(
 
 bool imgui_visualizer_get_frozen(const imgui_visualizer_state_t* state) {
     return state != nullptr && state->frozen;
+}
+
+bool imgui_visualizer_get_constellation_enabled(const imgui_visualizer_state_t* state) {
+    return state != nullptr && state->constellation_enabled;
+}
+
+void imgui_visualizer_set_constellation_enabled(imgui_visualizer_state_t* state, bool enabled) {
+    if (state != nullptr) {
+        state->constellation_enabled = enabled;
+    }
 }
 
 void imgui_visualizer_present(void) {

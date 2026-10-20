@@ -291,6 +291,61 @@ void visualizer_zoom_by(opengl_visualizer_t* vis,
 // by the same visual distance no matter how deep the zoom is.
 void visualizer_pan_by(opengl_visualizer_t* vis, float x_fraction, float y_fraction);
 
+// --- Zoomed selection ---
+// The zoom window of the frame last drawn, translated back into the symbol
+// ring's terms, so another view (the IQ constellation) can restrict itself to
+// exactly the data the main view has zoomed into. Each axis only narrows what
+// it measures: the horizontal one gives a resource-element range when it spans
+// resource elements, the vertical one a symbol range when its rows are
+// symbols, or a phase range when they are positions in a rolling mean's
+// averaging period. An axis measuring something else - delay taps, Doppler
+// bins, magnitude - leaves its side of the selection open.
+typedef enum visualizer_selection_time {
+    VISUALIZER_SELECTION_TIME_ALL = 0,     // every symbol
+    VISUALIZER_SELECTION_TIME_SYMBOLS = 1, // absolute symbols [symbol_first, symbol_last]
+    VISUALIZER_SELECTION_TIME_PHASES = 2   // symbols whose (symbol % period) is in
+                                           // [phase_first, phase_first + phase_count), wrapping
+} visualizer_selection_time_t;
+
+typedef struct visualizer_zoom_selection {
+    int valid;          // a frame with a usable grid has been drawn
+    int zoomed;         // the main view shows less than its whole extent
+    int re_first;       // inclusive, 0..3275
+    int re_last;
+    visualizer_selection_time_t time;
+    int symbol_first;   // TIME_SYMBOLS, inclusive
+    int symbol_last;
+    int phase_first;    // TIME_PHASES
+    int phase_count;
+    int period;
+} visualizer_zoom_selection_t;
+
+// Always fills out; with nothing drawn yet it describes everything.
+void visualizer_get_zoom_selection(const opengl_visualizer_t* vis, visualizer_zoom_selection_t* out);
+
+// The waterfall's colour scale: norm 0 is the dark-blue bottom of the
+// gradient, 1 its hot end; values outside [0,1] are clamped.
+void visualizer_heatmap_rgb(float norm, unsigned char* r, unsigned char* g, unsigned char* b);
+
+// --- Overview previews for the Zoom window's minimap ---
+// The whole, unzoomed view in miniature, for the minimap to draw under its
+// window marker. Both describe the frame last drawn, like the axes do.
+
+// The plot texture box-filtered down to width x height, as a GL texture in the
+// main window's context, which must be current. Waterfall (live, triggered,
+// rolling mean) and every radar output. Kept up to date with the plot, at
+// most ~15 times a second while it changes. Returns 0 when the view has no
+// texture to preview: Curve view, or nothing drawn yet.
+unsigned int visualizer_get_overview_texture(opengl_visualizer_t* vis, int width, int height);
+
+// Curve view's equivalent: the newest trace and, while it is shown, the mean
+// line, each squeezed into `columns` points as fractions of the full vertical
+// scale (0 bottom, 1 top), keeping the highest value of each stretch of
+// resource elements. Both arrays must hold `columns` floats. Returns a bit
+// mask: 1 when out_trace was filled, 2 when out_mean was; 0 outside Curve view
+// or before it has drawn anything.
+int visualizer_get_curve_overview(const opengl_visualizer_t* vis, int columns, float* out_trace, float* out_mean);
+
 // Vertical extent of the fully zoomed-out waterfall, in texture rows - the
 // denominator the normalized y window is a fraction of. Follows whichever of
 // Memory size, averaging period or capture depth is driving the view, so the

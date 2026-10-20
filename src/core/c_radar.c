@@ -424,6 +424,58 @@ static int cfr_row_complex(const fh_complex_t* dl_row,
     return occupied_in_row;
 }
 
+int fh_radar_cfr_symbol(const fh_radar_config_t* cfg,
+                        const fh_oran_memory_t* dl,
+                        const fh_oran_memory_t* ul,
+                        int dl_symbol,
+                        int re_first,
+                        int re_last,
+                        fh_complex_t* out) {
+    if (cfg == NULL || out == NULL) {
+        return -1;
+    }
+    size_t dl_idx = 0;
+    size_t ul_idx = 0;
+    if (!ring_row_for_symbol(dl, dl_symbol, &dl_idx) ||
+        !ring_row_for_symbol(ul, dl_symbol + cfg->dl_ul_lag_symbols, &ul_idx)) {
+        return -1;
+    }
+
+    const int start = (re_first > cfg->freq_start_re) ? re_first : cfg->freq_start_re;
+    const int end = (re_last < cfg->freq_end_re) ? re_last : cfg->freq_end_re;
+    const int lo = (start < 0) ? 0 : start;
+    const int hi = (end > FH_RADAR_RE_COUNT - 1) ? FH_RADAR_RE_COUNT - 1 : end;
+
+    // The same float-halves arithmetic as cfr_row_complex, without the window.
+    const int ul_over_dl = (cfg->division == RADAR_DIV_UL_OVER_DL);
+    const float* num = (const float*)(ul_over_dl ? ul->symbols[ul_idx] : dl->symbols[dl_idx]);
+    const float* den = (const float*)(ul_over_dl ? dl->symbols[dl_idx] : ul->symbols[ul_idx]);
+    const float* dl_row = (const float*)dl->symbols[dl_idx];
+    float* dst = (float*)out;
+
+    int occupied = 0;
+    int written = 0;
+    for (int re = lo; re <= hi; re++) {
+        if (dl_row[2 * re] != 0.0f || dl_row[2 * re + 1] != 0.0f) {
+            occupied = 1;
+        }
+        const float nr = num[2 * re];
+        const float ni = num[2 * re + 1];
+        const float dr = den[2 * re];
+        const float di = den[2 * re + 1];
+        const float den_p = dr * dr + di * di;
+        // Positive test, so a NaN denominator is skipped as well as 0/0.
+        if (!(den_p > 0.0f)) {
+            continue;
+        }
+        const float inv = 1.0f / den_p;
+        dst[2 * written] = (nr * dr + ni * di) * inv;
+        dst[2 * written + 1] = (ni * dr - nr * di) * inv;
+        written++;
+    }
+    return occupied ? written : -1;
+}
+
 // One full pass: pair each symbol of the window - rows symbols from oldest -
 // across the two rings, divide, and write the result into the sink. Every row
 // of the sink is written, whether or not its symbol paired. have_window is 0

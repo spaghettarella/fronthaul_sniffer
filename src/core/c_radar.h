@@ -125,6 +125,24 @@ int fh_radar_min_ring_symbols(const fh_radar_config_t* cfg);
 // the settings window both go through this, so they cannot disagree.
 void fh_radar_used_re_range(const fh_radar_config_t* cfg, int* out_start, int* out_end);
 
+// The complex channel estimate the CFR view takes |.| of, for one downlink
+// symbol: paired with uplink symbol dl_symbol + lag and divided the way cfg
+// says, over [re_first, re_last] narrowed to cfg's frequency range.
+// Unwindowed, like the CFR view. A resource element yields a value only where
+// the denominator is nonzero; values are written packed, in RE order, into
+// out, which must hold re_last - re_first + 1 of them. Returns how many were
+// written, or -1 when the symbol does not pair: the DL or UL row missing from
+// its ring, or a DL row with nothing in the range - the same symbols the
+// radar's own pass skips. Reads the rings without a lock, like the worker.
+// Callable from any thread; it touches no radar state.
+int fh_radar_cfr_symbol(const fh_radar_config_t* cfg,
+                        const fh_oran_memory_t* dl,
+                        const fh_oran_memory_t* ul,
+                        int dl_symbol,
+                        int re_first,
+                        int re_last,
+                        fh_complex_t* out);
+
 // Radial velocity per hertz of Doppler at the configured carrier, in m/s/Hz:
 // v_rel = f_D * c0 / (2 f_c), the 2 because the echo covers the path twice.
 // Same sign as the Doppler, so positive is approaching. 0 for a missing cfg.

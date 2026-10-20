@@ -9,6 +9,9 @@
 #include <string.h>
 #include <math.h>
 
+#include <algorithm>
+#include <vector>
+
 #define GLFW_INCLUDE_GLU
 #include <GLFW/glfw3.h>
 
@@ -263,6 +266,19 @@ typedef struct opengl_visualizer {
     // loops that happen afterward. Sized to trigger_capture_depth.
     int* trigger_snapshot_symbol;      // absolute symbol number per row; TRIGGER_NO_SYMBOL = not captured yet
     float* trigger_snapshot_magnitude; // trigger_capture_depth * HEATMAP_TEXTURE_WIDTH magnitudes
+
+    // The Zoom window's minimap preview: the plot texture box-filtered down to
+    // the minimap's size, see visualizer_get_overview_texture. The plot
+    // texture's generation counts its uploads, so the preview can tell when it
+    // has fallen behind.
+    unsigned long texture_generation;
+    GLuint overview_texture;            // 0 until first asked for
+    int overview_w;
+    int overview_h;
+    int overview_src_w;                 // plot texture size the preview was made from
+    int overview_src_h;
+    unsigned long overview_generation;
+    double overview_time;
 } opengl_visualizer_t;
 
 // Helper to extract real and imaginary parts from complex type
@@ -1148,19 +1164,7 @@ opengl_visualizer_t* visualizer_create(int width, int height, int texture_height
 // tag still matches (hasn't been evicted/overwritten by ring wraparound).
 // Returns 1 and sets *out_idx on success, 0 if unavailable/out of range.
 static int ring_row_for_symbol(const fh_oran_memory_t* memory, int symbol_num, size_t* out_idx) {
-    if (symbol_num < memory->symbol_lowest || symbol_num > memory->symbol_highest) {
-        return 0;
-    }
-    int age = memory->symbol_highest - symbol_num;
-    size_t idx = (memory->index_symbol_highest + memory->max_symbols - (size_t)age) % memory->max_symbols;
-    if (memory->symbols[idx] == NULL) {
-        return 0;
-    }
-    if (memory->row_symbol_numbers != NULL && memory->row_symbol_numbers[idx] != symbol_num) {
-        return 0;
-    }
-    *out_idx = idx;
-    return 1;
+    return fh_oran_memory_row_for_symbol(memory, symbol_num, out_idx);
 }
 
 // Mutable state + settings for one EMA fold accumulator. Lets Waterfall
@@ -1546,6 +1550,254 @@ int visualizer_get_zoom_total_rows(const opengl_visualizer_t* vis) {
         return vis->axis_rows;
     }
     return vis->tex_height > 0 ? vis->tex_height : 0;
+}
+
+// Cells of an axis the window covers, partially or wholly: [*first, *last] out
+// of count. Partly covered cells count, so the selection never leaves out
+// something that is at least partly on screen.
+static void zoom_window_cells(float origin_norm, float span_norm, int count, int* first, int* last) {
+    const float origin = origin_norm * (float)count;
+    int lo = (int)floorf(origin);
+    int hi = (int)ceilf(origin + span_norm * (float)count) - 1;
+    if (lo < 0) {
+        lo = 0;
+    }
+    if (hi > count - 1) {
+        hi = count - 1;
+    }
+    if (hi < lo) {
+        hi = lo;
+    }
+    *first = lo;
+    *last = hi;
+}
+
+void visualizer_get_zoom_selection(const opengl_visualizer_t* vis, visualizer_zoom_selection_t* out) {
+    if (out == NULL) {
+        return;
+    }
+    memset(out, 0, sizeof(*out));
+    out->re_first = 0;
+    out->re_last = HEATMAP_TEXTURE_WIDTH - 1;
+    out->time = VISUALIZER_SELECTION_TIME_ALL;
+    if (vis == NULL) {
+        return;
+    }
+    out->zoomed = visualizer_zoom_is_active(vis);
+    if (!vis->axis_valid) {
+        return;
+    }
+    out->valid = 1;
+
+    // Read from the axis state the frame published rather than from the view
+    // mode, which is what keeps the waterfall, the curve and every radar
+    // output on one rule: whatever an axis measures decides what it narrows.
+    if (vis->axis_x_unit == AXIS_UNIT_RE) {
+        const int columns = vis->axis_x_count > 0 ? vis->axis_x_count : HEATMAP_TEXTURE_WIDTH;
+        zoom_window_cells(zoom_x_origin(vis), vis->zoom_x_span, columns, &out->re_first, &out->re_last);
+        if (out->re_last > HEATMAP_TEXTURE_WIDTH - 1) {
+            out->re_last = HEATMAP_TEXTURE_WIDTH - 1;
+        }
+    }
+
+    if (vis->axis_y_unit == AXIS_UNIT_SYMBOL && vis->axis_rows > 0) {
+        int row_first = 0;
+        int row_last = 0;
+        zoom_window_cells(zoom_y_origin(vis), vis->zoom_y_span, vis->axis_rows, &row_first, &row_last);
+        if (vis->axis_phase_mode) {
+            const int period = vis->axis_period;
+            if (period > 0) {
+                int count = row_last - row_first + 1;
+                if (count > period) {
+                    count = period;
+                }
+                int phase = (vis->axis_row0_value + row_first) % period;
+                if (phase < 0) {
+                    phase += period;
+                }
+                out->time = VISUALIZER_SELECTION_TIME_PHASES;
+                out->phase_first = phase;
+                out->phase_count = count;
+                out->period = period;
+            }
+        } else {
+            out->time = VISUALIZER_SELECTION_TIME_SYMBOLS;
+            out->symbol_first = vis->axis_row0_value + row_first;
+            out->symbol_last = vis->axis_row0_value + row_last;
+        }
+    }
+}
+
+void visualizer_heatmap_rgb(float norm, unsigned char* r, unsigned char* g, unsigned char* b) {
+    // Written so a NaN lands on 0 too.
+    if (!(norm > 0.0f)) {
+        norm = 0.0f;
+    }
+    if (norm > 1.0f) {
+        norm = 1.0f;
+    }
+    uint8_t rr = 0, gg = 0, bb = 0;
+    magnitude_to_rgb(norm, 1.0f, &rr, &gg, &bb);
+    if (r) { *r = rr; }
+    if (g) { *g = gg; }
+    if (b) { *b = bb; }
+}
+
+// A preview only has to show where things are, not keep pace with the plot,
+// and every refresh reads the whole plot texture - several megabytes at a deep
+// Memory size - so it trails the plot at this rate while the plot changes.
+#define OVERVIEW_REFRESH_INTERVAL_S (1.0 / 15.0)
+
+// Averages each block of source pixels that lands on one preview pixel. A plain
+// GL minification would sample only a few rows of each block, so the preview
+// would shimmer as the waterfall scrolls through them.
+static void overview_box_filter(const uint8_t* src, int src_w, int src_h, uint8_t* dst, int dst_w, int dst_h) {
+    std::vector<int> col_first((size_t)dst_w);
+    std::vector<int> col_end((size_t)dst_w);
+    for (int i = 0; i < dst_w; i++) {
+        int x0 = (int)((long long)i * src_w / dst_w);
+        int x1 = (int)((long long)(i + 1) * src_w / dst_w);
+        if (x0 > src_w - 1) {
+            x0 = src_w - 1;
+        }
+        if (x1 <= x0) {
+            x1 = x0 + 1;  // a source narrower than the preview repeats its pixels
+        }
+        col_first[(size_t)i] = x0;
+        col_end[(size_t)i] = x1;
+    }
+
+    std::vector<uint64_t> sums((size_t)dst_w * 3);
+    for (int j = 0; j < dst_h; j++) {
+        int y0 = (int)((long long)j * src_h / dst_h);
+        int y1 = (int)((long long)(j + 1) * src_h / dst_h);
+        if (y0 > src_h - 1) {
+            y0 = src_h - 1;
+        }
+        if (y1 <= y0) {
+            y1 = y0 + 1;
+        }
+
+        std::fill(sums.begin(), sums.end(), 0);
+        for (int sy = y0; sy < y1; sy++) {
+            const uint8_t* row = src + (size_t)sy * (size_t)src_w * 4;
+            for (int i = 0; i < dst_w; i++) {
+                uint64_t r = 0, g = 0, b = 0;
+                for (int sx = col_first[(size_t)i]; sx < col_end[(size_t)i]; sx++) {
+                    const uint8_t* p = row + (size_t)sx * 4;
+                    r += p[0];
+                    g += p[1];
+                    b += p[2];
+                }
+                sums[(size_t)i * 3 + 0] += r;
+                sums[(size_t)i * 3 + 1] += g;
+                sums[(size_t)i * 3 + 2] += b;
+            }
+        }
+
+        uint8_t* out = dst + (size_t)j * (size_t)dst_w * 4;
+        for (int i = 0; i < dst_w; i++) {
+            const uint64_t area = (uint64_t)(col_end[(size_t)i] - col_first[(size_t)i]) * (uint64_t)(y1 - y0);
+            out[(size_t)i * 4 + 0] = (uint8_t)(sums[(size_t)i * 3 + 0] / area);
+            out[(size_t)i * 4 + 1] = (uint8_t)(sums[(size_t)i * 3 + 1] / area);
+            out[(size_t)i * 4 + 2] = (uint8_t)(sums[(size_t)i * 3 + 2] / area);
+            out[(size_t)i * 4 + 3] = 255;
+        }
+    }
+}
+
+unsigned int visualizer_get_overview_texture(opengl_visualizer_t* vis, int width, int height) {
+    if (vis == NULL || width <= 0 || height <= 0) {
+        return 0;
+    }
+    // Only views drawn from the plot texture have one to preview; the curve
+    // view draws lines straight to the screen.
+    if (!vis->axis_valid || vis->axis_curve_mode || vis->texture_data == NULL || vis->tex_width <= 0 ||
+        vis->tex_height <= 0 || vis->texture_generation == 0) {
+        return 0;
+    }
+
+    // A new size, or a plot reshaped by a settings change or a view switch, is
+    // refreshed at once rather than showing the old picture stretched.
+    const int reshaped = vis->overview_texture == 0 || width != vis->overview_w || height != vis->overview_h ||
+                         vis->tex_width != vis->overview_src_w || vis->tex_height != vis->overview_src_h;
+    const double now = glfwGetTime();
+    const int due = vis->overview_generation != vis->texture_generation &&
+                    (now - vis->overview_time) >= OVERVIEW_REFRESH_INTERVAL_S;
+    if (!reshaped && !due) {
+        return vis->overview_texture;
+    }
+
+    std::vector<uint8_t> pixels((size_t)width * (size_t)height * 4);
+    overview_box_filter(vis->texture_data, vis->tex_width, vis->tex_height, pixels.data(), width, height);
+
+    if (vis->overview_texture == 0) {
+        glGenTextures(1, &vis->overview_texture);
+        glBindTexture(GL_TEXTURE_2D, vis->overview_texture);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    } else {
+        glBindTexture(GL_TEXTURE_2D, vis->overview_texture);
+    }
+    if (width != vis->overview_w || height != vis->overview_h) {
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
+        vis->overview_w = width;
+        vis->overview_h = height;
+    } else {
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
+    }
+
+    vis->overview_src_w = vis->tex_width;
+    vis->overview_src_h = vis->tex_height;
+    vis->overview_generation = vis->texture_generation;
+    vis->overview_time = now;
+    return vis->overview_texture;
+}
+
+int visualizer_get_curve_overview(const opengl_visualizer_t* vis, int columns, float* out_trace, float* out_mean) {
+    if (vis == NULL || columns <= 0 || out_trace == NULL || out_mean == NULL) {
+        return 0;
+    }
+    if (vis->view_mode != VIEW_MODE_CURVE || !vis->axis_valid || !vis->axis_curve_mode) {
+        return 0;
+    }
+    const float scale = vis->curve_frame_scale > 1e-6f ? vis->curve_frame_scale : 1e-6f;
+
+    // Each point is the highest value in its stretch of resource elements, so a
+    // narrow peak survives being squeezed into a few hundred points.
+    const auto pool = [&](const float* src, float* dst) {
+        for (int k = 0; k < columns; k++) {
+            int c0 = (int)((long long)k * HEATMAP_TEXTURE_WIDTH / columns);
+            int c1 = (int)((long long)(k + 1) * HEATMAP_TEXTURE_WIDTH / columns);
+            if (c0 > HEATMAP_TEXTURE_WIDTH - 1) {
+                c0 = HEATMAP_TEXTURE_WIDTH - 1;
+            }
+            if (c1 <= c0) {
+                c1 = c0 + 1;
+            }
+            float peak = 0.0f;
+            for (int col = c0; col < c1; col++) {
+                if (src[col] > peak) {
+                    peak = src[col];
+                }
+            }
+            float norm = peak / scale;
+            dst[k] = norm > 1.0f ? 1.0f : norm;
+        }
+    };
+
+    int filled = 0;
+    if (vis->curve_frame_trace_count > 0 && vis->curve_frame_traces != NULL) {
+        pool(vis->curve_frame_traces, out_trace);  // trace 0 is the newest
+        filled |= 1;
+    }
+    if (vis->curve_frame_has_mean && vis->curve_frame_mean != NULL) {
+        pool(vis->curve_frame_mean, out_mean);
+        filled |= 2;
+    }
+    return filled;
 }
 
 // Gathers what the Curve view draws this frame into curve_frame_*: magnitude
@@ -3558,6 +3810,7 @@ static void render_heatmap_texture(opengl_visualizer_t* vis, const fh_oran_memor
     // Upload texture to GPU
     glBindTexture(GL_TEXTURE_2D, vis->texture_id);
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, vis->tex_width, vis->tex_height, GL_RGBA, GL_UNSIGNED_BYTE, vis->texture_data);
+    vis->texture_generation++;
 }
 
 // Folds every symbol row of a published CFR frame that has not been folded
@@ -3931,6 +4184,7 @@ static int update_radar_texture(opengl_visualizer_t* vis) {
 
     glBindTexture(GL_TEXTURE_2D, vis->texture_id);
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, vis->tex_width, vis->tex_height, GL_RGBA, GL_UNSIGNED_BYTE, vis->texture_data);
+    vis->texture_generation++;
     return 1;
 }
 
@@ -4128,6 +4382,9 @@ void visualizer_destroy(opengl_visualizer_t* vis) {
     
     if (vis->texture_id) {
         glDeleteTextures(1, &vis->texture_id);
+    }
+    if (vis->overview_texture) {
+        glDeleteTextures(1, &vis->overview_texture);
     }
     if (vis->texture_data) {
         free(vis->texture_data);

@@ -7,9 +7,11 @@
 #include "core/c_radar.h"
 #include "pipeline/c_packet_queue.h"
 #include "visualization/opengl_visualizer.h"
+#include "visualization/iq_constellation.h"
 #include "analysis/c_iq_analysis.h"
 #include "gui/imgui_startup_interface.h"
 #include "gui/imgui_visualizer_interface.h"
+#include "gui/imgui_constellation_interface.h"
 
 #include <GL/gl.h>
 
@@ -17,6 +19,7 @@
 #include <csignal>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -1025,6 +1028,25 @@ int main(int argc, char** argv) {
             });
         }
 
+        // IQ Constellation: a window of its own, opened and closed to follow the
+        // View Mode checkbox. The prefs outlive the window, so one closed and
+        // opened again comes back where it was - on the other monitor, say -
+        // set up the same way.
+        iq_constellation_prefs_t constellation_prefs;
+        iq_constellation_default_prefs(&constellation_prefs);
+        iq_constellation_t* constellation = nullptr;
+        imgui_constellation_state_t* constellation_ui = nullptr;
+        auto close_constellation = [&]() {
+            if (constellation_ui != nullptr) {
+                imgui_constellation_shutdown(constellation_ui);
+                constellation_ui = nullptr;
+            }
+            if (constellation != nullptr) {
+                iq_constellation_destroy(constellation, &constellation_prefs);
+                constellation = nullptr;
+            }
+        };
+
         // Main thread runs visualizer render loop with OpenGL calls
         int render_result = 0;
         if (visualizer != nullptr) {
@@ -1048,6 +1070,13 @@ int main(int argc, char** argv) {
                 // Update and obtain live queue stats for UI
                 fh_queue_stats_t stats = fh_packet_queue_stats(queue);
 
+                // The radar reads a DL and a UL ring - possibly from two
+                // different eAxCs - so it needs the pair rather than the one
+                // stream the other views draw. Kept for the frame, since the IQ
+                // constellation plots from the same pair in the Radar view.
+                fh_oran_memory_t* radar_dl = nullptr;
+                fh_oran_memory_t* radar_ul = nullptr;
+
                 // Render ImGui stream selection interface
                 if (imgui_state != nullptr && !keys_snapshot.empty()) {
                     fh_oran_memory_t* previous_display_memory = display_memory;
@@ -1062,12 +1091,6 @@ int main(int argc, char** argv) {
                         ui_width = 1000;
                         ui_height = 800;
                     }
-
-                    // The radar reads a DL and a UL ring - possibly from two
-                    // different eAxCs - so it needs the pair rather than the
-                    // one stream the other views draw.
-                    fh_oran_memory_t* radar_dl = nullptr;
-                    fh_oran_memory_t* radar_ul = nullptr;
 
                     display_memory = imgui_visualizer_render(
                         imgui_state,
@@ -1121,6 +1144,76 @@ int main(int argc, char** argv) {
                 }
 
                 visualizer_present(visualizer);
+
+                // The constellation follows the checkbox both ways: ticking it
+                // opens the window, unticking closes it, and closing the window
+                // from its own title bar - seen by the glfwPollEvents inside
+                // visualizer_update - unticks the box.
+                if (imgui_state != nullptr) {
+                    const bool constellation_wanted = imgui_visualizer_get_constellation_enabled(imgui_state);
+                    if (constellation != nullptr &&
+                        (!constellation_wanted || iq_constellation_close_requested(constellation))) {
+                        close_constellation();
+                        imgui_visualizer_set_constellation_enabled(imgui_state, false);
+                    } else if (constellation == nullptr && constellation_wanted) {
+                        constellation = iq_constellation_create(&constellation_prefs);
+                        if (constellation != nullptr) {
+                            constellation_ui = imgui_constellation_init(constellation);
+                        }
+                        if (constellation_ui == nullptr) {
+                            std::cerr << "warning: could not open the IQ Constellation window\n";
+                            close_constellation();
+                            imgui_visualizer_set_constellation_enabled(imgui_state, false);
+                        }
+                    }
+
+                    if (constellation_ui != nullptr) {
+                        // Drawn after the main frame, so the zoom selection
+                        // describes the frame just presented there.
+                        visualizer_zoom_selection_t selection;
+                        visualizer_get_zoom_selection(visualizer, &selection);
+
+                        // Names a ring by its eAxC, with or without the direction.
+                        const auto label_for = [&](const fh_oran_memory_t* memory, bool with_direction,
+                                                   char* out, std::size_t size) {
+                            out[0] = '\0';
+                            for (std::size_t i = 0; i < keys_snapshot.size() && memory != nullptr; ++i) {
+                                if (memory_ptrs[i] == memory) {
+                                    std::snprintf(out, size, with_direction ? "eAxC 0x%04X %s" : "eAxC 0x%04X",
+                                                  keys_snapshot[i].eaxc_id,
+                                                  data_direction_to_string(keys_snapshot[i].data_direction));
+                                    break;
+                                }
+                            }
+                        };
+                        char stream_label[48];
+                        label_for(display_memory, true, stream_label, sizeof(stream_label));
+
+                        // In the Radar view the constellation offers H of the
+                        // radar's pair, or either of its directions.
+                        iq_constellation_radar_pair_t radar_pair{};
+                        char dl_label[32];
+                        char ul_label[32];
+                        const bool radar_view = visualizer_get_view_mode(visualizer) == VIEW_MODE_RADAR;
+                        if (radar_view) {
+                            radar_pair.dl = radar_dl;
+                            radar_pair.ul = radar_ul;
+                            if (radar != nullptr) {
+                                fh_radar_get_config(radar, &radar_pair.config);
+                            } else {
+                                fh_radar_config_defaults(&radar_pair.config);
+                            }
+                            label_for(radar_dl, false, dl_label, sizeof(dl_label));
+                            label_for(radar_ul, false, ul_label, sizeof(ul_label));
+                            radar_pair.dl_label = dl_label;
+                            radar_pair.ul_label = ul_label;
+                        }
+
+                        imgui_constellation_frame(constellation_ui, constellation, display_memory, &selection,
+                                                  radar_view ? &radar_pair : nullptr, stream_label,
+                                                  imgui_visualizer_get_frozen(imgui_state));
+                    }
+                }
             }
         } else {
             // If no visualizer, block on g_stop
@@ -1180,7 +1273,11 @@ int main(int argc, char** argv) {
                       << " lowest=" << mem_stats.symbol_lowest << '\n';
         }
 
-        // Release resources in reverse order of creation.
+        // Release resources in reverse order of creation. The constellation
+        // first: its window has to close before glfwTerminate in
+        // visualizer_destroy, and its context is switched back and forth with
+        // the main ImGui context.
+        close_constellation();
         if (imgui_state != nullptr) {
             imgui_visualizer_shutdown(imgui_state);
         }

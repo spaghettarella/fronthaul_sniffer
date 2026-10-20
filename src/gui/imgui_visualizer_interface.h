@@ -99,6 +99,13 @@ struct fh_oran_memory* imgui_visualizer_render(
 // view shows the same moment; the caller applies that to its decode workers.
 bool imgui_visualizer_get_frozen(const imgui_visualizer_state_t* state);
 
+// Whether the IQ Constellation box in the View Mode window is ticked. The
+// caller opens and closes the constellation window to match, and unticks the
+// box with the setter when that window is closed from its own title bar or
+// could not be opened at all.
+bool imgui_visualizer_get_constellation_enabled(const imgui_visualizer_state_t* state);
+void imgui_visualizer_set_constellation_enabled(imgui_visualizer_state_t* state, bool enabled);
+
 // Shutdown ImGui and release resources
 void imgui_visualizer_shutdown(imgui_visualizer_state_t* state);
 

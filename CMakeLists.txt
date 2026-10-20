@@ -41,8 +41,10 @@ add_executable(fronthaul_sniffer
     src/core/c_radar_dsp.c
     src/analysis/c_iq_analysis.c
     src/visualization/opengl_visualizer.cpp
+    src/visualization/iq_constellation.cpp
     src/gui/imgui_startup_interface.cpp
     src/gui/imgui_visualizer_interface.cpp
+    src/gui/imgui_constellation_interface.cpp
     ${imgui_SOURCE_DIR}/imgui.cpp
     ${imgui_SOURCE_DIR}/imgui_demo.cpp
     ${imgui_SOURCE_DIR}/imgui_draw.cpp

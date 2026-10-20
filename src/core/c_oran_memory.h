@@ -57,6 +57,12 @@ void fh_oran_memory_advance_loop(fh_oran_memory_t* mem, int64_t loop_span);
 
 fh_oran_memory_stats_t fh_oran_memory_stats(const fh_oran_memory_t* mem);
 
+// Resolves the ring row holding an absolute symbol number, checking its tag so
+// a row since reused for another symbol (ring wraparound, or a gap the stream
+// never filled) is not mistaken for it. Returns 1 and sets *out_idx when the
+// symbol is present, 0 otherwise.
+int fh_oran_memory_row_for_symbol(const fh_oran_memory_t* mem, int symbol_num, size_t* out_idx);
+
 #ifdef __cplusplus
 }
 #endif

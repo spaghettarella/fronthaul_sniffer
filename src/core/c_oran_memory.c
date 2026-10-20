@@ -320,6 +320,25 @@ fh_oran_memory_stats_t fh_oran_memory_stats(const fh_oran_memory_t* mem) {
     return stats;
 }
 
+int fh_oran_memory_row_for_symbol(const fh_oran_memory_t* mem, int symbol_num, size_t* out_idx) {
+    if (mem == NULL || mem->symbols == NULL || mem->max_symbols == 0) {
+        return 0;
+    }
+    if (symbol_num < mem->symbol_lowest || symbol_num > mem->symbol_highest) {
+        return 0;
+    }
+    int age = mem->symbol_highest - symbol_num;
+    size_t idx = (mem->index_symbol_highest + mem->max_symbols - (size_t)age) % mem->max_symbols;
+    if (mem->symbols[idx] == NULL) {
+        return 0;
+    }
+    if (mem->row_symbol_numbers != NULL && mem->row_symbol_numbers[idx] != symbol_num) {
+        return 0;
+    }
+    *out_idx = idx;
+    return 1;
+}
+
 void fh_oran_memory_advance_loop(fh_oran_memory_t* mem, int64_t loop_span) {
     if (mem == NULL) {
         return;
