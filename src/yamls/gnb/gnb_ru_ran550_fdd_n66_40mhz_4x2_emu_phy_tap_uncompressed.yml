@@ -1,0 +1,137 @@
+# Uncompressed variant of gnb_ru_ran550_fdd_n66_40mhz_4x2_emu_phy_tap.yml: 16-bit IQ with no compression
+# on DL, UL and PRACH; everything else is identical. Pair with ../ru_emulator/ru_emu_40mhz_uncompressed.yml.
+#
+# FDD counterpart of gnb_ru_ran550_tdd_n78_100mhz_4x2_emu_phy_tap.yml, for the OCUDU RU emulator. Apart
+# from compression, the ru_ofh section is the RAN550 one; a real RAN550 is TDD n78 only, so this config is
+# for the emulator.
+#
+# Why n66 / 40 MHz / 30 kHz:
+# - The RU emulator hardcodes 30 kHz SCS (slot timing and PRB count), so common_scs stays 30.
+# - OCUDU rejects a common SCS that differs from the SSB SCS. Of the FDD bands, only n5, n24 and n66
+#   have a 30 kHz SSB pattern (case B); n66 is the widest.
+# - n66 UL is only 70 MHz wide (1710-1780 MHz), so 100 MHz cannot fit; 40 MHz is a standard n66
+#   channel bandwidth. 40 MHz at 30 kHz = 106 PRB.
+
+cu_cp:
+  amf:
+    addr: 127.0.0.5
+    port: 38412
+    bind_addr: 127.0.0.1
+    supported_tracking_areas:
+      - tac: 7
+        plmn_list:
+          - plmn: "00101"
+            tai_slice_support_list:
+              - sst: 1
+
+ru_ofh:
+  t1a_max_cp_dl: 535
+  t1a_min_cp_dl: 286
+  t1a_max_cp_ul: 535
+  t1a_min_cp_ul: 286
+  t1a_max_up: 390
+  t1a_min_up: 80
+  ta4_max: 500
+  ta4_min: 25
+  is_prach_cp_enabled: true
+  # No compression: plain 16-bit IQ. The RU emulator only accepts an UL udCompHdr of 0x00 (none, 16 bit)
+  # or 0x91 (BFP, 9 bit), so uncompressed has to be 16 bit. One symbol of one port is 106 PRB x 48 B,
+  # about 5.1 kB, which still fits a single packet at the default 9000 B MTU.
+  compr_method_ul: none
+  compr_bitwidth_ul: 16
+  compr_method_dl: none
+  compr_bitwidth_dl: 16
+  compr_method_prach: none
+  compr_bitwidth_prach: 16
+  enable_ul_static_compr_hdr: false
+  enable_dl_static_compr_hdr: false
+  iq_scaling: 20
+  warn_unreceived_ru_frames: always
+  cells:
+    - network_interface: lo
+      ru_mac_addr: 00:00:00:00:00:00
+      du_mac_addr: 00:00:00:00:00:00
+      #vlan_tag_cp: 2
+      #vlan_tag_up: 2
+      prach_port_id: [4, 5]
+      dl_port_id: [0, 1, 2, 3]
+      ul_port_id: [0, 1]
+      enable_promiscuous: true
+
+cell_cfg:
+  # DL 2155 MHz (2135-2175 MHz). The UL ARFCN is derived from the band's 400 MHz duplex spacing:
+  # 351000 = 1755 MHz (1735-1775 MHz).
+  dl_arfcn: 431000
+  band: 66
+  channel_bandwidth_MHz: 40
+  common_scs: 30
+  plmn: "00101"
+  tac: 7
+  pci: 1
+  nof_antennas_dl: 4
+  nof_antennas_ul: 2
+  prach:
+    # Long format 0, every frame in subframe 1 (TS 38.211 Table 6.3.3.2-2) - OCUDU's own FDD default.
+    # Index 159 from the TDD config is a different preamble in the paired-spectrum table. The RU
+    # emulator must be set to prach_format: long to match.
+    prach_config_index: 16
+    prach_root_sequence_index: 1
+    zero_correlation_zone: 0
+    # prach_frequency_start left out: OCUDU then places the PRACH clear of the PUCCH resources.
+  # No tdd_ul_dl_cfg: in FDD every slot is both DL (on 2155 MHz) and UL (on 1755 MHz).
+  ssb:
+    ssb_period: 20
+    ssb_block_power_dbm: -11
+  pucch:
+    sr_period_ms: 5
+    min_k1: 2
+    p0_nominal: -90
+  csi:
+    csi_rs_period: 40
+  pdsch:
+    mcs_table: qam256
+    olla_target_bler: 0.1
+    dc_offset: center
+  pusch:
+    mcs_table: qam64
+    olla_target_bler: 0.1
+    max_rank: 2
+    min_k2: 2
+    p0_nominal_with_grant: -80
+
+expert_phy:
+  enable_phy_tap: true
+  phy_tap_arguments: enable_quiet_processing=true,log_level=debug,tap_ul_epre=tcp://127.0.0.1:5555
+  max_request_headroom_slots: 0
+  max_proc_delay: 4
+  pusch_dec_max_iterations: 10
+  pusch_channel_estimator_td_strategy: interpolate
+  pusch_channel_estimator_cfo_compensation: false
+  pusch_channel_equalizer_algorithm: mmse
+
+expert_execution:
+  threads:
+    upper_phy:
+      pdsch_processor_type: flexible
+      max_pucch_concurrency: 2
+      max_pusch_and_srs_concurrency: 4
+      max_pdsch_concurrency: 4
+      pdsch_cb_batch_length: 8
+
+metrics:
+  autostart_stdout_metrics: true
+  enable_json: true
+
+remote_control:
+  enabled: true
+  bind_addr: 0.0.0.0
+
+log:
+  filename: /tmp/gnb.log
+  all_level: info
+
+pcap:
+  mac_enable: false
+  mac_filename: /tmp/gnb_mac.pcap
+  ngap_enable: false
+  ngap_filename: /tmp/gnb_ngap.pcap

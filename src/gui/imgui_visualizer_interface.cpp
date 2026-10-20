@@ -265,6 +265,22 @@ void draw_plot_axes(opengl_visualizer_t* visualizer, const fh_oran_memory_t* mem
     }
 }
 
+// IQ samples are normalised to about +/-1, so their magnitudes are often a few
+// thousandths; a channel estimate sits around 1, and a linear radar map can
+// run to thousands. A fixed precision either drowns the reading in digits or
+// quantises it to 0.000, so it is picked from the value rather than the view:
+// below 0.1 it keeps three significant digits instead of three decimals.
+static const char* value_format(float value) {
+    const float magnitude = (value < 0.0f) ? -value : value;
+    if (magnitude >= 100.0f) {
+        return "%.1f";
+    }
+    if (magnitude >= 0.1f || magnitude == 0.0f) {
+        return "%.3f";
+    }
+    return "%.3g";
+}
+
 // Five-pointed star, drawn as a dark halo underneath a coloured outline so it
 // stays visible against both ends of the heatmap gradient.
 void draw_marker_star(ImDrawList* draw, ImVec2 centre, float radius, ImU32 color) {
@@ -308,7 +324,9 @@ void draw_markers(opengl_visualizer_t* visualizer) {
         char line1[64];
         char line2[64];
         if (marker.has_value) {
-            snprintf(line1, sizeof(line1), "#%d  %.1f", i + 1, (double)marker.magnitude);
+            char value_text[32];
+            snprintf(value_text, sizeof(value_text), value_format(marker.magnitude), (double)marker.magnitude);
+            snprintf(line1, sizeof(line1), "#%d  %s", i + 1, value_text);
             snprintf(line2, sizeof(line2), "%.1f%% base", (double)marker.percent_of_baseline);
         } else {
             snprintf(line1, sizeof(line1), "#%d", i + 1);
@@ -632,7 +650,13 @@ void draw_zoom_window(opengl_visualizer_t* visualizer) {
             }
             const int centre = total_rows / 2;
             const int bin_last = bin_first + (bin_count > 0 ? bin_count - 1 : 0);
-            if (grid.y_unit_scale > 0.0f) {
+            if (grid.y_unit_scale > 0.0f && grid.y_velocity_scale > 0.0f) {
+                ImGui::TextDisabled("showing %+.0f to %+.0f Hz  (%+.1f to %+.1f m/s)",
+                                    (double)((float)(centre - bin_first) * grid.y_unit_scale),
+                                    (double)((float)(centre - bin_last) * grid.y_unit_scale),
+                                    (double)((float)(centre - bin_first) * grid.y_velocity_scale),
+                                    (double)((float)(centre - bin_last) * grid.y_velocity_scale));
+            } else if (grid.y_unit_scale > 0.0f) {
                 ImGui::TextDisabled("showing %+.0f to %+.0f Hz",
                                     (double)((float)(centre - bin_first) * grid.y_unit_scale),
                                     (double)((float)(centre - bin_last) * grid.y_unit_scale));
@@ -936,53 +960,77 @@ static void draw_radar_window(fh_radar_t* radar,
                  "-13 dB sidelobes that smear strong paths over other taps; Hann widens the main lobe for "
                  "-31 dB sidelobes.");
 
-        // Only the Doppler stage truncates: Range-Time plots the full transform.
-        const bool depth_applies = (cfg.output == RADAR_OUT_RANGE_DOPPLER);
-        if (!depth_applies) {
+        if (subcarrier_hz > 0.0) {
+            // Zero padding makes taps finer than the true resolution above; these
+            // are deliberately reported as separate numbers.
+            const double tap_spacing_m =
+                RADAR_SPEED_OF_LIGHT / (2.0 * (double)cfg.ifft_size * subcarrier_hz);
+            ImGui::TextDisabled("Tap spacing: %.2f m   Max range: %.1f m",
+                                tap_spacing_m, tap_spacing_m * (double)cfg.ifft_size);
+        }
+    }
+
+    // --- Range / Doppler --------------------------------------------------
+    // The slow-time stage of Range-Doppler. Depth and window do nothing in the
+    // other outputs; the carrier only labels the Doppler axis and stays
+    // editable, since it describes the setup rather than the processing.
+    const bool range_doppler_out = (cfg.output == RADAR_OUT_RANGE_DOPPLER);
+    if (section_header("Range / Doppler", range_doppler_out)) {
+        if (!range_doppler_out) {
             ImGui::BeginDisabled();
         }
         changed |= ImGui::InputInt("CIR depth (taps)", &cfg.cir_depth_taps);
-        if (!depth_applies) {
+        if (!range_doppler_out) {
             ImGui::EndDisabled();
         }
         ImGui::SameLine();
         gui_hint("x-depth, Range-Doppler",
                  "Keeps the nearest taps of each CIR for the Doppler stage: one slow-time FFT per kept tap, so "
                  "it sets both the map's range extent and its cost. Range-Time always shows every tap.");
-        if (depth_applies) {
+        if (range_doppler_out) {
             // One slow-time transform per kept tap, so this field is what sets the
             // refresh cost.
             ImGui::TextDisabled("%d slow-time FFTs of %d points per refresh", cfg.cir_depth_taps, window_rows);
+            if (subcarrier_hz > 0.0) {
+                const double tap_spacing_m =
+                    RADAR_SPEED_OF_LIGHT / (2.0 * (double)cfg.ifft_size * subcarrier_hz);
+                ImGui::TextDisabled("Map range: %.1f m", tap_spacing_m * (double)cfg.cir_depth_taps);
+            }
         }
 
-        if (subcarrier_hz > 0.0) {
-            // Zero padding makes taps finer than the true resolution above; these
-            // are deliberately reported as separate numbers.
-            const double tap_spacing_m =
-                RADAR_SPEED_OF_LIGHT / (2.0 * (double)cfg.ifft_size * subcarrier_hz);
-            const int extent_taps = depth_applies ? cfg.cir_depth_taps : cfg.ifft_size;
-            ImGui::TextDisabled("Tap spacing: %.2f m   Max range: %.1f m",
-                                tap_spacing_m, tap_spacing_m * (double)extent_taps);
-        }
-
-        if (symbol_s > 0.0 && window_rows > 0) {
-            const double doppler_res_hz = 1.0 / ((double)window_rows * symbol_s);
-            const double doppler_span_hz = 1.0 / (2.0 * symbol_s);
-            ImGui::TextDisabled("Doppler: %.1f Hz resolution, +/- %.1f kHz unambiguous",
-                                doppler_res_hz, doppler_span_hz / 1000.0);
-        }
-
-        if (!depth_applies) {
+        if (!range_doppler_out) {
             ImGui::BeginDisabled();
         }
         changed |= radar_window_combo("Doppler window", &cfg.doppler_window);
-        if (!depth_applies) {
+        if (!range_doppler_out) {
             ImGui::EndDisabled();
         }
         ImGui::SameLine();
         gui_hint("across symbols",
                  "Taper across the window's symbols before the Doppler FFT - the same trade as the range "
                  "window, along the Doppler axis. Range-Doppler only.");
+
+        double carrier_ghz = cfg.carrier_freq_hz / 1.0e9;
+        if (ImGui::InputDouble("Carrier freq. (GHz)", &carrier_ghz, 0.01, 0.1, "%.3f")) {
+            cfg.carrier_freq_hz = carrier_ghz * 1.0e9;
+            changed = true;
+        }
+        ImGui::SameLine();
+        gui_hint("velocity axis",
+                 "Centre frequency of the carrier. Converts the Doppler axis to radial velocity, "
+                 "v = f_D * c0 / (2 f_c), positive approaching. The map itself does not change.");
+
+        if (symbol_s > 0.0 && window_rows > 0) {
+            const double doppler_res_hz = 1.0 / ((double)window_rows * symbol_s);
+            const double doppler_span_hz = 1.0 / (2.0 * symbol_s);
+            ImGui::TextDisabled("Doppler: %.1f Hz resolution, +/- %.1f kHz unambiguous",
+                                doppler_res_hz, doppler_span_hz / 1000.0);
+            const double mps_per_hz = fh_radar_velocity_per_hz(&cfg);
+            if (mps_per_hz > 0.0) {
+                ImGui::TextDisabled("Velocity: %.2f m/s resolution, +/- %.1f m/s unambiguous",
+                                    doppler_res_hz * mps_per_hz, doppler_span_hz * mps_per_hz);
+            }
+        }
     }
 
     // --- Cancellation -----------------------------------------------------
@@ -1169,15 +1217,6 @@ static void draw_radar_window(fh_radar_t* radar,
 
 // --- Value at cursor ---
 
-// Raw IQ magnitudes run to thousands, while a channel estimate sits around 1,
-// so a fixed precision either drowns the reading in digits or quantises away
-// the part worth looking at. Picked from the value rather than the view, which
-// keeps it right for whatever a future output stage happens to produce.
-static const char* value_format(float value) {
-    const float magnitude = (value < 0.0f) ? -value : value;
-    return (magnitude < 100.0f) ? "%.3f" : "%.1f";
-}
-
 // Names the cell a reading came from in whatever the current view's axes
 // measure, so one readout serves the resource grid, the delay axis and the
 // Doppler axis without any of them being described in another's units.
@@ -1202,7 +1241,11 @@ static void format_cell_row(const visualizer_grid_info_t& grid,
         // Zero Doppler is the centre row; a bin index alone would not say
         // which side of it a reading is on.
         const int centre = grid.y_count / 2;
-        if (grid.y_unit_scale > 0.0f) {
+        if (grid.y_unit_scale > 0.0f && grid.y_velocity_scale > 0.0f) {
+            snprintf(out, out_size, "%+.0f Hz (%+.2f m/s)",
+                     static_cast<double>(static_cast<float>(centre - sample.row) * grid.y_unit_scale),
+                     static_cast<double>(static_cast<float>(centre - sample.row) * grid.y_velocity_scale));
+        } else if (grid.y_unit_scale > 0.0f) {
             snprintf(out, out_size, "%+.0f Hz",
                      static_cast<double>(static_cast<float>(centre - sample.row) * grid.y_unit_scale));
         } else {
@@ -2252,9 +2295,16 @@ fh_oran_memory_t* imgui_visualizer_render(
 
                 float live_peak = 0.0f, live_baseline = 0.0f, live_threshold = 0.0f;
                 visualizer_get_trigger_levels(visualizer, &live_peak, &live_baseline, &live_threshold);
-                ImGui::Text("Live peak: %.1f  (%.0f%% of baseline)", live_peak,
+                char peak_text[32];
+                char baseline_text[32];
+                char threshold_text[32];
+                snprintf(peak_text, sizeof(peak_text), value_format(live_peak), (double)live_peak);
+                snprintf(baseline_text, sizeof(baseline_text), value_format(live_baseline), (double)live_baseline);
+                snprintf(threshold_text, sizeof(threshold_text), value_format(live_threshold),
+                         (double)live_threshold);
+                ImGui::Text("Live peak: %s  (%.0f%% of baseline)", peak_text,
                             (live_baseline > 1e-6f) ? (100.0f * live_peak / live_baseline) : 0.0f);
-                ImGui::Text("Baseline: %.1f   Fire threshold: %.1f", live_baseline, live_threshold);
+                ImGui::Text("Baseline: %s   Fire threshold: %s", baseline_text, threshold_text);
 
                 int mean_periods = 0, mean_required = 0;
                 if (visualizer_get_trigger_mean_progress(visualizer, &mean_periods, &mean_required)) {

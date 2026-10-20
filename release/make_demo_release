@@ -23,6 +23,7 @@ DO_STRIP=1
 DO_ARCHIVE=1
 DO_VERIFY=1
 DO_REBUILD=0
+ALLOW_UNOPTIMIZED=0
 
 # Libraries that must come from the target machine, never from the bundle:
 # the GL stack is tied to the installed GPU driver and X11 to the running server.
@@ -35,8 +36,9 @@ COMPAT_RE='^(ld-linux-x86-64\.so|libc\.so|libm\.so|libdl\.so|libpthread\.so|libr
 
 # Data files the program opens through paths relative to its own directory.
 DEMO_DATA=(
-    "src/capture/demo.pcap"        # default demo stream
-    "src/capture/KlarweinXP.pcap"  # startup-screen background replay
+    "src/capture/demo.pcap"             # default demo stream
+    "src/capture/KlarweinXP.pcap"       # startup-screen background replay
+    "src/capture/ofdm_radar_test.pcap"  # radar demo
 )
 
 usage() {
@@ -52,6 +54,9 @@ Options:
   --no-strip         Keep debug symbols in the packaged binary
   --no-archive       Leave the bundle as a directory, do not create the tarball
   --no-verify        Skip the post-package smoke test
+  --allow-unoptimized
+                     Package a Debug / unoptimized build anyway (normally refused:
+                     it decodes several times slower and drops packets)
   -h, --help         Show this message
 USAGE
 }
@@ -69,6 +74,7 @@ while [ $# -gt 0 ]; do
         --no-strip)     DO_STRIP=0;          shift ;;
         --no-archive)   DO_ARCHIVE=0;        shift ;;
         --no-verify)    DO_VERIFY=0;         shift ;;
+        --allow-unoptimized) ALLOW_UNOPTIMIZED=1; shift ;;
         -h|--help)      usage; exit 0 ;;
         *) usage >&2; die "unknown option: $1" ;;
     esac
@@ -94,6 +100,22 @@ if [ -n "$(find "${REPO_ROOT}/src" "${REPO_ROOT}/CMakeLists.txt" \
             -print -quit 2>/dev/null)" ]; then
     printf '  WARNING: sources are newer than the binary; consider --rebuild\n' >&2
 fi
+
+# A Debug build directory compiles at -O0, which decodes several times slower
+# and drops packets at real-time rates - and nothing at run time says so.
+BUILD_TYPE="$(sed -n 's/^CMAKE_BUILD_TYPE:STRING=//p' "${BUILD_DIR}/CMakeCache.txt" 2>/dev/null | head -1)"
+case "${BUILD_TYPE}" in
+    Release|RelWithDebInfo|MinSizeRel)
+        info "build type   ${BUILD_TYPE}" ;;
+    *)
+        if [ "${ALLOW_UNOPTIMIZED}" -eq 1 ]; then
+            printf '  WARNING: packaging an unoptimized build (build type "%s")\n' "${BUILD_TYPE:-unset}" >&2
+        else
+            die "build type is \"${BUILD_TYPE:-unset}\", not optimized - reconfigure with
+       cmake -S \"${REPO_ROOT}\" -B \"${BUILD_DIR}\" -DCMAKE_BUILD_TYPE=RelWithDebInfo
+       and rebuild, or pass --allow-unoptimized"
+        fi ;;
+esac
 
 VERSION="$(sed -n 's/.*project(.*VERSION \([0-9][0-9.]*\).*/\1/p' "${REPO_ROOT}/CMakeLists.txt" | head -1)"
 VERSION="${VERSION:-0.0.0}"

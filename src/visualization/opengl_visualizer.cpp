@@ -68,6 +68,8 @@
 // stacking across it.
 #define AXIS_MIN_TICK_PX 6.0f
 #define AXIS_MIN_LABEL_PX_Y 30.0f
+// Doppler labels carry velocity on a second line, so each needs more room.
+#define AXIS_MIN_LABEL_PX_Y_DUAL 40.0f
 #define AXIS_MIN_LABEL_PX_X 60.0f
 
 #define SYMBOLS_PER_SLOT 14
@@ -212,6 +214,17 @@ typedef struct opengl_visualizer {
     float zoom_x_parked_center[2];
     float zoom_x_parked_span[2];
     int zoom_x_parked_slot;
+    // The grid of the last radar frame drawn, to tell when a settings change
+    // reshaped an axis; see radar_reload_changed_axes. Horizontally one per
+    // zoom slot, matching how that window is parked.
+    int radar_grid_y_known;
+    int radar_grid_rows;
+    int radar_grid_y_unit;
+    int radar_grid_phase_mode;
+    float radar_grid_y_scale;
+    int radar_grid_x_known[2];
+    int radar_grid_cols[2];
+    float radar_grid_x_scale[2];
 
     int axes_enabled;      // margins reserved for axes; off makes the view full-bleed
     int axis_valid;
@@ -236,6 +249,7 @@ typedef struct opengl_visualizer {
     visualizer_axis_unit_t axis_y_unit;
     float axis_x_unit_scale;   // metres per delay tap, 0 when not applicable
     float axis_y_unit_scale;   // hertz per Doppler bin, 0 when not applicable
+    float axis_y_velocity_scale; // m/s per Doppler bin, 0 when not applicable
     int axis_y_scrolling;      // vertical axis advances with new symbols
     const char* axis_value_label;
     // Row the trigger line marks and marker offsets count from, or -1 when no
@@ -283,6 +297,7 @@ static void axis_publish_defaults(opengl_visualizer_t* vis) {
     vis->axis_y_unit = AXIS_UNIT_SYMBOL;
     vis->axis_x_unit_scale = 0.0f;
     vis->axis_y_unit_scale = 0.0f;
+    vis->axis_y_velocity_scale = 0.0f;
     vis->axis_y_scrolling = 1;
     vis->axis_value_label = "magnitude";
     vis->axis_trigger_row = -1;
@@ -2344,6 +2359,28 @@ static int axis_nice_multiple(float unit_px, float min_px) {
     return ladder[count - 1];
 }
 
+// The same for an axis in a physical unit: the smallest 1-2-5 step, in that
+// unit, that is at least min_step and spreads ticks at least min_px apart.
+static double axis_nice_step(double px_per_unit, double min_px, double min_step) {
+    double want = (px_per_unit > 0.0) ? min_px / px_per_unit : min_step;
+    if (want < min_step) {
+        want = min_step;
+    }
+    if (!(want > 0.0 && want < 1e30)) {
+        return 1.0;
+    }
+    const double decade = pow(10.0, floor(log10(want)));
+    static const double multiples[] = { 1.0, 2.0, 5.0 };
+    for (int i = 0; i < 3; i++) {
+        // The tolerance keeps a step that is exactly a round number, such as
+        // a 100 Hz bin, from being pushed up to the next one by rounding.
+        if (multiples[i] * decade >= want * (1.0 - 1e-9)) {
+            return multiples[i] * decade;
+        }
+    }
+    return 10.0 * decade;
+}
+
 void visualizer_get_axis_titles(const opengl_visualizer_t* vis,
                                 const char** out_y_title,
                                 const char** out_x_title) {
@@ -2371,6 +2408,7 @@ void visualizer_get_grid_info(const opengl_visualizer_t* vis, visualizer_grid_in
     out->value_label = "magnitude";
     out->x_unit_scale = 0.0f;
     out->y_unit_scale = 0.0f;
+    out->y_velocity_scale = 0.0f;
     out->y_is_scrolling = 1;
 
     if (vis == NULL) {
@@ -2383,6 +2421,7 @@ void visualizer_get_grid_info(const opengl_visualizer_t* vis, visualizer_grid_in
     out->y_unit = vis->axis_y_unit;
     out->x_unit_scale = vis->axis_x_unit_scale;
     out->y_unit_scale = vis->axis_y_unit_scale;
+    out->y_velocity_scale = vis->axis_y_velocity_scale;
     out->y_is_scrolling = vis->axis_y_scrolling;
     out->value_label = vis->axis_value_label ? vis->axis_value_label : "magnitude";
 
@@ -2401,7 +2440,9 @@ void visualizer_get_grid_info(const opengl_visualizer_t* vis, visualizer_grid_in
         out->y_title = "Magnitude";
         break;
     case AXIS_UNIT_DOPPLER_BIN:
-        out->y_title = (vis->axis_y_unit_scale > 0.0f) ? "Doppler (Hz)" : "Doppler bin";
+        out->y_title = (vis->axis_y_velocity_scale > 0.0f) ? "Doppler (Hz) / velocity"
+                     : (vis->axis_y_unit_scale > 0.0f)     ? "Doppler (Hz)"
+                                                           : "Doppler bin";
         break;
     case AXIS_UNIT_SYMBOL:
     default:
@@ -2430,44 +2471,71 @@ int visualizer_get_y_ticks(const opengl_visualizer_t* vis,
     // once, so there is no frame/slot structure and nothing scrolls. Zero
     // Doppler sits at the centre row, with approaching targets above it and
     // receding ones below.
+    //
+    // Ticks are counted outward from zero, not down from the top row: zero
+    // always gets one and the ladder stays symmetric however many bins there
+    // are. With the bin width known they also sit on round frequencies, and
+    // since the axis's total span is set by the symbol duration alone, a new
+    // Time range then leaves them where they were.
     if (vis->axis_y_unit == AXIS_UNIT_DOPPLER_BIN) {
         const int bins = vis->axis_rows;
+        const int centre = bins / 2;
         const float bin_origin = zoom_y_origin(vis) * (float)bins;
         const float bin_extent = vis->zoom_y_span * (float)bins;
         const float px_per_bin = plot_h / (bin_extent > 1e-6f ? bin_extent : 1e-6f);
-        const int step = axis_nice_multiple(px_per_bin, AXIS_MIN_LABEL_PX_Y);
+        const int have_hz = vis->axis_y_unit_scale > 0.0f;
+        const int dual = have_hz && vis->axis_y_velocity_scale > 0.0f;
+        const float min_px = dual ? AXIS_MIN_LABEL_PX_Y_DUAL : AXIS_MIN_LABEL_PX_Y;
 
-        int first = (int)floorf(bin_origin) - 1;
-        int last = (int)ceilf(bin_origin + bin_extent) + 1;
-        if (first < 0) {
-            first = 0;
-        }
-        if (last > bins - 1) {
-            last = bins - 1;
-        }
+        // The step in the axis's own unit (Hz, or bins before the subcarrier
+        // spacing is known), never finer than one bin: a tick between two
+        // cells would claim a resolution the map does not have.
+        const double unit_per_bin = have_hz ? (double)vis->axis_y_unit_scale : 1.0;
+        const double step = have_hz
+            ? axis_nice_step((double)px_per_bin / unit_per_bin, (double)min_px, unit_per_bin)
+            : (double)axis_nice_multiple(px_per_bin, min_px);
+        const double step_bins = step / unit_per_bin;
+        // Velocity, like range on the delay axis, rides on the primary unit's
+        // ticks, so its values are not round; enough decimals to tell
+        // neighbouring ticks apart.
+        const double step_mps = step_bins * (double)vis->axis_y_velocity_scale;
+        const int mps_decimals = (step_mps >= 10.0) ? 0 : (step_mps >= 1.0) ? 1 : 2;
+        const int khz_decimals = (step >= 100.0) ? 1 : (step >= 10.0) ? 2 : 3;
 
-        const int centre = bins / 2;
-        for (int bin = (first / step) * step; bin <= last && count < max_ticks; bin += step) {
-            if (bin < first) {
-                continue;
-            }
+        // Doppler in bins, from the outermost cell centres (row r holds bin
+        // centre - r, centred at r + 0.5), narrowed to what the zoom shows.
+        const double view_top = (double)centre + 0.5 - (double)bin_origin;
+        const double view_bottom = view_top - (double)bin_extent;
+        const double top = fmin((double)centre, view_top);
+        const double bottom = fmax((double)(centre - (bins - 1)), view_bottom);
+
+        const int k_top = (int)floor(top / step_bins + 1e-9);
+        const int k_bottom = (int)ceil(bottom / step_bins - 1e-9);
+        for (int k = k_top; k >= k_bottom && count < max_ticks; k--) {
+            const double doppler_bins = (double)k * step_bins;
             visualizer_axis_tick_t* t = &out_ticks[count++];
-            // Cell centre, as on the other discrete axes.
-            t->position_px = plot_y + ((float)bin + 0.5f - bin_origin) * px_per_bin;
-            t->level = (bin == centre) ? 2 : 1;
+            t->position_px =
+                plot_y + (float)(((double)centre - doppler_bins + 0.5 - (double)bin_origin) * (double)px_per_bin);
+            // The longer tick marks zero Doppler. Not an anchor: the caller
+            // moves anchors down into the corner, away from their tick.
+            t->level = (k == 0) ? 2 : 1;
             t->has_label = 1;
-            t->is_anchor = (bin == centre);
-            if (vis->axis_y_unit_scale > 0.0f) {
-                const double hz = (double)(centre - bin) * (double)vis->axis_y_unit_scale;
+            t->is_anchor = 0;
+            t->label2[0] = '\0';
+            if (have_hz) {
+                const double hz = (double)k * step;
                 if (fabs(hz) >= 1000.0) {
-                    snprintf(t->label, sizeof(t->label), "%+.1fk", hz / 1000.0);
+                    snprintf(t->label, sizeof(t->label), "%+.*fk", khz_decimals, hz / 1000.0);
                 } else {
                     snprintf(t->label, sizeof(t->label), "%+.0f", hz);
                 }
+                if (dual) {
+                    snprintf(t->label2, sizeof(t->label2), "%+.*fm/s", mps_decimals,
+                             doppler_bins * (double)vis->axis_y_velocity_scale);
+                }
             } else {
-                snprintf(t->label, sizeof(t->label), "%d", centre - bin);
+                snprintf(t->label, sizeof(t->label), "%d", k * (int)step);
             }
-            t->label2[0] = '\0';
             t->label3[0] = '\0';
         }
         return count;
@@ -3602,6 +3670,46 @@ static void radar_persist_take_frame(opengl_visualizer_t* vis,
     }
 }
 
+// The radar's grid follows its settings: Time range, CIR depth, IFFT size, the
+// output and the rolling mean all resize or rescale an axis. A zoom window
+// kept across that lands on an arbitrary part of the new grid - a Doppler
+// window that no longer has zero in the middle, a tap range that now means
+// other metres - so an axis whose grid changed is reloaded at its full
+// extent. Called once the frame's grid is published. The first frame of a
+// kind only records it, keeping whatever window was parked for it. The
+// waterfall keeps its window across Memory size changes on purpose; this is
+// radar only.
+static void radar_reload_changed_axes(opengl_visualizer_t* vis) {
+    // Settle the horizontal parking first, so a reset lands on the window of
+    // the unit now on screen instead of being parked away straight after.
+    zoom_x_park_on_unit_change(vis);
+
+    const int slot = vis->zoom_x_parked_slot;
+    if (vis->radar_grid_x_known[slot] &&
+        (vis->radar_grid_cols[slot] != vis->axis_x_count ||
+         vis->radar_grid_x_scale[slot] != vis->axis_x_unit_scale)) {
+        vis->zoom_x_center = 0.5f;
+        vis->zoom_x_span = 1.0f;
+    }
+    vis->radar_grid_x_known[slot] = 1;
+    vis->radar_grid_cols[slot] = vis->axis_x_count;
+    vis->radar_grid_x_scale[slot] = vis->axis_x_unit_scale;
+
+    if (vis->radar_grid_y_known &&
+        (vis->radar_grid_rows != vis->axis_rows ||
+         vis->radar_grid_y_unit != (int)vis->axis_y_unit ||
+         vis->radar_grid_phase_mode != vis->axis_phase_mode ||
+         vis->radar_grid_y_scale != vis->axis_y_unit_scale)) {
+        vis->zoom_y_center = 0.5f;
+        vis->zoom_y_span = 1.0f;
+    }
+    vis->radar_grid_y_known = 1;
+    vis->radar_grid_rows = vis->axis_rows;
+    vis->radar_grid_y_unit = (int)vis->axis_y_unit;
+    vis->radar_grid_phase_mode = vis->axis_phase_mode;
+    vis->radar_grid_y_scale = vis->axis_y_unit_scale;
+}
+
 // Build the texture from the radar core's most recent finished frame. Unlike
 // the waterfall this reads no symbol ring at all: the radar worker has already
 // reduced two rings to one magnitude matrix, and the render thread only borrows
@@ -3686,6 +3794,9 @@ static int update_radar_texture(opengl_visualizer_t* vis) {
         // is one symbol per row.
         const double symbol_s = 0.001 / ((double)scs_khz / 15.0) / 14.0;
         vis->axis_y_unit_scale = (float)(1.0 / ((double)rows * symbol_s));
+        // The same bins in radial velocity at the configured carrier.
+        vis->axis_y_velocity_scale =
+            (float)((double)vis->axis_y_unit_scale * fh_radar_velocity_per_hz(&rcfg));
     }
 
     radar_persist_take_frame(vis, result, rows, cols, &stats);
@@ -3816,6 +3927,7 @@ static int update_radar_texture(opengl_visualizer_t* vis) {
     } else {
         vis->axis_row0_value = stats.window_first_valid ? stats.window_first_symbol : 0;
     }
+    radar_reload_changed_axes(vis);
 
     glBindTexture(GL_TEXTURE_2D, vis->texture_id);
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, vis->tex_width, vis->tex_height, GL_RGBA, GL_UNSIGNED_BYTE, vis->texture_data);

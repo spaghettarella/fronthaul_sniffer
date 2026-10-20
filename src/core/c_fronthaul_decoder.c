@@ -624,66 +624,61 @@ void fh_decoded_packet_free(fh_decoded_packet_t *pkt) {
     pkt->sections = NULL;
 }
 
-static int64_t extract_signed_bits(const uint8_t *buffer, uint32_t bit_offset, int bit_width) {
-    int64_t value = 0;
+// Uncompressed U-Plane IQ: 24 two's-complement components per PRB, I before
+// Q, each bit_width bits, MSB first and packed with no padding - so for 16 bits
+// plain big-endian int16 pairs. Scaled by 2^-15, which puts 16-bit samples on
+// the [-1, +1) scale every other source lands on.
+//
+// Runs once per PRB of every uncompressed packet, so it allocates nothing and
+// reads whole bytes: an uncompressed stream carries several times the PRBs per
+// second of a compressed one, and a slow path here starves the decode workers
+// until the packet queue drops.
+#define FH_UNCOMPRESSED_SCALE (1.0f / 32768.0f)
 
-    // Extract bits from buffer, MSB first
-    for (int i = 0; i < bit_width; i++) {
-        uint32_t byte_idx = (bit_offset + i) / 8;
-        uint32_t bit_idx = (bit_offset + i) % 8;
-
-        // Extract bit (bit 7 is MSB, bit 0 is LSB in each byte)
-        uint8_t bit = (buffer[byte_idx] >> (7 - bit_idx)) & 1;
-        value = (value << 1) | bit;
-    }
-
-    // Handle 2's complement sign extension for negative numbers
-    if (bit_width < 64) {
-        int64_t sign_bit = 1LL << (bit_width - 1);
-        if (value & sign_bit) {
-            // Negative number - sign extend all upper bits
-            value |= (-sign_bit);
-        }
-    }
-
-    return value;
+static inline int32_t sign_extend_bits(uint32_t value, int bit_width) {
+    const uint32_t sign = 1U << (bit_width - 1);
+    return (int32_t)((value ^ sign) - sign);
 }
 
 int extract_iq_samples(const char *ptr_prb, int bit_width, float i_samples[12], float q_samples[12]) {
-    // Validate inputs
-    if (!ptr_prb || !i_samples || !q_samples || !bit_width) {
-        return -1; // Invalid input pointers
+    if (!ptr_prb || !i_samples || !q_samples) {
+        return -1;
+    }
+    if (bit_width < 1 || bit_width > 32) {
+        return -2;
     }
 
-    // Calculate required bits and bytes for this PRB
-    // 12 IQ pairs * 2 samples/pair * compressed_bit_width bits/sample
-    uint32_t bits_needed = 12 * 2 * bit_width;
-    uint32_t bytes_needed = bits_needed / 8;
+    const uint8_t *bytes = (const uint8_t *)ptr_prb;
 
-    // Collect the bytes we need for this PRB
-    uint8_t *prb_bytes = (uint8_t *)malloc(bytes_needed);
-    if (!prb_bytes) {
-        return -4; // Memory allocation failure
+    // The width O-RAN uncompressed streams use in practice: byte aligned.
+    if (bit_width == 16) {
+        for (int k = 0; k < 12; k++) {
+            const uint32_t i_raw = ((uint32_t)bytes[4 * k] << 8) | bytes[4 * k + 1];
+            const uint32_t q_raw = ((uint32_t)bytes[4 * k + 2] << 8) | bytes[4 * k + 3];
+            i_samples[k] = (float)sign_extend_bits(i_raw, 16) * FH_UNCOMPRESSED_SCALE;
+            q_samples[k] = (float)sign_extend_bits(q_raw, 16) * FH_UNCOMPRESSED_SCALE;
+        }
+        return 0;
     }
 
-    for (uint32_t i = 0; i < bytes_needed; i++) {
-        prb_bytes[i] = ptr_prb[i];
+    // Any other width: whole bytes into an accumulator, components peeled off
+    // the top. It never holds more than bit_width + 7 bits, so 64 is plenty.
+    uint64_t accumulator = 0;
+    int accumulator_bits = 0;
+    const uint64_t mask = (bit_width == 32) ? 0xFFFFFFFFULL : ((1ULL << bit_width) - 1ULL);
+    for (int c = 0; c < 24; c++) {
+        while (accumulator_bits < bit_width) {
+            accumulator = (accumulator << 8) | *bytes++;
+            accumulator_bits += 8;
+        }
+        accumulator_bits -= bit_width;
+        const uint32_t raw = (uint32_t)((accumulator >> accumulator_bits) & mask);
+        const float value = (float)sign_extend_bits(raw, bit_width) * FH_UNCOMPRESSED_SCALE;
+        if (c % 2 == 0) {
+            i_samples[c / 2] = value;
+        } else {
+            q_samples[c / 2] = value;
+        }
     }
-
-    uint32_t bit_pos = 0;
-
-    for (int sample_idx = 0; sample_idx < 12; sample_idx++) {
-        // Extract I-sample mantissa (2's complement)
-        int64_t i_sample = extract_signed_bits(prb_bytes, bit_pos, bit_width);
-        bit_pos += bit_width;
-
-        // Extract Q-sample mantissa (2's complement)
-        int64_t q_sample = extract_signed_bits(prb_bytes, bit_pos, bit_width);
-        bit_pos += bit_width;
-
-        i_samples[sample_idx] = (float)(i_sample * pow(2.0, -15.0));
-        q_samples[sample_idx] = (float)(q_sample * pow(2.0, -15.0));
-    }
-    free(prb_bytes);
     return 0;
 }

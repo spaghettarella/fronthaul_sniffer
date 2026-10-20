@@ -38,7 +38,8 @@ typedef struct fh_section {
     /// magnitudes are comparable between sources and no consumer needs to know
     /// where a sample came from. The two paths reach that scale differently:
     /// the Ethernet/eCPRI path unpacks fixed-point components and applies 2^-15
-    /// (or the BFP exponent), while the PHY tap carries bfloat16 values that are
+    /// (BFP: mantissa * 2^exponent restores the 16-bit sample, which then gets
+    /// the same 2^-15), while the PHY tap carries bfloat16 values that are
     /// already normalized and are only widened to float.
     ///
     /// Treating the PHY tap's samples as fixed point instead is silent and

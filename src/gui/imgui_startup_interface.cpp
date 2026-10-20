@@ -523,7 +523,9 @@ bool imgui_startup_render(
 
         ImGui::InputInt("UD IQ-Width Decompressed (bits)", &config->ud_iq_width_decompressed);
         ImGui::SameLine();
-        gui_hint("default 16", "Width the samples are expanded to after decompression, 1-16. Default 16.");
+        gui_hint("default 16",
+                 "Width of the samples before BFP compression, 1-16; they are restored to it. It sets the "
+                 "full scale: a full-scale sample reads 1.0, as an uncompressed 16-bit one does. Default 16.");
         clamp_int(config->ud_iq_width_decompressed, 1, 16);
 
         if (ImGui::BeginCombo("SCS (kHz)", std::to_string(config->scs_khz).c_str())) {

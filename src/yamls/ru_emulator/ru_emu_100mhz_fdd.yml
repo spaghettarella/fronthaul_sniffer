@@ -1,0 +1,26 @@
+# Pairs with ../gnb/gnb_ru_ran550_fdd_n66_100mhz_4x2_emu_phy_tap.yml. The emulator derives its PRB
+# count from bandwidth at a fixed 30 kHz SCS, so this has to match the gNB's channel_bandwidth_MHz.
+# Not shared with the TDD configs: their PRACH is short format B4 (index 159), this one long format 0.
+log:
+  filename: /tmp/ru_emu.log
+  level: info
+
+ru_emu:
+  cells:
+    - bandwidth: 100                # MHz
+      network_interface: lo
+      ru_mac_addr: 00:00:00:00:00:00
+      du_mac_addr: 00:00:00:00:00:00
+      enable_promiscuous: true
+      dl_port_id: [0, 1, 2, 3]
+      ul_port_id: [0, 1]
+      prach_port_id: [4, 5]
+      prach_format: long            # gNB uses prach_config_index 16, long format 0
+      compr_method_ul: "bfp"
+      compr_bitwidth_ul: 9
+      t2a_max_cp_dl: 470
+      t2a_min_cp_dl: 350
+      t2a_max_cp_ul: 200
+      t2a_min_cp_ul: 90
+      t2a_max_up: 345
+      t2a_min_up: 70

@@ -233,6 +233,9 @@ typedef struct visualizer_grid_info {
     // real quantity next to the raw index.
     float x_unit_scale;
     float y_unit_scale;
+    // Second vertical unit on the same bins: m/s of radial velocity per
+    // Doppler bin at the radar's carrier, 0 when unknown.
+    float y_velocity_scale;
     // Whether the vertical axis scrolls with newly arriving symbols. False for
     // Range-Doppler, where the whole matrix is replaced per processing
     // interval and the axis is a fixed frequency scale.
@@ -248,7 +251,11 @@ void visualizer_get_grid_info(const opengl_visualizer_t* vis, visualizer_grid_in
 // view currently plots - symbol rows in the waterfall, magnitude in curve
 // view. Because the window is normalized rather than absolute, it survives
 // the vertical extent changing underneath it (Memory size, averaging period
-// and trigger capture depth all resize the row count).
+// and trigger capture depth all resize the row count). The radar view is the
+// exception: when a frame arrives whose grid differs from the last one on an
+// axis (Time range, CIR depth, IFFT size, output, rolling mean), that axis is
+// reloaded at its full extent, so a Doppler axis always comes back centred
+// on zero.
 //
 // This is a rendering transform and nothing more: no capture, decode, memory
 // ring, rolling-mean or trigger parameter is affected, so zooming never

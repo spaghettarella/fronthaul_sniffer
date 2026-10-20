@@ -38,6 +38,14 @@
 #define RADAR_MIN_DB_RANGE 10.0f
 #define RADAR_MAX_DB_RANGE 200.0f
 
+// Carrier for the Doppler axis's velocity scale. Wide enough for anything
+// from sub-GHz LTE to FR2.
+#define RADAR_DEFAULT_CARRIER_HZ 3.75e9
+#define RADAR_MIN_CARRIER_HZ 1.0e8
+#define RADAR_MAX_CARRIER_HZ 1.0e11
+
+#define RADAR_SPEED_OF_LIGHT 299792458.0
+
 // How long the worker idles between passes when nothing new has arrived.
 #define RADAR_IDLE_SLEEP_MS 25
 
@@ -121,6 +129,7 @@ void fh_radar_config_defaults(fh_radar_config_t* cfg) {
     cfg->cir_depth_taps = RADAR_DEFAULT_CIR_DEPTH;
     cfg->range_window = RADAR_WINDOW_HANN;
     cfg->doppler_window = RADAR_WINDOW_HANN;
+    cfg->carrier_freq_hz = RADAR_DEFAULT_CARRIER_HZ;
     cfg->mti_enabled = 1;
     cfg->blank_taps_enabled = 0;
     cfg->blank_taps = RADAR_DEFAULT_BLANK_TAPS;
@@ -159,6 +168,13 @@ void fh_radar_used_re_range(const fh_radar_config_t* cfg, int* out_start, int* o
     if (out_end != NULL) {
         *out_end = end;
     }
+}
+
+double fh_radar_velocity_per_hz(const fh_radar_config_t* cfg) {
+    if (cfg == NULL || !(cfg->carrier_freq_hz > 0.0)) {
+        return 0.0;
+    }
+    return RADAR_SPEED_OF_LIGHT / (2.0 * cfg->carrier_freq_hz);
 }
 
 static int clamp_int(int value, int low, int high) {
@@ -210,6 +226,12 @@ static void sanitize_config(fh_radar_config_t* cfg) {
     }
     if (cfg->doppler_window != RADAR_WINDOW_HANN) {
         cfg->doppler_window = RADAR_WINDOW_RECT;
+    }
+    // Same NaN-safe shape as db_range below.
+    if (!(cfg->carrier_freq_hz >= RADAR_MIN_CARRIER_HZ && cfg->carrier_freq_hz <= RADAR_MAX_CARRIER_HZ)) {
+        cfg->carrier_freq_hz = (cfg->carrier_freq_hz > RADAR_MAX_CARRIER_HZ) ? RADAR_MAX_CARRIER_HZ
+                             : (cfg->carrier_freq_hz < RADAR_MIN_CARRIER_HZ) ? RADAR_MIN_CARRIER_HZ
+                             : RADAR_DEFAULT_CARRIER_HZ;
     }
 
     cfg->mti_enabled = cfg->mti_enabled ? 1 : 0;

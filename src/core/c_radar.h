@@ -86,7 +86,10 @@ typedef struct fh_radar_config {
     int cir_depth_taps;
     fh_radar_window_t range_window;   // Across the used REs, before the delay IFFT
     fh_radar_window_t doppler_window; // Across the window's symbols, before the Doppler FFT
-    int mti_enabled;        // Subtract each tap's slow-time mean (static clutter removal)
+    // Carrier centre frequency. Changes no cell: it only converts the Doppler
+    // axis to radial velocity; see fh_radar_velocity_per_hz.
+    double carrier_freq_hz;
+    int mti_enabled;       // Subtract each tap's slow-time mean (static clutter removal)
     int blank_taps_enabled; // Zero the leading taps outright
     int blank_taps;         // How many leading taps blank_taps_enabled zeroes
     // Range-Time and Range-Doppler only. Cells are written as dB above a floor
@@ -121,6 +124,12 @@ int fh_radar_min_ring_symbols(const fh_radar_config_t* cfg);
 // its first ifft_size REs when it is wider than the transform. The worker and
 // the settings window both go through this, so they cannot disagree.
 void fh_radar_used_re_range(const fh_radar_config_t* cfg, int* out_start, int* out_end);
+
+// Radial velocity per hertz of Doppler at the configured carrier, in m/s/Hz:
+// v_rel = f_D * c0 / (2 f_c), the 2 because the echo covers the path twice.
+// Same sign as the Doppler, so positive is approaching. 0 for a missing cfg.
+// The Doppler axis and the settings window both scale through this.
+double fh_radar_velocity_per_hz(const fh_radar_config_t* cfg);
 
 typedef struct fh_radar_stats {
     int paired_symbols;      // Symbols in the window with usable DL and UL rows
