@@ -103,6 +103,12 @@ typedef struct opengl_visualizer {
     int persist_first_folded_symbol; // oldest symbol folded since the last clear, so the
     int persist_has_first_folded;    // number of accumulated periods can be measured
     float* persist_accum;           // persist_period * HEATMAP_TEXTURE_WIDTH magnitudes
+    // Complex twin of persist_accum: the same cells averaged as IQ rather than
+    // |IQ|, for the constellation; see visualizer_get_complex_mean. Interleaved
+    // re, im, NaN where nothing has been folded. Always allocated, cleared and
+    // folded together with persist_accum.
+    float* persist_accum_iq;
+    unsigned long persist_generation; // moves whenever either accumulator changes
 
     visualizer_view_mode_t view_mode;
     const fh_oran_memory_t* last_seen_memory; // detects stream switches to reset accumulators
@@ -120,6 +126,14 @@ typedef struct opengl_visualizer {
     int radar_persist_n;
     int radar_persist_cols;              // frame width the accumulator was sized for; 0 = not allocated
     float* radar_persist_accum;          // radar_persist_period * radar_persist_cols |H| means
+    // Complex twin: H itself averaged over the same cells, recomputed from the
+    // radar's rings as each row is folded, since the frame only carries |H|.
+    // Interleaved re, im, NaN where nothing has been folded.
+    float* radar_persist_accum_h;
+    float* radar_persist_h_scratch;      // one symbol's H, packed then spread out by RE
+    float* radar_persist_h_row;
+    int* radar_persist_h_re;
+    unsigned long radar_persist_generation;
     int* radar_persist_tags;             // RADAR_PERSIST_TAG_SLOTS folded symbol numbers
     int radar_persist_has_epoch;         // whether radar_persist_epoch is valid yet
     uint64_t radar_persist_epoch;        // radar epoch every folded frame belonged to
@@ -152,6 +166,8 @@ typedef struct opengl_visualizer {
     int curve_mean_last_folded_symbol;
     int curve_mean_has_last_folded;
     float* curve_mean_accum;            // curve_mean_period * HEATMAP_TEXTURE_WIDTH magnitudes
+    float* curve_mean_accum_iq;         // complex twin, as persist_accum_iq
+    unsigned long curve_mean_generation;
 
     // Curve view's own magnitude scale, independent of the waterfall's so
     // switching view modes doesn't cause a jarring color/height jump.
@@ -376,6 +392,17 @@ static void magnitude_to_rgb(float magnitude, float max_magnitude, uint8_t* r, u
     }
 }
 
+// Marks every complex cell "never folded". NaN rather than a sentinel value,
+// since any finite complex number is a legitimate mean.
+static void complex_mean_clear(float* cells, size_t count) {
+    if (!cells) {
+        return;
+    }
+    for (size_t i = 0; i < count * 2; i++) {
+        cells[i] = NAN;
+    }
+}
+
 // Fill the persistence accumulator with the "never folded" sentinel and
 // forget which symbols have been folded, without touching allocation.
 static void persist_clear_values(opengl_visualizer_t* vis) {
@@ -386,16 +413,18 @@ static void persist_clear_values(opengl_visualizer_t* vis) {
     for (size_t i = 0; i < cells; i++) {
         vis->persist_accum[i] = PERSIST_EMPTY_CELL;
     }
+    complex_mean_clear(vis->persist_accum_iq, cells);
     vis->persist_has_last_folded = 0;
     vis->persist_has_first_folded = 0;
+    vis->persist_generation++;
 }
 
 // (Re)allocate the accumulator for the current persist_period and clear it.
 static void persist_realloc(opengl_visualizer_t* vis) {
-    if (vis->persist_accum) {
-        free(vis->persist_accum);
-        vis->persist_accum = NULL;
-    }
+    free(vis->persist_accum);
+    vis->persist_accum = NULL;
+    free(vis->persist_accum_iq);
+    vis->persist_accum_iq = NULL;
     if (vis->persist_period <= 0) {
         return;
     }
@@ -404,6 +433,9 @@ static void persist_realloc(opengl_visualizer_t* vis) {
     if (!vis->persist_accum) {
         return;
     }
+    // The magnitude mean is what the view draws, so it carries on without its
+    // twin if this one allocation fails; only the constellation loses out.
+    vis->persist_accum_iq = (float*)malloc(cells * 2 * sizeof(float));
     persist_clear_values(vis);
 }
 
@@ -418,14 +450,16 @@ static void curve_mean_clear_values(opengl_visualizer_t* vis) {
     for (size_t i = 0; i < cells; i++) {
         vis->curve_mean_accum[i] = PERSIST_EMPTY_CELL;
     }
+    complex_mean_clear(vis->curve_mean_accum_iq, cells);
     vis->curve_mean_has_last_folded = 0;
+    vis->curve_mean_generation++;
 }
 
 static void curve_mean_realloc(opengl_visualizer_t* vis) {
-    if (vis->curve_mean_accum) {
-        free(vis->curve_mean_accum);
-        vis->curve_mean_accum = NULL;
-    }
+    free(vis->curve_mean_accum);
+    vis->curve_mean_accum = NULL;
+    free(vis->curve_mean_accum_iq);
+    vis->curve_mean_accum_iq = NULL;
     if (vis->curve_mean_period <= 0) {
         return;
     }
@@ -434,6 +468,7 @@ static void curve_mean_realloc(opengl_visualizer_t* vis) {
     if (!vis->curve_mean_accum) {
         return;
     }
+    vis->curve_mean_accum_iq = (float*)malloc(cells * 2 * sizeof(float));
     curve_mean_clear_values(vis);
 }
 
@@ -534,6 +569,7 @@ static void radar_persist_clear_values(opengl_visualizer_t* vis) {
         for (size_t i = 0; i < cells; i++) {
             vis->radar_persist_accum[i] = PERSIST_EMPTY_CELL;
         }
+        complex_mean_clear(vis->radar_persist_accum_h, cells);
     }
     if (vis->radar_persist_tags) {
         for (int i = 0; i < RADAR_PERSIST_TAG_SLOTS; i++) {
@@ -542,6 +578,19 @@ static void radar_persist_clear_values(opengl_visualizer_t* vis) {
     }
     vis->radar_persist_frame_seen = 0;
     vis->radar_persist_has_folded = 0;
+    vis->radar_persist_generation++;
+}
+
+// The complex twin and its scratch rows, freed together with the accumulator.
+static void radar_persist_free_h(opengl_visualizer_t* vis) {
+    free(vis->radar_persist_accum_h);
+    vis->radar_persist_accum_h = NULL;
+    free(vis->radar_persist_h_scratch);
+    vis->radar_persist_h_scratch = NULL;
+    free(vis->radar_persist_h_row);
+    vis->radar_persist_h_row = NULL;
+    free(vis->radar_persist_h_re);
+    vis->radar_persist_h_re = NULL;
 }
 
 // Sizes the accumulator for frames cols wide, clearing it whenever it has to
@@ -555,6 +604,7 @@ static int radar_persist_ensure(opengl_visualizer_t* vis, int cols) {
     }
     free(vis->radar_persist_accum);
     vis->radar_persist_accum = NULL;
+    radar_persist_free_h(vis);
     vis->radar_persist_cols = 0;
 
     if (vis->radar_persist_period <= 0 || cols <= 0) {
@@ -570,6 +620,16 @@ static int radar_persist_ensure(opengl_visualizer_t* vis, int cols) {
         (float*)malloc((size_t)vis->radar_persist_period * (size_t)cols * sizeof(float));
     if (!vis->radar_persist_accum) {
         return 0;
+    }
+    // As for the waterfall's twin: the |H| mean carries on without it.
+    vis->radar_persist_accum_h =
+        (float*)malloc((size_t)vis->radar_persist_period * (size_t)cols * 2 * sizeof(float));
+    vis->radar_persist_h_scratch = (float*)malloc((size_t)cols * 2 * sizeof(float));
+    vis->radar_persist_h_row = (float*)malloc((size_t)cols * 2 * sizeof(float));
+    vis->radar_persist_h_re = (int*)malloc((size_t)cols * sizeof(int));
+    if (!vis->radar_persist_accum_h || !vis->radar_persist_h_scratch || !vis->radar_persist_h_row ||
+        !vis->radar_persist_h_re) {
+        radar_persist_free_h(vis);
     }
     vis->radar_persist_cols = cols;
     radar_persist_clear_values(vis);
@@ -605,6 +665,7 @@ void visualizer_set_radar_persistence_period(opengl_visualizer_t* vis, int perio
     // frame reallocates at the new size and refolds its whole window.
     free(vis->radar_persist_accum);
     vis->radar_persist_accum = NULL;
+    radar_persist_free_h(vis);
     vis->radar_persist_cols = 0;
     radar_persist_clear_values(vis);
 }
@@ -1178,6 +1239,8 @@ struct ema_fold_target {
     int has_last_folded;    // in/out
     int first_folded_symbol; // in/out - oldest symbol ever folded, for measuring
     int has_first_folded;    // in/out   how many periods have accumulated
+    float* accum_iq;         // complex twin of accum, folded alongside; may be NULL
+    int folded_any;          // out - whether any symbol went in
 };
 
 // Fold newly-arrived symbols (since the last call) into an accumulator,
@@ -1222,16 +1285,28 @@ static void ema_fold_new_symbols(struct ema_fold_target* t, const fh_oran_memory
             phase += t->period;
         }
         float* accum_row = t->accum + (size_t)phase * HEATMAP_TEXTURE_WIDTH;
+        float* iq_row = t->accum_iq ? t->accum_iq + (size_t)phase * HEATMAP_TEXTURE_WIDTH * 2 : NULL;
+        t->folded_any = 1;
 
         for (int col = 0; col < HEATMAP_TEXTURE_WIDTH; col++) {
             float i_val, q_val;
             extract_iq(memory->symbols[idx][col], i_val, q_val);
             float magnitude = sqrtf(i_val * i_val + q_val * q_val);
 
+            // The twin takes the same weight at the same moment, so the two
+            // differ only in averaging x rather than |x|.
             if (accum_row[col] < 0.0f) {
                 accum_row[col] = magnitude;  // first sample ever seen at this phase
+                if (iq_row) {
+                    iq_row[2 * col] = i_val;
+                    iq_row[2 * col + 1] = q_val;
+                }
             } else {
                 accum_row[col] += (magnitude - accum_row[col]) * alpha;
+                if (iq_row) {
+                    iq_row[2 * col] += (i_val - iq_row[2 * col]) * alpha;
+                    iq_row[2 * col + 1] += (q_val - iq_row[2 * col + 1]) * alpha;
+                }
             }
         }
     }
@@ -1243,12 +1318,16 @@ static void ema_fold_new_symbols(struct ema_fold_target* t, const fh_oran_memory
 static void persist_fold_new_symbols(opengl_visualizer_t* vis, const fh_oran_memory_t* memory) {
     struct ema_fold_target t = { vis->persist_accum, vis->persist_period, vis->persist_n,
                                   vis->persist_last_folded_symbol, vis->persist_has_last_folded,
-                                  vis->persist_first_folded_symbol, vis->persist_has_first_folded };
+                                  vis->persist_first_folded_symbol, vis->persist_has_first_folded,
+                                  vis->persist_accum_iq, 0 };
     ema_fold_new_symbols(&t, memory);
     vis->persist_last_folded_symbol = t.last_folded_symbol;
     vis->persist_has_last_folded = t.has_last_folded;
     vis->persist_first_folded_symbol = t.first_folded_symbol;
     vis->persist_has_first_folded = t.has_first_folded;
+    if (t.folded_any) {
+        vis->persist_generation++;
+    }
 }
 
 // How many averaging periods have accumulated since the rolling mean was
@@ -1268,10 +1347,13 @@ static int persist_periods_elapsed(const opengl_visualizer_t* vis) {
 static void curve_mean_fold_new_symbols(opengl_visualizer_t* vis, const fh_oran_memory_t* memory) {
     struct ema_fold_target t = { vis->curve_mean_accum, vis->curve_mean_period, vis->curve_mean_n,
                                   vis->curve_mean_last_folded_symbol, vis->curve_mean_has_last_folded,
-                                  0, 0 };
+                                  0, 0, vis->curve_mean_accum_iq, 0 };
     ema_fold_new_symbols(&t, memory);
     vis->curve_mean_last_folded_symbol = t.last_folded_symbol;
     vis->curve_mean_has_last_folded = t.has_last_folded;
+    if (t.folded_any) {
+        vis->curve_mean_generation++;
+    }
 }
 
 #define CURVE_TRACE_MIN_ALPHA 0.08f
@@ -1754,6 +1836,53 @@ unsigned int visualizer_get_overview_texture(opengl_visualizer_t* vis, int width
     vis->overview_generation = vis->texture_generation;
     vis->overview_time = now;
     return vis->overview_texture;
+}
+
+void visualizer_get_complex_mean(const opengl_visualizer_t* vis, visualizer_complex_mean_t* out) {
+    if (out == NULL) {
+        return;
+    }
+    memset(out, 0, sizeof(*out));
+    out->kind = VISUALIZER_MEAN_NONE;
+    if (vis == NULL) {
+        return;
+    }
+
+    switch (vis->view_mode) {
+    case VIEW_MODE_WATERFALL:
+        if (vis->persist_enabled && vis->persist_accum && vis->persist_accum_iq && vis->persist_period > 0) {
+            out->kind = VISUALIZER_MEAN_IQ;
+            out->cells = vis->persist_accum_iq;
+            out->rows = vis->persist_period;
+            out->cols = HEATMAP_TEXTURE_WIDTH;
+            out->generation = vis->persist_generation;
+        }
+        break;
+    case VIEW_MODE_CURVE:
+        if (vis->curve_mean_enabled && vis->curve_mean_accum && vis->curve_mean_accum_iq &&
+            vis->curve_mean_period > 0) {
+            out->kind = VISUALIZER_MEAN_IQ;
+            out->cells = vis->curve_mean_accum_iq;
+            out->rows = vis->curve_mean_period;
+            out->cols = HEATMAP_TEXTURE_WIDTH;
+            out->generation = vis->curve_mean_generation;
+        }
+        break;
+    case VIEW_MODE_RADAR:
+        // axis_radar_own_mean: the frame last drawn was this visualizer's CFR
+        // mean, which also rules out the core's transform-output means.
+        if (vis->axis_radar_own_mean && vis->radar_persist_accum_h && vis->radar_persist_period > 0 &&
+            vis->radar_persist_cols == FH_RADAR_RE_COUNT) {
+            out->kind = VISUALIZER_MEAN_H;
+            out->cells = vis->radar_persist_accum_h;
+            out->rows = vis->radar_persist_period;
+            out->cols = vis->radar_persist_cols;
+            out->generation = vis->radar_persist_generation;
+        }
+        break;
+    case VIEW_MODE_COUNT:
+        break;
+    }
 }
 
 int visualizer_get_curve_overview(const opengl_visualizer_t* vis, int columns, float* out_trace, float* out_mean) {
@@ -3846,6 +3975,21 @@ static void radar_persist_fold_frame(opengl_visualizer_t* vis,
     // just makes the assumption safe rather than silent.
     const int first_row = (rows > RADAR_PERSIST_TAG_SLOTS) ? rows - RADAR_PERSIST_TAG_SLOTS : 0;
 
+    // The complex twin needs H itself, which the frame has already reduced to
+    // |H|, so each row about to be folded is divided again from the rings the
+    // radar reads, with the settings it divides by. Those settings are the
+    // frame's own: any change to them starts a new epoch, which clears both
+    // accumulators before a frame of the new settings is folded.
+    const int fold_h = vis->radar_persist_accum_h != NULL && vis->radar != NULL;
+    fh_radar_config_t pair_cfg;
+    const fh_oran_memory_t* pair_dl = NULL;
+    const fh_oran_memory_t* pair_ul = NULL;
+    if (fold_h) {
+        fh_radar_get_config(vis->radar, &pair_cfg);
+        fh_radar_get_pair(vis->radar, &pair_dl, &pair_ul);
+    }
+    int folded_any = 0;
+
     for (int row = first_row; row < rows; row++) {
         const int symbol = stats->window_first_symbol + row;
         int slot = symbol % RADAR_PERSIST_TAG_SLOTS;
@@ -3863,6 +4007,26 @@ static void radar_persist_fold_frame(opengl_visualizer_t* vis,
         float* accum_row = vis->radar_persist_accum + (size_t)phase * (size_t)cols;
         const float* src = frame + (size_t)row * (size_t)cols;
 
+        // This row's H spread out by RE. Only read where the frame has an
+        // estimate, and every such RE had a nonzero denominator when the frame
+        // was computed, so it is among what the division writes now. A row
+        // since evicted from either ring yields nothing; its |H| still folds.
+        int have_h = 0;
+        float* h_row = vis->radar_persist_h_row;
+        if (fold_h && cols == FH_RADAR_RE_COUNT) {
+            const int written = fh_radar_cfr_symbol(&pair_cfg, pair_dl, pair_ul, symbol, 0, cols - 1,
+                                                    (fh_complex_t*)vis->radar_persist_h_scratch,
+                                                    vis->radar_persist_h_re);
+            for (int k = 0; k < written; k++) {
+                const int re = vis->radar_persist_h_re[k];
+                h_row[2 * re] = vis->radar_persist_h_scratch[2 * k];
+                h_row[2 * re + 1] = vis->radar_persist_h_scratch[2 * k + 1];
+            }
+            have_h = written >= 0;
+        }
+        float* h_accum_row = vis->radar_persist_accum_h ? vis->radar_persist_accum_h + (size_t)phase * (size_t)cols * 2
+                                                        : NULL;
+
         int folded = 0;
         for (int col = 0; col < cols; col++) {
             const float value = src[col];
@@ -3875,11 +4039,24 @@ static void radar_persist_fold_frame(opengl_visualizer_t* vis,
             } else {
                 accum_row[col] += (value - accum_row[col]) * alpha;
             }
+            // NaN marks a twin cell nothing has reached, which can trail the
+            // |H| cell when a row went unrecomputed.
+            if (have_h && h_accum_row) {
+                float* cell = h_accum_row + 2 * col;
+                if (cell[0] != cell[0]) {
+                    cell[0] = h_row[2 * col];
+                    cell[1] = h_row[2 * col + 1];
+                } else {
+                    cell[0] += (h_row[2 * col] - cell[0]) * alpha;
+                    cell[1] += (h_row[2 * col + 1] - cell[1]) * alpha;
+                }
+            }
             folded = 1;
         }
         if (!folded) {
             continue;  // unpaired so far; a later frame may still pair it
         }
+        folded_any = 1;
 
         vis->radar_persist_tags[slot] = symbol;
         if (!vis->radar_persist_has_folded) {
@@ -3894,6 +4071,9 @@ static void radar_persist_fold_frame(opengl_visualizer_t* vis,
                 vis->radar_persist_last_symbol = symbol;
             }
         }
+    }
+    if (folded_any) {
+        vis->radar_persist_generation++;
     }
 }
 
@@ -4392,10 +4572,13 @@ void visualizer_destroy(opengl_visualizer_t* vis) {
     if (vis->persist_accum) {
         free(vis->persist_accum);
     }
+    free(vis->persist_accum_iq);
     if (vis->curve_mean_accum) {
         free(vis->curve_mean_accum);
     }
+    free(vis->curve_mean_accum_iq);
     free(vis->radar_persist_accum);
+    radar_persist_free_h(vis);
     free(vis->radar_persist_tags);
     free(vis->curve_frame_traces);
     free(vis->curve_frame_mean);

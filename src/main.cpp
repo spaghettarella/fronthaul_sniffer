@@ -1209,8 +1209,14 @@ int main(int argc, char** argv) {
                             radar_pair.ul_label = ul_label;
                         }
 
+                        // The complex twin of whatever rolling mean the main
+                        // view just drew, for the constellation's Rolling mean
+                        // data box.
+                        visualizer_complex_mean_t mean;
+                        visualizer_get_complex_mean(visualizer, &mean);
+
                         imgui_constellation_frame(constellation_ui, constellation, display_memory, &selection,
-                                                  radar_view ? &radar_pair : nullptr, stream_label,
+                                                  radar_view ? &radar_pair : nullptr, &mean, stream_label,
                                                   imgui_visualizer_get_frozen(imgui_state));
                     }
                 }

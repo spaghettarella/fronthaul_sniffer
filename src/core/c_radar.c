@@ -57,6 +57,12 @@
 #define RADAR_BATCH_POLL_MS 2
 #define RADAR_BATCH_SETTLE_SYMBOLS 28
 
+// How many frames one ring may run on while the other's newest symbol does not
+// move before the other counts as stalled; see fh_radar_stats::ul_stalled. TDD
+// keeps a direction silent for at most its pattern period, 10 ms at most, and
+// the check compares consecutive passes, so a slow pass cannot fake a stall.
+#define RADAR_STALL_FRAMES 4
+
 struct fh_radar {
     size_t fft_threads;
 
@@ -108,6 +114,35 @@ struct fh_radar {
     int64_t batch_last;
     uint64_t batch_cfg_generation;
     uint64_t batches_skipped;
+
+    // Stall guard; worker-only. Each ring's newest symbol as last seen, and
+    // the other ring's newest at the last pass where this one had moved.
+    // Cleared by a reset.
+    int stall_valid;
+    int stall_dl_seen;
+    int stall_ul_seen;
+    int64_t stall_dl_at_ul_move;
+    int64_t stall_ul_at_dl_move;
+
+    // Rolling means of the published stats; worker-only. What each pairing
+    // mean was last folded under, so it starts over when that changes, and
+    // when each was last folded, for the weight. Cleared by a reset.
+    int avg_pair_valid;
+    uint64_t avg_pair_epoch;
+    int avg_pair_window;
+    double avg_pair_ms;
+    float avg_paired;
+    float avg_skipped_dl;
+    float avg_skipped_ul;
+    int avg_mag_valid;
+    double avg_mag_ms;
+    float avg_mag;
+    int avg_time_valid;
+    fh_radar_output_t avg_time_output;
+    double avg_time_ms;
+    double avg_refresh;
+    double avg_cfr;
+    double avg_transform;
 
     pthread_t worker;
     int worker_started;
@@ -258,26 +293,76 @@ static void sanitize_config(fh_radar_config_t* cfg) {
 
 // --- Ring access ----------------------------------------------------------
 
+// Rounds toward minus infinity, so batch indices stay right below symbol 0.
+static int64_t floor_div(int64_t a, int64_t b) {
+    int64_t q = a / b;
+    if ((a % b != 0) && ((a < 0) != (b < 0))) {
+        q--;
+    }
+    return q;
+}
+
+static int ring_empty(const fh_oran_memory_t* memory) {
+    return memory->symbol_highest < memory->symbol_lowest;
+}
+
 // Resolve the ring row holding an absolute symbol number, verifying the row's
 // tag still matches so an evicted symbol is reported missing rather than read
 // as whatever overwrote it. Mirrors ring_row_for_symbol in the visualizer.
-static int ring_row_for_symbol(const fh_oran_memory_t* memory, int symbol_num, size_t* out_idx) {
+// Wide, so a UL symbol a cycle offset away cannot overflow on the way here.
+static int ring_row_for_symbol(const fh_oran_memory_t* memory, int64_t symbol_num, size_t* out_idx) {
     if (memory == NULL || memory->symbols == NULL) {
         return 0;
     }
     if (symbol_num < memory->symbol_lowest || symbol_num > memory->symbol_highest) {
         return 0;
     }
-    size_t age = (size_t)(memory->symbol_highest - symbol_num);
-    size_t idx = (memory->index_symbol_highest + memory->max_symbols - age) % memory->max_symbols;
-    if (memory->symbols[idx] == NULL) {
-        return 0;
+    // The decode side moves index_symbol_highest and symbol_highest one after
+    // the other, so a lookup that lands between the two stores computes the
+    // row next to the right one, and the tag check reports a symbol that is
+    // there as missing - a fraction of a symbol per pass on average, all of
+    // it near the write head. A second look sees both stores. The tag still
+    // vouches for every row returned, so retrying can only recover a miss.
+    size_t idx = 0;
+    for (int attempt = 0;; attempt++) {
+        const int highest = __atomic_load_n(&memory->symbol_highest, __ATOMIC_RELAXED);
+        const int index_highest = __atomic_load_n(&memory->index_symbol_highest, __ATOMIC_RELAXED);
+        const size_t age = (size_t)((int64_t)highest - symbol_num);
+        idx = ((size_t)index_highest + memory->max_symbols - age % memory->max_symbols) % memory->max_symbols;
+        if (memory->row_symbol_numbers == NULL || memory->row_symbol_numbers[idx] == symbol_num) {
+            break;
+        }
+        if (attempt == 1) {
+            return 0;
+        }
     }
-    if (memory->row_symbol_numbers != NULL && memory->row_symbol_numbers[idx] != symbol_num) {
+    if (memory->symbols[idx] == NULL) {
         return 0;
     }
     *out_idx = idx;
     return 1;
+}
+
+// Symbols per 256-frame cycle for a DL/UL pair: the DL's spacing, or the UL's
+// while the DL has not reported one. 0 while neither has.
+static int64_t pair_cycle_symbols(const fh_oran_memory_t* dl, const fh_oran_memory_t* ul) {
+    const int64_t cycle = fh_oran_memory_cycle_symbols(dl);
+    return (cycle > 0) ? cycle : fh_oran_memory_cycle_symbols(ul);
+}
+
+int64_t fh_radar_ul_cycle_offset(const fh_oran_memory_t* dl, const fh_oran_memory_t* ul) {
+    if (dl == NULL || ul == NULL || ring_empty(dl) || ring_empty(ul)) {
+        return 0;
+    }
+    const int64_t cycle = pair_cycle_symbols(dl, ul);
+    if (cycle <= 0) {
+        return 0;
+    }
+    // The two streams run side by side, so their newest symbols are a whole
+    // number of cycles apart give or take a TDD period; rounding to the nearest
+    // cycle recovers that number.
+    const int64_t gap = (int64_t)ul->symbol_highest - (int64_t)dl->symbol_highest;
+    return floor_div(gap + cycle / 2, cycle) * cycle;
 }
 
 static double monotonic_ms(void) {
@@ -430,14 +515,16 @@ int fh_radar_cfr_symbol(const fh_radar_config_t* cfg,
                         int dl_symbol,
                         int re_first,
                         int re_last,
-                        fh_complex_t* out) {
+                        fh_complex_t* out,
+                        int* out_re) {
     if (cfg == NULL || out == NULL) {
         return -1;
     }
     size_t dl_idx = 0;
     size_t ul_idx = 0;
     if (!ring_row_for_symbol(dl, dl_symbol, &dl_idx) ||
-        !ring_row_for_symbol(ul, dl_symbol + cfg->dl_ul_lag_symbols, &ul_idx)) {
+        !ring_row_for_symbol(ul, (int64_t)dl_symbol + cfg->dl_ul_lag_symbols + fh_radar_ul_cycle_offset(dl, ul),
+                             &ul_idx)) {
         return -1;
     }
 
@@ -471,15 +558,19 @@ int fh_radar_cfr_symbol(const fh_radar_config_t* cfg,
         const float inv = 1.0f / den_p;
         dst[2 * written] = (nr * dr + ni * di) * inv;
         dst[2 * written + 1] = (ni * dr - nr * di) * inv;
+        if (out_re != NULL) {
+            out_re[written] = re;
+        }
         written++;
     }
     return occupied ? written : -1;
 }
 
 // One full pass: pair each symbol of the window - rows symbols from oldest -
-// across the two rings, divide, and write the result into the sink. Every row
-// of the sink is written, whether or not its symbol paired. have_window is 0
-// while there is nothing to place a window on yet.
+// across the two rings, divide, and write the result into the sink. DL symbol
+// n pairs with UL symbol n + ul_shift: the lag plus fh_radar_ul_cycle_offset.
+// Every row of the sink is written, whether or not its symbol paired.
+// have_window is 0 while there is nothing to place a window on yet.
 //
 // The rings are read without taking the decode-side data lock, matching how
 // the renderer already samples the same memory every frame. A row torn by a
@@ -487,6 +578,7 @@ int fh_radar_cfr_symbol(const fh_radar_config_t* cfg,
 static void compute_cfr(const fh_radar_config_t* cfg,
                         const fh_oran_memory_t* dl,
                         const fh_oran_memory_t* ul,
+                        int64_t ul_shift,
                         int have_window,
                         int oldest,
                         int rows,
@@ -541,7 +633,7 @@ static void compute_cfr(const fh_radar_config_t* cfg,
         }
 
         size_t ul_idx = 0;
-        if (!ring_row_for_symbol(ul, sym + cfg->dl_ul_lag_symbols, &ul_idx)) {
+        if (!ring_row_for_symbol(ul, (int64_t)sym + ul_shift, &ul_idx)) {
             stats->skipped_ul_missing++;
             cfr_sink_clear_row(sink, row);
             continue;
@@ -586,6 +678,7 @@ static void compute_transform_frame(fh_radar_dsp_t* dsp,
                                     const fh_radar_config_t* cfg,
                                     const fh_oran_memory_t* dl,
                                     const fh_oran_memory_t* ul,
+                                    int64_t ul_shift,
                                     int have_window,
                                     int oldest,
                                     float* dst,
@@ -618,7 +711,7 @@ static void compute_transform_frame(fh_radar_dsp_t* dsp,
     sink.window = fh_radar_dsp_range_window(dsp, cfg->range_window, sink.used_count);
     sink.row_valid = row_valid;
 
-    compute_cfr(cfg, dl, ul, have_window, oldest, rows, &sink, stats);
+    compute_cfr(cfg, dl, ul, ul_shift, have_window, oldest, rows, &sink, stats);
 
     const double cfr_done = monotonic_ms();
     stats->cfr_ms = cfr_done - started;
@@ -677,29 +770,20 @@ static void wait_locked(fh_radar_t* r, int ms) {
     pthread_cond_timedwait(&r->cv, &r->lock, &deadline);
 }
 
-// Rounds toward minus infinity, so batch indices stay right below symbol 0.
-static int64_t floor_div(int64_t a, int64_t b) {
-    int64_t q = a / b;
-    if ((a % b != 0) && ((a < 0) != (b < 0))) {
-        q--;
-    }
-    return q;
-}
-
 // The newest batch of rows symbols that has settled in both rings: the DL up
-// to its last symbol, and the UL up to that symbol plus the lag, each with
-// RADAR_BATCH_SETTLE_SYMBOLS to spare. Returns 0 while there is none.
-static int newest_complete_batch(const fh_radar_config_t* cfg,
-                                 const fh_oran_memory_t* dl,
+// to its last symbol, and the UL up to its partner, that symbol plus
+// ul_shift, each with RADAR_BATCH_SETTLE_SYMBOLS to spare. Batches are
+// numbered in the DL's symbols. Returns 0 while there is none.
+static int newest_complete_batch(const fh_oran_memory_t* dl,
                                  const fh_oran_memory_t* ul,
+                                 int64_t ul_shift,
                                  int rows,
                                  int64_t* out_batch) {
-    if (dl->symbol_highest < dl->symbol_lowest || ul->symbol_highest < ul->symbol_lowest) {
+    if (ring_empty(dl) || ring_empty(ul)) {
         return 0; // nothing captured yet
     }
     const int64_t dl_settled = (int64_t)dl->symbol_highest - RADAR_BATCH_SETTLE_SYMBOLS;
-    const int64_t ul_settled =
-        (int64_t)ul->symbol_highest - (int64_t)cfg->dl_ul_lag_symbols - RADAR_BATCH_SETTLE_SYMBOLS;
+    const int64_t ul_settled = (int64_t)ul->symbol_highest - ul_shift - RADAR_BATCH_SETTLE_SYMBOLS;
     const int64_t settled = (dl_settled < ul_settled) ? dl_settled : ul_settled;
 
     // Batch k ends at (k + 1) * rows - 1, so the newest one ending at or
@@ -710,6 +794,112 @@ static int newest_complete_batch(const fh_radar_config_t* cfg,
     }
     *out_batch = batch;
     return 1;
+}
+
+// Feeds the stall guard the rings' newest symbols and reports which ring, if
+// either, has stood still while the other ran on by more than
+// RADAR_STALL_FRAMES. Each ring is measured in its own numbering, so a cycle
+// offset between them does not matter. With r->lock held.
+static void track_stall(fh_radar_t* r,
+                        const fh_oran_memory_t* dl,
+                        const fh_oran_memory_t* ul,
+                        int64_t cycle,
+                        int* out_dl_stalled,
+                        int* out_ul_stalled) {
+    *out_dl_stalled = 0;
+    *out_ul_stalled = 0;
+    if (ring_empty(dl) || ring_empty(ul)) {
+        r->stall_valid = 0; // wiped, or nothing yet: start watching afresh
+        return;
+    }
+    const int dl_high = dl->symbol_highest;
+    const int ul_high = ul->symbol_highest;
+    if (!r->stall_valid) {
+        r->stall_valid = 1;
+        r->stall_dl_seen = dl_high;
+        r->stall_ul_seen = ul_high;
+        r->stall_dl_at_ul_move = dl_high;
+        r->stall_ul_at_dl_move = ul_high;
+        return;
+    }
+    if (ul_high != r->stall_ul_seen) {
+        r->stall_ul_seen = ul_high;
+        r->stall_dl_at_ul_move = dl_high;
+    }
+    if (dl_high != r->stall_dl_seen) {
+        r->stall_dl_seen = dl_high;
+        r->stall_ul_at_dl_move = ul_high;
+    }
+    if (cycle <= 0) {
+        return;
+    }
+    const int64_t limit = (int64_t)RADAR_STALL_FRAMES * (cycle / 256);
+    *out_ul_stalled = ((int64_t)dl_high - r->stall_dl_at_ul_move) > limit;
+    *out_dl_stalled = ((int64_t)ul_high - r->stall_ul_at_dl_move) > limit;
+}
+
+// How much of a new value a rolling mean last folded at last_ms takes in:
+// FH_RADAR_STATS_MEAN_TAU_MS of wall time, however many passes that is.
+static double mean_weight(double now_ms, double last_ms) {
+    const double dt = now_ms - last_ms;
+    return (dt > 0.0) ? 1.0 - exp(-dt / FH_RADAR_STATS_MEAN_TAU_MS) : 0.0;
+}
+
+// Folds a pass about to be published into the rolling means and writes them
+// into it. With r->lock held.
+static void fold_stats_means(fh_radar_t* r, fh_radar_stats_t* pass, double now_ms) {
+    // Counts out of a different window depth, or values measured another way
+    // (a new epoch), do not average with the ones before.
+    if (!r->avg_pair_valid || r->avg_pair_epoch != pass->epoch || r->avg_pair_window != pass->window_symbols) {
+        r->avg_pair_valid = 1;
+        r->avg_pair_epoch = pass->epoch;
+        r->avg_pair_window = pass->window_symbols;
+        r->avg_paired = (float)pass->paired_symbols;
+        r->avg_skipped_dl = (float)pass->skipped_dl_empty;
+        r->avg_skipped_ul = (float)pass->skipped_ul_missing;
+        r->avg_mag_valid = 0;
+    } else {
+        const float w = (float)mean_weight(now_ms, r->avg_pair_ms);
+        r->avg_paired += w * ((float)pass->paired_symbols - r->avg_paired);
+        r->avg_skipped_dl += w * ((float)pass->skipped_dl_empty - r->avg_skipped_dl);
+        r->avg_skipped_ul += w * ((float)pass->skipped_ul_missing - r->avg_skipped_ul);
+    }
+    r->avg_pair_ms = now_ms;
+
+    // A pass that paired nothing has no |H| to report, not an |H| of 0.
+    if (pass->paired_symbols > 0) {
+        if (!r->avg_mag_valid) {
+            r->avg_mag_valid = 1;
+            r->avg_mag = pass->mean_cfr_magnitude;
+        } else {
+            r->avg_mag += (float)mean_weight(now_ms, r->avg_mag_ms) * (pass->mean_cfr_magnitude - r->avg_mag);
+        }
+        r->avg_mag_ms = now_ms;
+    }
+
+    pass->avg_paired_symbols = r->avg_paired;
+    pass->avg_skipped_dl_empty = r->avg_skipped_dl;
+    pass->avg_skipped_ul_missing = r->avg_skipped_ul;
+    pass->avg_cfr_magnitude = r->avg_mag_valid ? r->avg_mag : 0.0f;
+
+    // Each output costs its own, so switching starts the timings over.
+    if (!r->avg_time_valid || r->avg_time_output != pass->output) {
+        r->avg_time_valid = 1;
+        r->avg_time_output = pass->output;
+        r->avg_refresh = pass->last_refresh_ms;
+        r->avg_cfr = pass->cfr_ms;
+        r->avg_transform = pass->transform_ms;
+    } else {
+        const double w = mean_weight(now_ms, r->avg_time_ms);
+        r->avg_refresh += w * (pass->last_refresh_ms - r->avg_refresh);
+        r->avg_cfr += w * (pass->cfr_ms - r->avg_cfr);
+        r->avg_transform += w * (pass->transform_ms - r->avg_transform);
+    }
+    r->avg_time_ms = now_ms;
+
+    pass->avg_refresh_ms = r->avg_refresh;
+    pass->avg_cfr_ms = r->avg_cfr;
+    pass->avg_transform_ms = r->avg_transform;
 }
 
 static void* radar_worker(void* arg) {
@@ -728,6 +918,10 @@ static void* radar_worker(void* arg) {
             memset(&r->stats, 0, sizeof(r->stats));
             r->batch_valid = 0;
             r->batches_skipped = 0;
+            r->stall_valid = 0;
+            r->avg_pair_valid = 0;
+            r->avg_mag_valid = 0;
+            r->avg_time_valid = 0;
         }
 
         // Nobody is looking: sleep until something changes rather than run
@@ -750,15 +944,42 @@ static void* radar_worker(void* arg) {
             rows = (int)dl->max_symbols;
         }
 
+        // Where each DL symbol's UL partner sits, taken once so the batch check
+        // and the pass agree on it: the lag, on the rolling frame_id.
+        const int have_pair = dl != NULL && ul != NULL;
+        const int64_t cycle = have_pair ? pair_cycle_symbols(dl, ul) : 0;
+        const int64_t ul_offset = have_pair ? fh_radar_ul_cycle_offset(dl, ul) : 0;
+        const int64_t ul_shift = (int64_t)cfg.dl_ul_lag_symbols + ul_offset;
+        const int ul_cycle_offset = (cycle > 0) ? (int)(ul_offset / cycle) : 0;
+
+        // That pairing cannot tell a live ring from a stalled one whose old
+        // rows sit at the same place in the cycle, so a stalled ring holds
+        // the last frame on screen instead.
+        int dl_stalled = 0;
+        int ul_stalled = 0;
+        if (have_pair) {
+            track_stall(r, dl, ul, cycle, &dl_stalled, &ul_stalled);
+        }
+        r->stats.ul_cycle_offset = ul_cycle_offset;
+        r->stats.dl_stalled = dl_stalled;
+        r->stats.ul_stalled = ul_stalled;
+        if (dl_stalled || ul_stalled) {
+            r->stats.have_dl = 1;
+            r->stats.have_ul = 1;
+            wait_locked(r, cfg.batch_aligned ? RADAR_BATCH_POLL_MS : RADAR_IDLE_SLEEP_MS);
+            pthread_mutex_unlock(&r->lock);
+            continue;
+        }
+
         // Where the window sits, settled before the pass so the batch check
         // and the frame agree on it. Without a pair there is nothing to align
         // to, and the pass below only reports what is missing.
-        const int batched = cfg.batch_aligned && dl != NULL && ul != NULL;
+        const int batched = cfg.batch_aligned && have_pair;
         int have_window = 0;
         int oldest = 0;
         int64_t batch = 0;
         if (batched) {
-            if (!newest_complete_batch(&cfg, dl, ul, rows, &batch)) {
+            if (!newest_complete_batch(dl, ul, ul_shift, rows, &batch)) {
                 r->stats.batch_waiting = 1;
                 r->stats.have_dl = 1;
                 r->stats.have_ul = 1;
@@ -816,6 +1037,7 @@ static void* radar_worker(void* arg) {
         // time it is published.
         pass.output = cfg.output;
         pass.epoch = epoch;
+        pass.ul_cycle_offset = ul_cycle_offset;
 
         if (persist_reset) {
             fh_radar_dsp_reset_persistence(r->dsp);
@@ -825,10 +1047,11 @@ static void* radar_worker(void* arg) {
             cfr_sink_t sink;
             memset(&sink, 0, sizeof(sink));
             sink.magnitude = back;
-            compute_cfr(&cfg, dl, ul, have_window, oldest, rows, &sink, &pass);
+            compute_cfr(&cfg, dl, ul, ul_shift, have_window, oldest, rows, &sink, &pass);
             pass.cfr_ms = monotonic_ms() - started;
         } else {
-            compute_transform_frame(r->dsp, &cfg, dl, ul, have_window, oldest, back, rows, out_rows, cols, &pass);
+            compute_transform_frame(r->dsp, &cfg, dl, ul, ul_shift, have_window, oldest, back, rows, out_rows, cols,
+                                    &pass);
         }
         pass.last_refresh_ms = monotonic_ms() - started;
 
@@ -874,6 +1097,7 @@ static void* radar_worker(void* arg) {
         }
         pass.batches_skipped = r->batches_skipped;
         pass.refresh_count = r->stats.refresh_count + 1;
+        fold_stats_means(r, &pass, monotonic_ms());
         r->stats = pass;
 
         // A sliding window idles between passes. A batch goes straight back to
@@ -1073,6 +1297,23 @@ void fh_radar_submit(fh_radar_t* r, fh_oran_memory_t* dl, fh_oran_memory_t* ul) 
         pthread_cond_broadcast(&r->cv);
     }
     pthread_mutex_unlock(&r->lock);
+}
+
+void fh_radar_get_pair(fh_radar_t* r, const fh_oran_memory_t** out_dl, const fh_oran_memory_t** out_ul) {
+    const fh_oran_memory_t* dl = NULL;
+    const fh_oran_memory_t* ul = NULL;
+    if (r != NULL) {
+        pthread_mutex_lock(&r->lock);
+        dl = r->dl;
+        ul = r->ul;
+        pthread_mutex_unlock(&r->lock);
+    }
+    if (out_dl != NULL) {
+        *out_dl = dl;
+    }
+    if (out_ul != NULL) {
+        *out_ul = ul;
+    }
 }
 
 const float* fh_radar_acquire_result(fh_radar_t* r, int* out_rows, int* out_cols) {

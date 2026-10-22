@@ -101,6 +101,11 @@ struct iqc_input {
     iq_constellation_direction_t direction;
     int symbol_shift;                 // moves the zoomed area's symbols onto this ring's
     iq_constellation_missing_t missing;
+    int mean;                         // the main window's complex rolling mean in place of the above
+    const float* mean_cells;          // its rows x cols cells, see visualizer_complex_mean_t
+    int mean_rows;
+    int mean_cols;
+    unsigned long mean_generation;
 };
 
 // What decides how samples map to pixels. Any change here rebuilds at once.
@@ -109,6 +114,8 @@ struct iqc_view_key {
     const fh_oran_memory_t* memory;
     const fh_oran_memory_t* ul;
     int cfr;
+    const float* mean_cells;
+    int mean_rows;
     int lag;
     int division;
     int freq_start_re;
@@ -122,6 +129,7 @@ struct iqc_view_key {
     int refit;
     int source;
     int skip_empty;
+    float skip_tolerance;
     int density;
     int dot_size;
     int re_first;
@@ -136,6 +144,7 @@ struct iqc_view_key {
 struct iqc_data_key {
     int symbol_highest;
     int ul_symbol_highest;
+    unsigned long mean_generation;
     int symbol_first;
     int symbol_last;
 };
@@ -147,6 +156,7 @@ struct iqc_identity {
     const fh_oran_memory_t* ul;
     int cfr;
     int division;
+    int mean;
 };
 
 struct iq_constellation {
@@ -180,10 +190,12 @@ struct iq_constellation {
 
     iq_constellation_source_t source = IQ_CONSTELLATION_SOURCE_ALL;
     int skip_empty = 1;
+    float skip_tolerance = 0.0f;
     int density = 1;
     int dot_size = 1;
     iq_constellation_radar_data_t radar_data = IQ_CONSTELLATION_RADAR_CFR;
     iq_constellation_direction_t radar_direction = IQ_CONSTELLATION_UL;
+    int use_mean = 0;
 
     int have_built = 0;
     iqc_view_key last_view;
@@ -209,10 +221,12 @@ void iq_constellation_default_prefs(iq_constellation_prefs_t* out) {
     out->height = IQC_DEFAULT_SIZE;
     out->source = IQ_CONSTELLATION_SOURCE_ALL;
     out->skip_empty = 1;
+    out->skip_tolerance = 0.0f;
     out->density = 1;
     out->dot_size = 1;
     out->radar_data = IQ_CONSTELLATION_RADAR_CFR;
     out->radar_direction = IQ_CONSTELLATION_UL;
+    out->use_mean = 0;
 }
 
 static float iqc_guard(float value, float fallback) {
@@ -307,11 +321,13 @@ iq_constellation_t* iq_constellation_create(const iq_constellation_prefs_t* pref
     c->source = (p.source == IQ_CONSTELLATION_SOURCE_ZOOMED) ? IQ_CONSTELLATION_SOURCE_ZOOMED
                                                               : IQ_CONSTELLATION_SOURCE_ALL;
     c->skip_empty = p.skip_empty ? 1 : 0;
+    iq_constellation_set_skip_tolerance(c, p.skip_tolerance);
     c->density = p.density ? 1 : 0;
     c->dot_size = p.dot_size ? 1 : 0;
     c->radar_data = (p.radar_data == IQ_CONSTELLATION_RADAR_IQ) ? IQ_CONSTELLATION_RADAR_IQ
                                                                  : IQ_CONSTELLATION_RADAR_CFR;
     c->radar_direction = (p.radar_direction == IQ_CONSTELLATION_DL) ? IQ_CONSTELLATION_DL : IQ_CONSTELLATION_UL;
+    c->use_mean = p.use_mean ? 1 : 0;
     c->cfr_row.resize(VISUALIZER_RE_COUNT);
     memset(&c->last_view, 0, sizeof(c->last_view));
     memset(&c->last_data, 0, sizeof(c->last_data));
@@ -372,10 +388,12 @@ void iq_constellation_destroy(iq_constellation_t* c, iq_constellation_prefs_t* o
         out_prefs->height = h;
         out_prefs->source = c->source;
         out_prefs->skip_empty = c->skip_empty;
+        out_prefs->skip_tolerance = c->skip_tolerance;
         out_prefs->density = c->density;
         out_prefs->dot_size = c->dot_size;
         out_prefs->radar_data = c->radar_data;
         out_prefs->radar_direction = c->radar_direction;
+        out_prefs->use_mean = c->use_mean;
     }
 
     GLFWwindow* caller = glfwGetCurrentContext();
@@ -636,45 +654,78 @@ static void iqc_fit_extent(iq_constellation_t* c, float peak) {
     c->refit = 0;
 }
 
+// Whether the main window's rolling mean can stand in for the data the
+// settings ask for: the mean has to be of the same thing - the IQ of the
+// stream on screen outside the Radar view, H of its pair inside it.
+static int iqc_mean_matches(const iq_constellation_t* c,
+                            const visualizer_complex_mean_t* mean,
+                            const iq_constellation_radar_pair_t* radar) {
+    if (mean == NULL || mean->cells == NULL || mean->rows <= 0 || mean->cols <= 0) {
+        return 0;
+    }
+    if (mean->kind == VISUALIZER_MEAN_IQ) {
+        return radar == NULL;
+    }
+    if (mean->kind == VISUALIZER_MEAN_H) {
+        return radar != NULL && c->radar_data == IQ_CONSTELLATION_RADAR_CFR;
+    }
+    return 0;
+}
+
 // What the settings and the Radar view's pair say to plot. Outside the Radar
 // view that is always the IQ of the stream on screen.
 static iqc_input iqc_resolve_input(const iq_constellation_t* c,
                                    const fh_oran_memory_t* memory,
-                                   const iq_constellation_radar_pair_t* radar) {
+                                   const iq_constellation_radar_pair_t* radar,
+                                   const visualizer_complex_mean_t* mean) {
     iqc_input in;
     memset(&in, 0, sizeof(in));
     in.direction = IQ_CONSTELLATION_DL;
     if (radar == NULL) {
         in.memory = memory;
         in.missing = (memory == NULL) ? IQ_CONSTELLATION_MISSING_STREAM : IQ_CONSTELLATION_MISSING_NONE;
-        return in;
+    } else {
+        in.radar_view = 1;
+        in.config = radar->config;
+        if (c->radar_data == IQ_CONSTELLATION_RADAR_CFR) {
+            in.cfr = 1;
+            in.memory = radar->dl;
+            in.ul = radar->ul;
+            in.missing = (radar->dl == NULL) ? IQ_CONSTELLATION_MISSING_DL
+                       : (radar->ul == NULL) ? IQ_CONSTELLATION_MISSING_UL
+                                             : IQ_CONSTELLATION_MISSING_NONE;
+        } else if (c->radar_direction == IQ_CONSTELLATION_UL) {
+            in.direction = IQ_CONSTELLATION_UL;
+            in.memory = radar->ul;
+            // The Radar view's rows are DL symbols, and DL symbol n is paired
+            // with UL symbol n + lag on the rolling frame_id; that is where
+            // its UL samples are, in the UL ring's own numbering.
+            in.symbol_shift =
+                (int)(radar->config.dl_ul_lag_symbols + fh_radar_ul_cycle_offset(radar->dl, radar->ul));
+            in.missing = (radar->ul == NULL) ? IQ_CONSTELLATION_MISSING_UL : IQ_CONSTELLATION_MISSING_NONE;
+        } else {
+            in.memory = radar->dl;
+            in.missing = (radar->dl == NULL) ? IQ_CONSTELLATION_MISSING_DL : IQ_CONSTELLATION_MISSING_NONE;
+        }
     }
 
-    in.radar_view = 1;
-    in.config = radar->config;
-    if (c->radar_data == IQ_CONSTELLATION_RADAR_CFR) {
-        in.cfr = 1;
-        in.memory = radar->dl;
-        in.ul = radar->ul;
-        in.missing = (radar->dl == NULL) ? IQ_CONSTELLATION_MISSING_DL
-                   : (radar->ul == NULL) ? IQ_CONSTELLATION_MISSING_UL
-                                         : IQ_CONSTELLATION_MISSING_NONE;
-    } else if (c->radar_direction == IQ_CONSTELLATION_UL) {
-        in.direction = IQ_CONSTELLATION_UL;
-        in.memory = radar->ul;
-        // The Radar view's rows are DL symbols, and DL symbol n is paired with
-        // UL symbol n + lag; that is where its UL samples are.
-        in.symbol_shift = radar->config.dl_ul_lag_symbols;
-        in.missing = (radar->ul == NULL) ? IQ_CONSTELLATION_MISSING_UL : IQ_CONSTELLATION_MISSING_NONE;
-    } else {
-        in.memory = radar->dl;
-        in.missing = (radar->dl == NULL) ? IQ_CONSTELLATION_MISSING_DL : IQ_CONSTELLATION_MISSING_NONE;
+    // The mean's cells are already averaged, so the rings behind them do not
+    // have to be there any more.
+    if (c->use_mean && iqc_mean_matches(c, mean, radar)) {
+        in.mean = 1;
+        in.mean_cells = mean->cells;
+        in.mean_rows = mean->rows;
+        in.mean_cols = mean->cols;
+        in.mean_generation = mean->generation;
+        in.symbol_shift = 0;
+        in.missing = IQ_CONSTELLATION_MISSING_NONE;
     }
     return in;
 }
 
-// Moves a zoomed area's symbols onto the ring the input reads, and narrows H
-// to the resource elements the radar divides at all.
+// Moves a zoomed area's symbols onto the ring the input reads, narrows H to the
+// resource elements the radar divides at all, and turns time into offsets in
+// the period when the input is a rolling mean, whose rows are those offsets.
 static void iqc_adapt_selection(iqc_selection* sel, const iqc_input& in) {
     if (in.symbol_shift != 0) {
         if (sel->time == VISUALIZER_SELECTION_TIME_SYMBOLS) {
@@ -699,10 +750,44 @@ static void iqc_adapt_selection(iqc_selection* sel, const iqc_input& in) {
             sel->re_last = sel->re_first;  // disjoint: H then yields nothing
         }
     }
+    if (in.mean) {
+        const int rows = in.mean_rows;
+        if (sel->time == VISUALIZER_SELECTION_TIME_SYMBOLS) {
+            const long long count = (long long)sel->symbol_last - (long long)sel->symbol_first + 1;
+            if (count >= rows) {
+                sel->time = VISUALIZER_SELECTION_TIME_ALL;
+            } else {
+                int phase = sel->symbol_first % rows;
+                if (phase < 0) {
+                    phase += rows;
+                }
+                sel->time = VISUALIZER_SELECTION_TIME_PHASES;
+                sel->phase_first = phase;
+                sel->phase_count = (int)count;
+                sel->period = rows;
+            }
+        } else if (sel->time == VISUALIZER_SELECTION_TIME_PHASES && sel->period != rows) {
+            sel->time = VISUALIZER_SELECTION_TIME_ALL;  // offsets of another period mean nothing here
+        }
+    }
 }
 
-// One pass over the selection, newest symbol first, binning every sample into
-// the plot and into the overview map.
+// Whether a position in a period of sel->period falls inside the selection's
+// run of offsets, which may wrap past the end of the period.
+static bool iqc_phase_selected(const iqc_selection& sel, int position) {
+    int phase = position % sel.period;
+    if (phase < 0) {
+        phase += sel.period;
+    }
+    int offset = phase - sel.phase_first;
+    if (offset < 0) {
+        offset += sel.period;
+    }
+    return offset < sel.phase_count;
+}
+
+// One pass over the selection, newest symbol first - or for a rolling mean,
+// every row of it - binning every sample into the plot and into the overview map.
 static void iqc_build(iq_constellation_t* c, const iqc_input& in, const iqc_selection& sel,
                       int plot_w, int plot_h) {
     c->plot_counts.assign((size_t)plot_w * (size_t)plot_h, 0);
@@ -713,6 +798,7 @@ static void iqc_build(iq_constellation_t* c, const iqc_input& in, const iqc_sele
     st.missing = in.missing;
     st.radar_view = in.radar_view;
     st.showing_cfr = in.cfr;
+    st.showing_mean = in.mean;
     st.direction = in.direction;
     st.symbol_shift = in.symbol_shift;
     st.re_first = sel.re_first;
@@ -728,8 +814,8 @@ static void iqc_build(iq_constellation_t* c, const iqc_input& in, const iqc_sele
     st.main_view_valid = sel.main_view_valid;
 
     const fh_oran_memory_t* memory = in.memory;
-    if (in.missing != IQ_CONSTELLATION_MISSING_NONE || memory == NULL || memory->symbols == NULL ||
-        memory->symbol_highest < memory->symbol_lowest) {
+    if (!in.mean && (in.missing != IQ_CONSTELLATION_MISSING_NONE || memory == NULL || memory->symbols == NULL ||
+                     memory->symbol_highest < memory->symbol_lowest)) {
         return;
     }
     st.has_memory = 1;
@@ -752,98 +838,24 @@ static void iqc_build(iq_constellation_t* c, const iqc_input& in, const iqc_sele
     const float map_px = (float)IQC_MAP_PX;
     uint32_t* const plot = c->plot_counts.data();
     uint32_t* const map = c->map_counts.data();
-
-    int symbol_hi = memory->symbol_highest;
-    int symbol_lo = memory->symbol_lowest;
-    if (sel.time == VISUALIZER_SELECTION_TIME_SYMBOLS) {
-        if (sel.symbol_last < symbol_hi) {
-            symbol_hi = sel.symbol_last;
-        }
-        if (sel.symbol_first > symbol_lo) {
-            symbol_lo = sel.symbol_first;
-        }
-    }
-    if (symbol_lo == INT_MIN) {
-        symbol_lo = INT_MIN + 1;  // the countdown below must be able to step past it
-    }
     const int row_len = sel.re_last - sel.re_first + 1;
     const int skip_empty = c->skip_empty;
-
-    // Thins the overview map's symbols to about IQC_MAP_SAMPLE_TARGET samples,
-    // estimated from the rows the pass can visit: the ring's span narrowed by
-    // the selection, then by the sample budget.
-    long long candidate_rows = (symbol_hi >= symbol_lo) ? (long long)symbol_hi - (long long)symbol_lo + 1 : 0;
-    if (sel.time == VISUALIZER_SELECTION_TIME_PHASES && sel.period > 0) {
-        candidate_rows = candidate_rows * sel.phase_count / sel.period + 1;
-    }
-    if (candidate_rows > IQC_SAMPLE_BUDGET / row_len + 1) {
-        candidate_rows = IQC_SAMPLE_BUDGET / row_len + 1;
-    }
-    const long long map_estimate = candidate_rows * row_len;
-    const int map_stride = (map_estimate > IQC_MAP_SAMPLE_TARGET)
-        ? (int)((map_estimate + IQC_MAP_SAMPLE_TARGET - 1) / IQC_MAP_SAMPLE_TARGET)
-        : 1;
-
-    long long scanned = 0;
+    const float skip_tolerance = c->skip_tolerance;
     float peak = 0.0f;
-    for (int symbol = symbol_hi; symbol >= symbol_lo; symbol--) {
-        if (sel.time == VISUALIZER_SELECTION_TIME_PHASES) {
-            int phase = symbol % sel.period;
-            if (phase < 0) {
-                phase += sel.period;
-            }
-            int offset = phase - sel.phase_first;
-            if (offset < 0) {
-                offset += sel.period;
-            }
-            if (offset >= sel.phase_count) {
-                continue;
-            }
-        }
 
-        // A ring row as it stands, or for H the symbol divided out against its
-        // UL partner. Either way a run of values to bin.
-        const fh_complex_t* values = NULL;
-        int value_count = 0;
-        if (in.cfr) {
-            const int written = fh_radar_cfr_symbol(&in.config, memory, in.ul, symbol, sel.re_first, sel.re_last,
-                                                    c->cfr_row.data());
-            if (written < 0) {
-                continue;  // did not pair, for the same reasons the radar skips it
-            }
-            values = c->cfr_row.data();
-            value_count = written;
-        } else {
-            size_t idx;
-            if (!fh_oran_memory_row_for_symbol(memory, symbol, &idx)) {
-                continue;  // evicted, or a gap the stream never filled (TDD's other direction)
-            }
-            values = memory->symbols[idx] + sel.re_first;
-            value_count = row_len;
-        }
-        st.symbols_selected++;
-        // Keeps counting past the budget, so the panel can say how much was left out.
-        if (st.budget_hit) {
-            continue;
-        }
-        if (st.symbols_plotted > 0 && scanned + row_len > IQC_SAMPLE_BUDGET) {
-            st.budget_hit = 1;
-            continue;
-        }
-        scanned += row_len;
-        const bool to_map = (st.symbols_plotted % map_stride) == 0;
-        st.symbols_plotted++;
-
-        for (int k = 0; k < value_count; k++) {
+    // Bins one run of values: a ring row, one symbol's H, or one row of a mean.
+    const auto bin_values = [&](const fh_complex_t* values, int count, bool to_map) {
+        for (int k = 0; k < count; k++) {
             const float i_val = values[k].real();
             const float q_val = values[k].imag();
-            if (skip_empty && i_val == 0.0f && q_val == 0.0f) {
+            const float ai = fabsf(i_val);
+            const float aq = fabsf(q_val);
+            // A tolerance of 0 leaves exactly the 0+0j of an empty RE out.
+            if (skip_empty && ai <= skip_tolerance && aq <= skip_tolerance) {
                 continue;
             }
             st.samples_plotted++;
 
-            const float ai = fabsf(i_val);
-            const float aq = fabsf(q_val);
             const float m = ai > aq ? ai : aq;
             if (m > peak && m < 1e30f) {
                 peak = m;
@@ -864,6 +876,120 @@ static void iqc_build(iq_constellation_t* c, const iqc_input& in, const iqc_sele
                 }
             }
         }
+    };
+
+    // Thins the overview map's rows to about IQC_MAP_SAMPLE_TARGET samples,
+    // estimated from the rows the pass can visit, narrowed by the selection
+    // and then by the sample budget.
+    const auto map_stride_for = [&](long long candidate_rows) {
+        if (sel.time == VISUALIZER_SELECTION_TIME_PHASES && sel.period > 0) {
+            candidate_rows = candidate_rows * sel.phase_count / sel.period + 1;
+        }
+        if (candidate_rows > IQC_SAMPLE_BUDGET / row_len + 1) {
+            candidate_rows = IQC_SAMPLE_BUDGET / row_len + 1;
+        }
+        const long long estimate = candidate_rows * row_len;
+        return (estimate > IQC_MAP_SAMPLE_TARGET)
+            ? (int)((estimate + IQC_MAP_SAMPLE_TARGET - 1) / IQC_MAP_SAMPLE_TARGET)
+            : 1;
+    };
+
+    // Counts a row in, or out past the sample budget; returns whether to bin it
+    // and, through to_map, whether the map takes it too. Keeps counting past the
+    // budget, so the panel can say how much was left out.
+    long long scanned = 0;
+    const auto admit_row = [&](int map_stride, bool* to_map) {
+        st.symbols_selected++;
+        if (st.budget_hit) {
+            return false;
+        }
+        if (st.symbols_plotted > 0 && scanned + row_len > IQC_SAMPLE_BUDGET) {
+            st.budget_hit = 1;
+            return false;
+        }
+        scanned += row_len;
+        *to_map = (st.symbols_plotted % map_stride) == 0;
+        st.symbols_plotted++;
+        return true;
+    };
+
+    if (in.mean) {
+        // One value per cell of the mean: row r is offset r in the period. A
+        // cell nothing has been folded into yet holds NaN and is left out.
+        const int rows = in.mean_rows;
+        const int map_stride = map_stride_for(rows);
+        fh_complex_t* packed = c->cfr_row.data();
+        for (int r = 0; r < rows; r++) {
+            if (sel.time == VISUALIZER_SELECTION_TIME_PHASES && !iqc_phase_selected(sel, r)) {
+                continue;
+            }
+            const float* cells = in.mean_cells + (size_t)r * (size_t)in.mean_cols * 2;
+            int count = 0;
+            for (int re = sel.re_first; re <= sel.re_last && re < in.mean_cols; re++) {
+                const float re_part = cells[2 * re];
+                if (re_part != re_part) {
+                    continue;
+                }
+                packed[count++] = fh_complex_t(re_part, cells[2 * re + 1]);
+            }
+            if (count == 0) {
+                continue;
+            }
+            bool to_map = false;
+            if (admit_row(map_stride, &to_map)) {
+                bin_values(packed, count, to_map);
+            }
+        }
+        iqc_fit_extent(c, peak);
+        return;
+    }
+
+    int symbol_hi = memory->symbol_highest;
+    int symbol_lo = memory->symbol_lowest;
+    if (sel.time == VISUALIZER_SELECTION_TIME_SYMBOLS) {
+        if (sel.symbol_last < symbol_hi) {
+            symbol_hi = sel.symbol_last;
+        }
+        if (sel.symbol_first > symbol_lo) {
+            symbol_lo = sel.symbol_first;
+        }
+    }
+    if (symbol_lo == INT_MIN) {
+        symbol_lo = INT_MIN + 1;  // the countdown below must be able to step past it
+    }
+    const int map_stride =
+        map_stride_for((symbol_hi >= symbol_lo) ? (long long)symbol_hi - (long long)symbol_lo + 1 : 0);
+
+    for (int symbol = symbol_hi; symbol >= symbol_lo; symbol--) {
+        if (sel.time == VISUALIZER_SELECTION_TIME_PHASES && !iqc_phase_selected(sel, symbol)) {
+            continue;
+        }
+
+        // A ring row as it stands, or for H the symbol divided out against its
+        // UL partner. Either way a run of values to bin.
+        const fh_complex_t* values = NULL;
+        int value_count = 0;
+        if (in.cfr) {
+            const int written = fh_radar_cfr_symbol(&in.config, memory, in.ul, symbol, sel.re_first, sel.re_last,
+                                                    c->cfr_row.data(), NULL);
+            if (written < 0) {
+                continue;  // did not pair, for the same reasons the radar skips it
+            }
+            values = c->cfr_row.data();
+            value_count = written;
+        } else {
+            size_t idx;
+            if (!fh_oran_memory_row_for_symbol(memory, symbol, &idx)) {
+                continue;  // evicted, or a gap the stream never filled (TDD's other direction)
+            }
+            values = memory->symbols[idx] + sel.re_first;
+            value_count = row_len;
+        }
+
+        bool to_map = false;
+        if (admit_row(map_stride, &to_map)) {
+            bin_values(values, value_count, to_map);
+        }
     }
 
     iqc_fit_extent(c, peak);
@@ -872,12 +998,13 @@ static void iqc_build(iq_constellation_t* c, const iqc_input& in, const iqc_sele
 void iq_constellation_update(iq_constellation_t* c,
                              const fh_oran_memory_t* memory,
                              const visualizer_zoom_selection_t* selection,
-                             const iq_constellation_radar_pair_t* radar) {
+                             const iq_constellation_radar_pair_t* radar,
+                             const visualizer_complex_mean_t* mean) {
     if (c == NULL) {
         return;
     }
 
-    const iqc_input in = iqc_resolve_input(c, memory, radar);
+    const iqc_input in = iqc_resolve_input(c, memory, radar, mean);
 
     // A different stream, or H in place of IQ, is a different scale, so the
     // full view is fitted again; the zoom is kept, being relative to it.
@@ -887,6 +1014,8 @@ void iq_constellation_update(iq_constellation_t* c,
     identity.ul = in.ul;
     identity.cfr = in.cfr;
     identity.division = in.cfr ? (int)in.config.division : 0;
+    // A coherent mean can sit far inside the samples it averages.
+    identity.mean = in.mean;
     if (memcmp(&identity, &c->last_identity, sizeof(identity)) != 0) {
         c->refit = 1;
         c->last_identity = identity;
@@ -902,6 +1031,8 @@ void iq_constellation_update(iq_constellation_t* c,
     view.memory = in.memory;
     view.ul = in.ul;
     view.cfr = in.cfr;
+    view.mean_cells = in.mean ? in.mean_cells : NULL;
+    view.mean_rows = in.mean ? in.mean_rows : 0;
     if (in.cfr) {
         view.lag = in.config.dl_ul_lag_symbols;
         view.division = (int)in.config.division;
@@ -917,6 +1048,7 @@ void iq_constellation_update(iq_constellation_t* c,
     view.refit = c->refit;
     view.source = (int)c->source;
     view.skip_empty = c->skip_empty;
+    view.skip_tolerance = c->skip_empty ? c->skip_tolerance : 0.0f;
     view.density = c->density;
     view.dot_size = c->dot_size;
     view.re_first = sel.re_first;
@@ -930,6 +1062,7 @@ void iq_constellation_update(iq_constellation_t* c,
     memset(&data, 0, sizeof(data));
     data.symbol_highest = in.memory != NULL ? in.memory->symbol_highest : INT_MIN;
     data.ul_symbol_highest = in.ul != NULL ? in.ul->symbol_highest : INT_MIN;
+    data.mean_generation = in.mean ? in.mean_generation : 0;
     data.symbol_first = sel.symbol_first;
     data.symbol_last = sel.symbol_last;
 
@@ -1018,6 +1151,24 @@ int iq_constellation_get_skip_empty(const iq_constellation_t* c) {
     return c ? c->skip_empty : 0;
 }
 
+void iq_constellation_set_skip_tolerance(iq_constellation_t* c, float tolerance) {
+    if (c == NULL) {
+        return;
+    }
+    // Written so a NaN lands on 0 too.
+    if (!(tolerance > 0.0f)) {
+        tolerance = 0.0f;
+    }
+    if (tolerance > IQ_CONSTELLATION_SKIP_TOLERANCE_MAX) {
+        tolerance = IQ_CONSTELLATION_SKIP_TOLERANCE_MAX;
+    }
+    c->skip_tolerance = tolerance;
+}
+
+float iq_constellation_get_skip_tolerance(const iq_constellation_t* c) {
+    return c ? c->skip_tolerance : 0.0f;
+}
+
 void iq_constellation_set_density(iq_constellation_t* c, int enabled) {
     if (c != NULL) {
         c->density = enabled ? 1 : 0;
@@ -1056,6 +1207,22 @@ void iq_constellation_set_radar_direction(iq_constellation_t* c, iq_constellatio
 
 iq_constellation_direction_t iq_constellation_get_radar_direction(const iq_constellation_t* c) {
     return c ? c->radar_direction : IQ_CONSTELLATION_UL;
+}
+
+void iq_constellation_set_use_mean(iq_constellation_t* c, int enabled) {
+    if (c != NULL) {
+        c->use_mean = enabled ? 1 : 0;
+    }
+}
+
+int iq_constellation_get_use_mean(const iq_constellation_t* c) {
+    return c ? c->use_mean : 0;
+}
+
+int iq_constellation_mean_available(const iq_constellation_t* c,
+                                    const visualizer_complex_mean_t* mean,
+                                    const iq_constellation_radar_pair_t* radar) {
+    return c != NULL && iqc_mean_matches(c, mean, radar);
 }
 
 void iq_constellation_get_zoom(const iq_constellation_t* c, float* out_center_u, float* out_center_v, float* out_span) {

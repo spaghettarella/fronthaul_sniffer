@@ -5,15 +5,23 @@
 #include <string.h>
 #include <limits.h>
 
+// Slots in one 1 ms subframe at a subcarrier spacing; a slot is always 14
+// symbols. compute_symbol_number and fh_oran_memory_cycle_symbols both number
+// symbols through this, so the two cannot disagree.
+static int slots_per_subframe_for(int scs_khz) {
+    int slots_per_subframe = scs_khz / 15;
+    if (slots_per_subframe <= 0) {
+        slots_per_subframe = 1;
+    }
+    return slots_per_subframe;
+}
+
 static int compute_symbol_number(uint64_t frame_cycle, const fh_section_t* section, int scs_khz) {
     if (section == NULL || scs_khz <= 0) {
         return -1;
     }
 
-    int slots_per_subframe = scs_khz / 15;
-    if (slots_per_subframe <= 0) {
-        slots_per_subframe = 1;
-    }
+    const int slots_per_subframe = slots_per_subframe_for(scs_khz);
 
     // `frame_cycle` is which 256-frame wraparound the section's 8-bit frame_id
     // falls in (see resolve_frame_cycle), so the absolute frame number is:
@@ -46,11 +54,16 @@ static int compute_symbol_number(uint64_t frame_cycle, const fh_section_t* secti
 // A frame_id below the newest one is not by itself a wraparound: a section
 // from frame 3 that is saved just after one from frame 4 would otherwise count
 // as the counter wrapping, and every symbol of the stream from then on would
-// land 256 frames (71 680 symbols at 30 kHz) further on - harmless to the
-// waterfall, which only ever looks at one stream, but fatal to anything that
-// lines two streams up by symbol number, like the radar's DL/UL pairing. So the
-// ids are compared the way sequence numbers are: a short step back is a late
-// section, anything else is progress, wrapping past 255 when the id is lower.
+// land 256 frames (71 680 symbols at 30 kHz) further on, and the ring would
+// evict everything it holds to make room for it. So the ids are compared
+// the way sequence numbers are: a short step back is a late section, anything
+// else is progress, wrapping past 255 when the id is lower.
+//
+// The cycle count is still only this stream's own: one that was not decoded
+// for a while (Only decode selected) misses the wraps of the gap, and one first
+// seen after another stream had wrapped starts a cycle behind it. Anything that
+// lines two streams up by symbol number, like the radar's DL/UL pairing, has
+// to compare them modulo fh_oran_memory_cycle_symbols, on the 8-bit frame_id.
 //
 // A stream that goes silent and comes back almost exactly one cycle later can
 // be mistaken for late sections; that costs at most FRAME_REORDER_WINDOW frames
@@ -318,6 +331,13 @@ fh_oran_memory_stats_t fh_oran_memory_stats(const fh_oran_memory_t* mem) {
     }
 
     return stats;
+}
+
+int64_t fh_oran_memory_cycle_symbols(const fh_oran_memory_t* mem) {
+    if (mem == NULL || mem->scs_khz <= 0) {
+        return 0;
+    }
+    return 256LL * 10LL * (int64_t)slots_per_subframe_for(mem->scs_khz) * 14LL;
 }
 
 int fh_oran_memory_row_for_symbol(const fh_oran_memory_t* mem, int symbol_num, size_t* out_idx) {

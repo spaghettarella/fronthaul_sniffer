@@ -327,6 +327,41 @@ void visualizer_get_zoom_selection(const opengl_visualizer_t* vis, visualizer_zo
 // gradient, 1 its hot end; values outside [0,1] are clamped.
 void visualizer_heatmap_rgb(float norm, unsigned char* r, unsigned char* g, unsigned char* b);
 
+// --- Complex rolling mean ---
+// The waterfall's rolling mean, the curve's and the Radar view's CFR mean each
+// average magnitudes, |x| or |H|, and that is what they draw. Next to each
+// runs a complex twin over the same cells, folded at the same moments with the
+// same weight, period and resets: the mean of x, or of H, itself. Nothing in
+// the main window draws it; it is there for the IQ constellation.
+//
+// The two can differ a lot. A coherent mean of data resource elements tends
+// to zero, since random QAM symbols cancel, and only what repeats every
+// period stays - reference signals, SSB, idle patterns. For H it is coherent
+// integration: noise falls, a phase-stable channel stays, phase drift shrinks
+// the mean toward zero.
+typedef enum visualizer_mean_kind {
+    VISUALIZER_MEAN_NONE = 0,  // the view on screen shows no rolling mean
+    VISUALIZER_MEAN_IQ = 1,    // waterfall or curve mean: IQ of the stream on screen
+    VISUALIZER_MEAN_H = 2      // Radar view's CFR mean: H of the radar's pair
+} visualizer_mean_kind_t;
+
+typedef struct visualizer_complex_mean {
+    visualizer_mean_kind_t kind;
+    // rows x cols complex means, interleaved re then im, row r holding offset r
+    // in the averaging period. NaN in a cell nothing has been folded into yet.
+    const float* cells;
+    int rows;                  // the averaging period; 1 for the curve's running average
+    int cols;                  // resource elements
+    unsigned long generation;  // moves whenever any cell changes or the mean is cleared
+} visualizer_complex_mean_t;
+
+// The complex twin of the rolling mean the view on screen draws, from the
+// frame last drawn. The pointer stays valid until the next visualizer_update
+// or settings call. kind is VISUALIZER_MEAN_NONE when no rolling mean is on
+// screen, including the radar's own Range-Time and Range-Doppler means, which
+// average delay-domain power rather than anything on the RE grid.
+void visualizer_get_complex_mean(const opengl_visualizer_t* vis, visualizer_complex_mean_t* out);
+
 // --- Overview previews for the Zoom window's minimap ---
 // The whole, unzoomed view in miniature, for the minimap to draw under its
 // window marker. Both describe the frame last drawn, like the axes do.

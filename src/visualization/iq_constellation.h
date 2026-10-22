@@ -66,11 +66,13 @@ typedef struct iq_constellation_prefs {
     int width;
     int height;
     iq_constellation_source_t source;
-    int skip_empty;     // leave out samples that are exactly 0+0j (unscheduled resource elements)
+    int skip_empty;     // leave out samples within skip_tolerance of 0+0j (unscheduled resource elements)
+    float skip_tolerance; // on |I| and on |Q| alike; 0 leaves out exactly 0+0j only
     int density;        // colour by hits per pixel; 0 draws every hit pixel the same colour
     int dot_size;       // grow each hit pixel into a dot sized by its hits; 0 keeps single pixels
     iq_constellation_radar_data_t radar_data;     // Radar view only
     iq_constellation_direction_t radar_direction; // Radar view, IQ samples only
+    int use_mean;       // plot the main window's complex rolling mean, while it has one
 } iq_constellation_prefs_t;
 
 void iq_constellation_default_prefs(iq_constellation_prefs_t* out);
@@ -109,20 +111,33 @@ void iq_constellation_end_frame(iq_constellation_t* c, int present);
 // view's pair while that view is on screen, NULL otherwise; with it, the radar
 // data and direction settings decide what is plotted instead of memory, and a
 // zoomed area - whose rows are DL symbols there - is moved by the lag when the
-// UL is plotted, onto the UL symbols those rows were paired with. Rebuilds only when
+// UL is plotted, onto the UL symbols those rows were paired with. mean is the
+// complex twin of the rolling mean the main view shows (see
+// visualizer_get_complex_mean); with the rolling mean setting on and a mean of
+// the same thing the settings ask for, its cells are plotted instead of single
+// symbols. May be NULL. Rebuilds only when
 // something it depends on has changed, and for new data at most ~30 times a
 // second - less often when one rebuild is expensive, so a deep memory cannot
 // stall the main window - and a frozen memory costs nothing once it is drawn.
 void iq_constellation_update(iq_constellation_t* c,
                              const fh_oran_memory_t* memory,
                              const visualizer_zoom_selection_t* selection,
-                             const iq_constellation_radar_pair_t* radar);
+                             const iq_constellation_radar_pair_t* radar,
+                             const visualizer_complex_mean_t* mean);
 
 // --- Settings ---
 void iq_constellation_set_source(iq_constellation_t* c, iq_constellation_source_t source);
 iq_constellation_source_t iq_constellation_get_source(const iq_constellation_t* c);
 void iq_constellation_set_skip_empty(iq_constellation_t* c, int enabled);
 int iq_constellation_get_skip_empty(const iq_constellation_t* c);
+
+// How close to 0+0j a value has to be for Skip empty to leave it out: both
+// |I| and |Q| at most this, in the units plotted (full scale is about 1 for
+// IQ, |H| about 1 for H). 0, the default, leaves out exact zeros only. Clamped
+// to [0, IQ_CONSTELLATION_SKIP_TOLERANCE_MAX].
+#define IQ_CONSTELLATION_SKIP_TOLERANCE_MAX 1.0f
+void iq_constellation_set_skip_tolerance(iq_constellation_t* c, float tolerance);
+float iq_constellation_get_skip_tolerance(const iq_constellation_t* c);
 void iq_constellation_set_density(iq_constellation_t* c, int enabled);
 int iq_constellation_get_density(const iq_constellation_t* c);
 // Dot size by density: denser pixels draw as bigger dots, up to a few pixels
@@ -134,6 +149,18 @@ void iq_constellation_set_radar_data(iq_constellation_t* c, iq_constellation_rad
 iq_constellation_radar_data_t iq_constellation_get_radar_data(const iq_constellation_t* c);
 void iq_constellation_set_radar_direction(iq_constellation_t* c, iq_constellation_direction_t direction);
 iq_constellation_direction_t iq_constellation_get_radar_direction(const iq_constellation_t* c);
+
+// Rolling mean data: plot the main window's complex rolling mean - one point
+// per cell, offset in the period by resource element - instead of single
+// symbols. Off by default. Only takes effect while the mean is available: the
+// main view shows a rolling mean of the same thing the other settings ask for,
+// the stream's IQ outside the Radar view, H in it. The setting is kept while
+// it is not, and applies again once it is.
+void iq_constellation_set_use_mean(iq_constellation_t* c, int enabled);
+int iq_constellation_get_use_mean(const iq_constellation_t* c);
+int iq_constellation_mean_available(const iq_constellation_t* c,
+                                    const visualizer_complex_mean_t* mean,
+                                    const iq_constellation_radar_pair_t* radar);
 
 // --- Zoom ---
 // Normalised like the waterfall's: 0..1 across the full view on each axis, u
@@ -200,8 +227,9 @@ typedef struct iq_constellation_stats {
     iq_constellation_missing_t missing;
     int radar_view;               // built from the Radar view's pair
     int showing_cfr;              // the picture is H, not IQ samples
+    int showing_mean;             // the picture is the rolling mean's cells; symbols count its rows
     iq_constellation_direction_t direction; // IQ in the Radar view: which direction
-    int symbol_shift;             // added to the zoomed area's symbols (the lag, for UL)
+    int symbol_shift;             // added to the zoomed area's symbols (UL: the lag plus fh_radar_ul_cycle_offset)
     int symbols_plotted;          // symbols binned into the picture; paired symbols for H
     int symbols_selected;         // symbols the selection asked for that the memory holds
     long long samples_plotted;    // samples binned (after skipping empty ones)

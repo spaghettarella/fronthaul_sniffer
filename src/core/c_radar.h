@@ -35,6 +35,10 @@ extern "C" {
 #define FH_RADAR_MAX_PERSIST_PERIOD 4096
 #define FH_RADAR_MAX_PERSIST_N 100000
 
+// Time constant of the rolling means in fh_radar_stats, in wall-clock
+// milliseconds, so they settle alike however fast passes come.
+#define FH_RADAR_STATS_MEAN_TAU_MS 1000.0
+
 typedef enum fh_radar_output {
     RADAR_OUT_CFR = 0,           // |H| over (symbol x RE). No FFT; the bring-up view.
     RADAR_OUT_RANGE_TIME = 1,    // |CIR| over (symbol x delay tap)
@@ -73,7 +77,10 @@ typedef struct fh_radar_config {
     int batch_aligned;
     int freq_start_re;     // First resource element used, inclusive
     int freq_end_re;       // Last resource element used, inclusive
-    int dl_ul_lag_symbols; // UL symbol paired with DL symbol n is n + lag. May be negative.
+    // UL symbol paired with DL symbol n is n + lag, on the rolling 8-bit
+    // frame_id rather than either ring's own cycle count; see
+    // fh_radar_ul_cycle_offset. May be negative.
+    int dl_ul_lag_symbols;
     fh_radar_division_t division;
     // Delay-domain transform size; power of two. A span wider than this is
     // cropped to its first ifft_size REs for the transform outputs; see
@@ -125,23 +132,37 @@ int fh_radar_min_ring_symbols(const fh_radar_config_t* cfg);
 // the settings window both go through this, so they cannot disagree.
 void fh_radar_used_re_range(const fh_radar_config_t* cfg, int* out_start, int* out_end);
 
+// How far the UL ring's symbol numbers sit from the DL ring's, in symbols: a
+// whole number of 256-frame cycles of the 8-bit frame_id. Each ring counts
+// those cycles on its own, so a stream that was not decoded for a while (Only
+// decode selected) or was first seen after the other had wrapped numbers the
+// same frame_id differently - by whole cycles, never by less. Taken as the
+// cycle multiple nearest the gap between the two newest symbols, so the DL and
+// UL may be up to half a cycle (1.28 s) apart before the pairing slips. UL
+// symbol paired with DL symbol n is n + lag + this. 0 while either ring is
+// missing or empty, or its subcarrier spacing unknown. Reads the rings without
+// a lock; callable from any thread.
+int64_t fh_radar_ul_cycle_offset(const fh_oran_memory_t* dl, const fh_oran_memory_t* ul);
+
 // The complex channel estimate the CFR view takes |.| of, for one downlink
-// symbol: paired with uplink symbol dl_symbol + lag and divided the way cfg
-// says, over [re_first, re_last] narrowed to cfg's frequency range.
+// symbol: paired with uplink symbol dl_symbol + lag + fh_radar_ul_cycle_offset
+// and divided the way cfg says, over [re_first, re_last] narrowed to cfg's frequency range.
 // Unwindowed, like the CFR view. A resource element yields a value only where
 // the denominator is nonzero; values are written packed, in RE order, into
-// out, which must hold re_last - re_first + 1 of them. Returns how many were
-// written, or -1 when the symbol does not pair: the DL or UL row missing from
-// its ring, or a DL row with nothing in the range - the same symbols the
-// radar's own pass skips. Reads the rings without a lock, like the worker.
-// Callable from any thread; it touches no radar state.
+// out, which must hold re_last - re_first + 1 of them, and when out_re is not
+// NULL each value's resource element goes to the same index of out_re.
+// Returns how many were written, or -1 when the symbol does not pair: the DL
+// or UL row missing from its ring, or a DL row with nothing in the range - the
+// same symbols the radar's own pass skips. Reads the rings without a lock,
+// like the worker. Callable from any thread; it touches no radar state.
 int fh_radar_cfr_symbol(const fh_radar_config_t* cfg,
                         const fh_oran_memory_t* dl,
                         const fh_oran_memory_t* ul,
                         int dl_symbol,
                         int re_first,
                         int re_last,
-                        fh_complex_t* out);
+                        fh_complex_t* out,
+                        int* out_re);
 
 // Radial velocity per hertz of Doppler at the configured carrier, in m/s/Hz:
 // v_rel = f_D * c0 / (2 f_c), the 2 because the echo covers the path twice.
@@ -159,9 +180,32 @@ typedef struct fh_radar_stats {
     // Mean |H| over resource elements that were occupied in both directions.
     // Reads near 1.0 when the pairing is correct; this is the acceptance test.
     float mean_cfr_magnitude;
+    // The four figures above as a rolling mean over about the last second
+    // (FH_RADAR_STATS_MEAN_TAU_MS), since a single pass jumps around. Start
+    // over with the epoch and with a new window depth. avg_cfr_magnitude
+    // only takes in passes that paired anything.
+    float avg_paired_symbols;
+    float avg_skipped_dl_empty;
+    float avg_skipped_ul_missing;
+    float avg_cfr_magnitude;
+    // The UL ring's symbol numbering minus the DL ring's, in 256-frame cycles:
+    // nonzero when the two streams' own frame counters disagree, which the
+    // pairing absorbs. See fh_radar_ul_cycle_offset.
+    int ul_cycle_offset;
+    // One ring has stopped advancing while the other ran on by more than a few
+    // frames. Nothing is published meanwhile, since pairing on the rolling
+    // frame_id would otherwise divide live rows against stale ones that
+    // happen to sit at the same position in the cycle.
+    int dl_stalled;
+    int ul_stalled;
     double last_refresh_ms;  // Wall time the most recent full pass took
     double cfr_ms;           // Of which pairing and dividing the rings
     double transform_ms;     // Of which the transform stages; 0 for the CFR view
+    // The three timings above as the same rolling mean. Start over on a reset
+    // and when the output changes; avg_transform_ms stays 0 for the CFR view.
+    double avg_refresh_ms;
+    double avg_cfr_ms;
+    double avg_transform_ms;
     // REs the transform stages used, after cropping to the IFFT size.
     // Inclusive; both 0 for the CFR view.
     int used_re_start;
@@ -231,6 +275,10 @@ void fh_radar_set_active(fh_radar_t* r, int active);
 // worker reports through fh_radar_stats::have_dl / have_ul. Cheap enough to
 // call every frame; it only stores the pointers.
 void fh_radar_submit(fh_radar_t* r, fh_oran_memory_t* dl, fh_oran_memory_t* ul);
+
+// The rings last submitted, so a consumer of the published frame can go back
+// to the samples behind it. Either out-pointer may be NULL.
+void fh_radar_get_pair(fh_radar_t* r, const fh_oran_memory_t** out_dl, const fh_oran_memory_t** out_ul);
 
 // Borrows the most recent finished magnitude matrix, row-major, rows*cols
 // floats. Returns NULL when nothing has been computed yet. Every successful

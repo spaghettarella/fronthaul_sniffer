@@ -57,6 +57,13 @@ void fh_oran_memory_advance_loop(fh_oran_memory_t* mem, int64_t loop_span);
 
 fh_oran_memory_stats_t fh_oran_memory_stats(const fh_oran_memory_t* mem);
 
+// Symbols in one 256-frame cycle of the 8-bit frame_id at the stream's
+// subcarrier spacing: how far apart two symbol numbers with the same frame_id,
+// subframe, slot and symbol lie. 0 until the stream has been saved with a
+// known spacing. Each stream counts these cycles on its own, so two streams
+// only agree on symbol numbers modulo this; see resolve_frame_cycle.
+int64_t fh_oran_memory_cycle_symbols(const fh_oran_memory_t* mem);
+
 // Resolves the ring row holding an absolute symbol number, checking its tag so
 // a row since reused for another symbol (ring wraparound, or a gap the stream
 // never filled) is not mistaken for it. Returns 1 and sets *out_idx when the

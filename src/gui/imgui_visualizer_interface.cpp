@@ -964,15 +964,58 @@ static void draw_radar_window(fh_radar_t* radar,
                  "UL/DL is the physical channel. DL/UL is its reciprocal and mirrors the delay axis - both "
                  "read about 1 on occupied REs, so the mean below cannot tell them apart.");
 
-        ImGui::Text("Paired: %d / %d symbols", st.paired_symbols, st.window_symbols);
-        ImGui::Text("Skipped: %d (DL empty), %d (UL missing)",
-                    st.skipped_dl_empty, st.skipped_ul_missing);
+        // Each figure for the frame on screen beside its mean over about the
+        // last second, which a single pass jumps around too much to read.
+        if (ImGui::BeginTable("radar_pairing_stats", 3, ImGuiTableFlags_SizingFixedFit)) {
+            ImGui::TableSetupColumn("Symbols");
+            ImGui::TableSetupColumn("Last pass");
+            ImGui::TableSetupColumn("Mean (1 s)");
+            ImGui::TableHeadersRow();
 
-        // The acceptance test: an occupied RE divided by itself through a unit
-        // channel is 1, so a healthy setup parks this near 1.0.
-        const bool mean_healthy = (st.mean_cfr_magnitude > 0.5f && st.mean_cfr_magnitude < 2.0f);
-        ImGui::TextColored(mean_healthy ? ok_color : warn_color,
-                           "Mean |H| on occupied REs: %.3f", st.mean_cfr_magnitude);
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted("Paired");
+            ImGui::TableNextColumn();
+            ImGui::Text("%d / %d", st.paired_symbols, st.window_symbols);
+            ImGui::TableNextColumn();
+            ImGui::Text("%.1f", st.avg_paired_symbols);
+
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted("Skipped, DL empty");
+            ImGui::TableNextColumn();
+            ImGui::Text("%d", st.skipped_dl_empty);
+            ImGui::TableNextColumn();
+            ImGui::Text("%.1f", st.avg_skipped_dl_empty);
+
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted("Skipped, UL missing");
+            ImGui::TableNextColumn();
+            ImGui::Text("%d", st.skipped_ul_missing);
+            ImGui::TableNextColumn();
+            ImGui::Text("%.1f", st.avg_skipped_ul_missing);
+
+            // The acceptance test: an occupied RE divided by itself through a
+            // unit channel is 1, so a healthy setup parks this near 1.0.
+            auto mag_color = [&](float mag) { return (mag > 0.5f && mag < 2.0f) ? ok_color : warn_color; };
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted("Mean |H|, occupied REs");
+            ImGui::TableNextColumn();
+            ImGui::TextColored(mag_color(st.mean_cfr_magnitude), "%.3f", st.mean_cfr_magnitude);
+            ImGui::TableNextColumn();
+            ImGui::TextColored(mag_color(st.avg_cfr_magnitude), "%.3f", st.avg_cfr_magnitude);
+
+            ImGui::EndTable();
+        }
+
+        if (st.dl_stalled || st.ul_stalled) {
+            ImGui::TextColored(warn_color, "%s not advancing - holding the last frame", st.ul_stalled ? "UL" : "DL");
+        }
+        if (st.ul_cycle_offset != 0) {
+            ImGui::TextDisabled("UL frame counter %+d x 256 frames vs DL, paired on frame_id", st.ul_cycle_offset);
+        }
     }
 
     // --- Delay / range ----------------------------------------------------
@@ -1257,10 +1300,11 @@ static void draw_radar_window(fh_radar_t* radar,
         ImGui::SameLine();
         gui_hint("set at startup",
                  "Fixed for the run, like the decode threads, and shares the same budget of 20 with them.");
-        ImGui::Text("Last refresh: %.1f ms   Frames: %llu",
-                    st.last_refresh_ms, (unsigned long long)st.refresh_count);
+        ImGui::Text("Last refresh: %.1f ms (mean %.1f)   Frames: %llu",
+                    st.last_refresh_ms, st.avg_refresh_ms, (unsigned long long)st.refresh_count);
         if (st.output != RADAR_OUT_CFR) {
-            ImGui::TextDisabled("CFR %.1f ms, transforms %.1f ms", st.cfr_ms, st.transform_ms);
+            ImGui::TextDisabled("CFR %.1f ms (mean %.1f), transforms %.1f ms (mean %.1f)",
+                                st.cfr_ms, st.avg_cfr_ms, st.transform_ms, st.avg_transform_ms);
         }
 
         if (ImGui::Button("Reset")) {

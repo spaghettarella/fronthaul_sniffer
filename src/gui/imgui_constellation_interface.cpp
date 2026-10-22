@@ -17,9 +17,21 @@
 struct imgui_constellation_state {
     ImGuiContext* context;
     GLFWwindow* window;
+    // Whether the view was zoomed when the Overview section last looked. The
+    // section opens when a zoom takes the view in from full and closes when one
+    // brings it back out; in between it stays however it was left, so it can
+    // be opened by hand at full view.
+    bool overview_zoomed;
 };
 
 namespace {
+
+// Skip empty's tolerance: Double starts from one LSB of 16-bit IQ, full scale
+// being 1, and Half drops to 0 once below the slider's own resolution, which a
+// logarithmic slider takes from the format's decimals - "%.7f" here; a %g or
+// %e format would leave it with none.
+const float SKIP_TOLERANCE_FIRST_STEP = 1.0f / 32768.0f;
+const float SKIP_TOLERANCE_MIN = 1e-7f;
 
 // One wheel notch, and one arrow keypress as a fraction of the window - the
 // main window's steps, so both zoom alike.
@@ -378,18 +390,25 @@ void format_count(char* out, size_t size, long long n) {
 // screen, or in the Radar view H of the pair or one of its directions.
 void describe_source(const iq_constellation_t* constellation,
                      const iq_constellation_radar_pair_t* radar,
+                     const visualizer_complex_mean_t* mean,
                      const char* stream_label,
                      char* out,
                      size_t size) {
+    // Says so when the points are averages rather than samples.
+    const char* mean_suffix = (iq_constellation_get_use_mean(constellation) &&
+                               iq_constellation_mean_available(constellation, mean, radar))
+                                  ? " (rolling mean)"
+                                  : "";
     if (radar == nullptr) {
-        snprintf(out, size, "%s", stream_label != nullptr ? stream_label : "");
+        snprintf(out, size, "%s%s", stream_label != nullptr ? stream_label : "",
+                 (stream_label != nullptr && stream_label[0] != '\0') ? mean_suffix : "");
         return;
     }
     const char* dl = (radar->dl != nullptr && radar->dl_label != nullptr) ? radar->dl_label : "not captured";
     const char* ul = (radar->ul != nullptr && radar->ul_label != nullptr) ? radar->ul_label : "not captured";
     if (iq_constellation_get_radar_data(constellation) == IQ_CONSTELLATION_RADAR_CFR) {
-        snprintf(out, size, "%s, DL %s / UL %s",
-                 radar->config.division == RADAR_DIV_UL_OVER_DL ? "H = UL/DL" : "1/H = DL/UL", dl, ul);
+        snprintf(out, size, "%s, DL %s / UL %s%s",
+                 radar->config.division == RADAR_DIV_UL_OVER_DL ? "H = UL/DL" : "1/H = DL/UL", dl, ul, mean_suffix);
     } else if (iq_constellation_get_radar_direction(constellation) == IQ_CONSTELLATION_UL) {
         snprintf(out, size, "%s UL", ul);
     } else {
@@ -433,10 +452,96 @@ void draw_radar_choices(iq_constellation_t* constellation, const iq_constellatio
     }
 }
 
-void draw_panel(iq_constellation_t* constellation,
+// Rolling mean data, usable only while the main view shows a rolling mean of
+// what the other settings ask for. While it is not, the box reads unticked and
+// cannot be changed, but the choice is kept for when it is.
+void draw_mean_choice(iq_constellation_t* constellation,
+                      const iq_constellation_radar_pair_t* radar,
+                      const visualizer_complex_mean_t* mean) {
+    const bool available = iq_constellation_mean_available(constellation, mean, radar) != 0;
+    bool use_mean = available && iq_constellation_get_use_mean(constellation) != 0;
+    if (!available) {
+        ImGui::BeginDisabled();
+    }
+    if (ImGui::Checkbox("Rolling mean data", &use_mean)) {
+        iq_constellation_set_use_mean(constellation, use_mean ? 1 : 0);
+    }
+    if (!available) {
+        ImGui::EndDisabled();
+    }
+    ImGui::SameLine();
+    const char* short_text = "complex mean per cell";
+    if (!available) {
+        short_text = (radar != nullptr && iq_constellation_get_radar_data(constellation) == IQ_CONSTELLATION_RADAR_IQ)
+                         ? "H only in Radar view"
+                         : "needs the main rolling mean on";
+    }
+    gui_hint(short_text,
+             "Plots the main window's rolling mean instead of single symbols: one point per cell - offset in the "
+             "period by resource element - holding the complex average of what was folded there. Same period, n "
+             "and resets as the mean on screen, which averages magnitudes instead. A coherent mean of data REs "
+             "tends to zero, since random QAM symbols cancel; only what repeats every period stays, such as "
+             "reference signals. For H it is coherent integration: noise falls, a stable channel stays, and phase "
+             "drift pulls the points in toward the origin. Available while the main window shows a rolling mean: "
+             "Waterfall, Curve's mean curve, or in the Radar view the CFR mean with H selected here.");
+}
+
+// Skip empty REs and its tolerance, set the way the PCAP speed is: a
+// logarithmic slider, Half and Double, and Ctrl+click to type a value.
+void draw_skip_empty(iq_constellation_t* constellation) {
+    bool skip_empty = iq_constellation_get_skip_empty(constellation) != 0;
+    if (ImGui::Checkbox("Skip empty REs", &skip_empty)) {
+        iq_constellation_set_skip_empty(constellation, skip_empty ? 1 : 0);
+    }
+    ImGui::SameLine();
+    gui_hint("|I| and |Q| within tolerance",
+             "Leaves out values whose |I| and |Q| are both at most the tolerance below; at 0 only exact zeros go. "
+             "Resource elements nothing was scheduled on decode as 0+0j; left in, they pile into the one pixel at "
+             "the origin and flatten the colour scale for everything else. A small tolerance also takes out "
+             "near-empty ones, such as idle REs carrying only quantisation noise. For H, an RE empty in the "
+             "dividing direction gives no estimate at all, and one empty in the other gives exactly 0.");
+
+    if (!skip_empty) {
+        ImGui::BeginDisabled();
+    }
+    ImGui::Indent();
+    float tolerance = iq_constellation_get_skip_tolerance(constellation);
+    bool changed = false;
+    ImGui::SetNextItemWidth(200.0f);
+    changed |= ImGui::SliderFloat("Tolerance", &tolerance, 0.0f, IQ_CONSTELLATION_SKIP_TOLERANCE_MAX, "%.7f",
+                                  ImGuiSliderFlags_Logarithmic | ImGuiSliderFlags_AlwaysClamp);
+    if (ImGui::Button("Half##skip_tolerance")) {
+        tolerance *= 0.5f;
+        if (tolerance < SKIP_TOLERANCE_MIN) {
+            tolerance = 0.0f;
+        }
+        changed = true;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Double##skip_tolerance")) {
+        tolerance = (tolerance > 0.0f) ? tolerance * 2.0f : SKIP_TOLERANCE_FIRST_STEP;
+        changed = true;
+    }
+    ImGui::SameLine();
+    gui_hint("Ctrl+click to type",
+             "Ctrl+click the slider to type an exact value; Half and Double step it by factors of two, Double "
+             "starting from one LSB of 16-bit IQ (2^-15 = 0.0000305 of full scale). One value for I and Q, in the "
+             "units plotted: IQ full scale and |H| = 1 are both about 1.");
+    if (changed) {
+        iq_constellation_set_skip_tolerance(constellation, tolerance);
+    }
+    ImGui::Unindent();
+    if (!skip_empty) {
+        ImGui::EndDisabled();
+    }
+}
+
+void draw_panel(imgui_constellation_state_t* ui,
+                iq_constellation_t* constellation,
                 const iq_constellation_view_t& view,
                 const char* source_label,
-                const iq_constellation_radar_pair_t* radar) {
+                const iq_constellation_radar_pair_t* radar,
+                const visualizer_complex_mean_t* mean) {
     const ImVec4 warn_color(1.0f, 0.45f, 0.35f, 1.0f);
 
     gui_push_theme();
@@ -457,7 +562,15 @@ void draw_panel(iq_constellation_t* constellation,
         ImGui::TextDisabled("full view");
     }
 
-    if (section_header("Overview", true)) {
+    // Opened and closed only as a zoom crosses full view - the wheel, or Reset
+    // just above - never held to the zoom state, so it can be opened by hand
+    // at full view and closed by hand while zoomed. Starts closed, at full view.
+    const bool zoomed = iq_constellation_zoom_is_active(constellation) != 0;
+    if (zoomed != ui->overview_zoomed) {
+        ImGui::SetNextItemOpen(zoomed, ImGuiCond_Always);
+        ui->overview_zoomed = zoomed;
+    }
+    if (section_header("Overview", false)) {
         draw_minimap(constellation, view);
         gui_hint("click or drag to move",
                  "The whole full view, with the part on screen marked. Click or drag in it to move there. The full "
@@ -500,6 +613,8 @@ void draw_panel(iq_constellation_t* constellation,
             iq_constellation_set_source(constellation, (iq_constellation_source_t)source);
         }
 
+        draw_mean_choice(constellation, radar, mean);
+
         if (st.missing == IQ_CONSTELLATION_MISSING_DL || st.missing == IQ_CONSTELLATION_MISSING_UL) {
             ImGui::TextColored(warn_color, "The pair's %s has not been captured%s",
                                st.missing == IQ_CONSTELLATION_MISSING_DL ? "DL" : "UL",
@@ -509,7 +624,10 @@ void draw_panel(iq_constellation_t* constellation,
         } else {
             char samples_text[32];
             format_count(samples_text, sizeof(samples_text), st.samples_plotted);
-            if (st.showing_cfr) {
+            if (st.showing_mean) {
+                ImGui::Text("%d period rows, %s cells (%s mean)", st.symbols_plotted, samples_text,
+                            st.showing_cfr ? "H" : "IQ");
+            } else if (st.showing_cfr) {
                 ImGui::Text("%d paired symbols, %s estimates", st.symbols_plotted, samples_text);
             } else {
                 ImGui::Text("%d symbols, %s samples", st.symbols_plotted, samples_text);
@@ -528,7 +646,7 @@ void draw_panel(iq_constellation_t* constellation,
                 switch (st.time) {
                 case VISUALIZER_SELECTION_TIME_SYMBOLS:
                     if (st.symbol_shift != 0) {
-                        ImGui::Text("UL symbols %d-%d (rows + lag %+d)", st.symbol_first, st.symbol_last,
+                        ImGui::Text("UL symbols %d-%d (DL rows %+d)", st.symbol_first, st.symbol_last,
                                     st.symbol_shift);
                     } else {
                         ImGui::Text("Symbols %d-%d", st.symbol_first, st.symbol_last);
@@ -539,7 +657,7 @@ void draw_panel(iq_constellation_t* constellation,
                                 (st.phase_first + st.phase_count - 1) % (st.period > 0 ? st.period : 1), st.period);
                     if (st.symbol_shift != 0) {
                         ImGui::SameLine();
-                        ImGui::Text("(rows + lag %+d)", st.symbol_shift);
+                        ImGui::Text("(DL rows %+d)", st.symbol_shift);
                     }
                     break;
                 case VISUALIZER_SELECTION_TIME_ALL:
@@ -553,16 +671,7 @@ void draw_panel(iq_constellation_t* constellation,
             }
         }
 
-        bool skip_empty = iq_constellation_get_skip_empty(constellation) != 0;
-        if (ImGui::Checkbox("Skip empty REs", &skip_empty)) {
-            iq_constellation_set_skip_empty(constellation, skip_empty ? 1 : 0);
-        }
-        ImGui::SameLine();
-        gui_hint("exact 0+0j",
-                 "Leaves out samples that are exactly zero. Resource elements nothing was scheduled on decode as "
-                 "0+0j; left in, they pile into the one pixel at the origin and flatten the colour scale for "
-                 "everything else. For H, an RE empty in the dividing direction gives no estimate at all, and one "
-                 "empty in the other gives exactly 0, which this leaves out too.");
+        draw_skip_empty(constellation);
     }
 
     if (section_header("Display", true)) {
@@ -609,6 +718,7 @@ imgui_constellation_state_t* imgui_constellation_init(iq_constellation_t* conste
         return nullptr;
     }
     ui->window = window;
+    ui->overview_zoomed = iq_constellation_zoom_is_active(constellation) != 0;
 
     ImGuiContext* previous = ImGui::GetCurrentContext();
     GLFWwindow* previous_gl = glfwGetCurrentContext();
@@ -673,6 +783,7 @@ void imgui_constellation_frame(imgui_constellation_state_t* ui,
                                const fh_oran_memory_t* memory,
                                const visualizer_zoom_selection_t* selection,
                                const iq_constellation_radar_pair_t* radar,
+                               const visualizer_complex_mean_t* mean,
                                const char* stream_label,
                                bool frozen) {
     if (ui == nullptr || constellation == nullptr) {
@@ -682,7 +793,7 @@ void imgui_constellation_frame(imgui_constellation_state_t* ui,
     // Described from the settings as they stand coming into the frame, like
     // the picture itself.
     char source_label[160];
-    describe_source(constellation, radar, stream_label, source_label, sizeof(source_label));
+    describe_source(constellation, radar, mean, stream_label, source_label, sizeof(source_label));
     iq_constellation_set_title(constellation, source_label);
 
     // Minimised: nothing to draw into, but the context still has to go back.
@@ -709,7 +820,7 @@ void imgui_constellation_frame(imgui_constellation_state_t* ui,
 
     // Before the update, so a zoom this frame is already in the picture drawn.
     handle_input(constellation, view);
-    iq_constellation_update(constellation, memory, selection, radar);
+    iq_constellation_update(constellation, memory, selection, radar, mean);
 
     // Read again: the update may have fitted the full view to new data.
     iq_constellation_get_view(constellation, &view);
@@ -732,8 +843,9 @@ void imgui_constellation_frame(imgui_constellation_state_t* ui,
     case IQ_CONSTELLATION_MISSING_NONE:
     default:
         if (st.has_memory && st.samples_plotted == 0) {
-            draw_plot_notice(view, st.showing_cfr ? "No paired symbols in this selection"
-                                                  : "No samples in this selection");
+            draw_plot_notice(view, st.showing_mean  ? "The rolling mean holds nothing in this selection yet"
+                                   : st.showing_cfr ? "No paired symbols in this selection"
+                                                    : "No samples in this selection");
         }
         break;
     }
@@ -741,7 +853,7 @@ void imgui_constellation_frame(imgui_constellation_state_t* ui,
         draw_frozen_badge(view);
     }
     draw_cursor_readout(constellation, view);
-    draw_panel(constellation, view, source_label, radar);
+    draw_panel(ui, constellation, view, source_label, radar, mean);
 
     ImGui::Render();
     ImGui_ImplOpenGL2_RenderDrawData(ImGui::GetDrawData());
