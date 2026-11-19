@@ -494,8 +494,9 @@ void draw_skip_empty(iq_constellation_t* constellation) {
         iq_constellation_set_skip_empty(constellation, skip_empty ? 1 : 0);
     }
     ImGui::SameLine();
-    gui_hint("|I| and |Q| within tolerance",
-             "Leaves out values whose |I| and |Q| are both at most the tolerance below; at 0 only exact zeros go. "
+    gui_hint("|z| within tolerance",
+             "Leaves out values whose magnitude |z| = sqrt(I^2 + Q^2) is at most the tolerance below, which blanks "
+             "a disc around the origin; at 0 only exact zeros go. "
              "Resource elements nothing was scheduled on decode as 0+0j; left in, they pile into the one pixel at "
              "the origin and flatten the colour scale for everything else. A small tolerance also takes out "
              "near-empty ones, such as idle REs carrying only quantisation noise. For H, an RE empty in the "
@@ -525,8 +526,8 @@ void draw_skip_empty(iq_constellation_t* constellation) {
     ImGui::SameLine();
     gui_hint("Ctrl+click to type",
              "Ctrl+click the slider to type an exact value; Half and Double step it by factors of two, Double "
-             "starting from one LSB of 16-bit IQ (2^-15 = 0.0000305 of full scale). One value for I and Q, in the "
-             "units plotted: IQ full scale and |H| = 1 are both about 1.");
+             "starting from one LSB of 16-bit IQ (2^-15 = 0.0000305 of full scale). It is the radius of the "
+             "blanked disc, in the units plotted: IQ full scale and |H| = 1 are both about 1.");
     if (changed) {
         iq_constellation_set_skip_tolerance(constellation, tolerance);
     }

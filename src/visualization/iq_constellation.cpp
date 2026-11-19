@@ -840,7 +840,9 @@ static void iqc_build(iq_constellation_t* c, const iqc_input& in, const iqc_sele
     uint32_t* const map = c->map_counts.data();
     const int row_len = sel.re_last - sel.re_first + 1;
     const int skip_empty = c->skip_empty;
-    const float skip_tolerance = c->skip_tolerance;
+    // Compared squared, against I^2 + Q^2, so the blanked area is a disc of
+    // that radius around the origin rather than a square.
+    const float skip_tolerance_sq = c->skip_tolerance * c->skip_tolerance;
     float peak = 0.0f;
 
     // Bins one run of values: a ring row, one symbol's H, or one row of a mean.
@@ -848,14 +850,14 @@ static void iqc_build(iq_constellation_t* c, const iqc_input& in, const iqc_sele
         for (int k = 0; k < count; k++) {
             const float i_val = values[k].real();
             const float q_val = values[k].imag();
-            const float ai = fabsf(i_val);
-            const float aq = fabsf(q_val);
             // A tolerance of 0 leaves exactly the 0+0j of an empty RE out.
-            if (skip_empty && ai <= skip_tolerance && aq <= skip_tolerance) {
+            if (skip_empty && i_val * i_val + q_val * q_val <= skip_tolerance_sq) {
                 continue;
             }
             st.samples_plotted++;
 
+            const float ai = fabsf(i_val);
+            const float aq = fabsf(q_val);
             const float m = ai > aq ? ai : aq;
             if (m > peak && m < 1e30f) {
                 peak = m;

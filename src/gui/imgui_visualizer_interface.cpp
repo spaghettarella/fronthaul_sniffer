@@ -17,6 +17,12 @@
 #include <cstdlib>
 #include <cstring>
 
+// The Data Query's average drop rate: how far back it looks, and how many of
+// the half-second samples behind it are kept - enough to span the window
+// even when a sample lands a frame late.
+constexpr double DROP_WINDOW_S = 5.0;
+constexpr int DROP_WINDOW_SAMPLES = 16;
+
 struct imgui_visualizer_state {
     bool initialized;
     bool selection_initialized;
@@ -70,6 +76,19 @@ struct imgui_visualizer_state {
     double packet_rate_last_time;
     size_t packet_rate_last_total;
     double packet_rate_pps;
+
+    // Drop rate over the last DROP_WINDOW_S, next to the since-start figure,
+    // which a long run turns into a number that hardly moves. The queue's two
+    // running totals are sampled with the packet rate into a short ring, and
+    // the window is the newest sample against the oldest still inside it.
+    int drop_window_count;
+    int drop_window_next;
+    double drop_window_time[DROP_WINDOW_SAMPLES];
+    size_t drop_window_total[DROP_WINDOW_SAMPLES];
+    size_t drop_window_dropped[DROP_WINDOW_SAMPLES];
+    double drop_window_span;   // seconds the last figure covers; 0 before there are two samples
+    size_t drop_window_packets; // packets offered in that span
+    double drop_window_pct;
 };
 
 namespace {
@@ -1623,6 +1642,11 @@ imgui_visualizer_state_t* imgui_visualizer_init(int window_width, int window_hei
     state->packet_rate_last_time = 0.0;
     state->packet_rate_last_total = 0;
     state->packet_rate_pps = 0.0;
+    state->drop_window_count = 0;
+    state->drop_window_next = 0;
+    state->drop_window_span = 0.0;
+    state->drop_window_packets = 0;
+    state->drop_window_pct = 0.0;
 
     // Setup ImGui context
     IMGUI_CHECKVERSION();
@@ -2079,16 +2103,56 @@ fh_oran_memory_t* imgui_visualizer_render(
     // total counts every packet offered to the queue, dropped or not, and
     // never goes backwards, so a decrease can only mean a new queue.
     const double rate_now = ImGui::GetTime();
+    bool take_drop_sample = false;
     if (!state->packet_rate_initialized || stats.total_packets < state->packet_rate_last_total) {
         state->packet_rate_initialized = true;
         state->packet_rate_last_time = rate_now;
         state->packet_rate_last_total = stats.total_packets;
+        // A new queue: its counts have nothing to do with the old ones.
+        state->drop_window_count = 0;
+        state->drop_window_next = 0;
+        state->drop_window_span = 0.0;
+        take_drop_sample = true;
     } else if (rate_now - state->packet_rate_last_time >= 0.5) {
         state->packet_rate_pps =
             static_cast<double>(stats.total_packets - state->packet_rate_last_total) /
             (rate_now - state->packet_rate_last_time);
         state->packet_rate_last_time = rate_now;
         state->packet_rate_last_total = stats.total_packets;
+        take_drop_sample = true;
+    }
+
+    // Average drop rate: dropped over offered, between the newest sample and
+    // the oldest one still within DROP_WINDOW_S of it. Short of a full window
+    // after a start, it covers what there is and says how long that is.
+    if (take_drop_sample) {
+        const int slot = state->drop_window_next;
+        state->drop_window_time[slot] = rate_now;
+        state->drop_window_total[slot] = stats.total_packets;
+        state->drop_window_dropped[slot] = stats.dropped_packets;
+        state->drop_window_next = (slot + 1) % DROP_WINDOW_SAMPLES;
+        if (state->drop_window_count < DROP_WINDOW_SAMPLES) {
+            state->drop_window_count++;
+        }
+
+        int oldest = slot;
+        for (int age = state->drop_window_count - 1; age > 0; age--) {
+            const int i = (slot - age + DROP_WINDOW_SAMPLES) % DROP_WINDOW_SAMPLES;
+            // A little slack, so a sample half a frame past the edge still counts.
+            if (rate_now - state->drop_window_time[i] <= DROP_WINDOW_S + 0.1) {
+                oldest = i;
+                break;
+            }
+        }
+        state->drop_window_span = rate_now - state->drop_window_time[oldest];
+        state->drop_window_packets = stats.total_packets - state->drop_window_total[oldest];
+        const size_t dropped = stats.dropped_packets - state->drop_window_dropped[oldest];
+        // Evicting queued packets to make room can drop more in a span than
+        // arrived in it; those packets were counted when they arrived.
+        double pct = (state->drop_window_packets > 0)
+            ? 100.0 * static_cast<double>(dropped) / static_cast<double>(state->drop_window_packets)
+            : 0.0;
+        state->drop_window_pct = (pct > 100.0) ? 100.0 : pct;
     }
 
     ImGui::Begin("Live Statistics", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
@@ -2135,7 +2199,20 @@ fh_oran_memory_t* imgui_visualizer_render(
         // setting means the pipeline behind it has hit its limit - read it
         // together with the drop rate below.
         ImGui::Text("Packet rate: %.0f packets/sec", state->packet_rate_pps);
-        ImGui::Text("Packet drop rate: %.2f%%", dropped_pct);
+        if (state->drop_window_span <= 0.0) {
+            ImGui::Text("Packet drop rate: %.2f%% overall", dropped_pct);
+        } else {
+            // Whole seconds once the window is full, so the label holds still;
+            // tenths while it is still filling.
+            const int span_decimals = (state->drop_window_span >= DROP_WINDOW_S - 0.05) ? 0 : 1;
+            if (state->drop_window_packets > 0) {
+                ImGui::Text("Packet drop rate: %.2f%% overall, %.2f%% avg (last %.*f s)", dropped_pct,
+                            state->drop_window_pct, span_decimals, state->drop_window_span);
+            } else {
+                ImGui::Text("Packet drop rate: %.2f%% overall, no packets in the last %.*f s", dropped_pct,
+                            span_decimals, state->drop_window_span);
+            }
+        }
         ImGui::Text("Total packets: %llu", static_cast<unsigned long long>(stats.total_packets));
         ImGui::Text("Dropped packets: %llu", static_cast<unsigned long long>(stats.dropped_packets));
         ImGui::Text("Queued packets: %llu", static_cast<unsigned long long>(stats.queued_packets));

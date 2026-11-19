@@ -67,7 +67,7 @@ typedef struct iq_constellation_prefs {
     int height;
     iq_constellation_source_t source;
     int skip_empty;     // leave out samples within skip_tolerance of 0+0j (unscheduled resource elements)
-    float skip_tolerance; // on |I| and on |Q| alike; 0 leaves out exactly 0+0j only
+    float skip_tolerance; // on |z| = sqrt(I^2 + Q^2); 0 leaves out exactly 0+0j only
     int density;        // colour by hits per pixel; 0 draws every hit pixel the same colour
     int dot_size;       // grow each hit pixel into a dot sized by its hits; 0 keeps single pixels
     iq_constellation_radar_data_t radar_data;     // Radar view only
@@ -131,10 +131,11 @@ iq_constellation_source_t iq_constellation_get_source(const iq_constellation_t* 
 void iq_constellation_set_skip_empty(iq_constellation_t* c, int enabled);
 int iq_constellation_get_skip_empty(const iq_constellation_t* c);
 
-// How close to 0+0j a value has to be for Skip empty to leave it out: both
-// |I| and |Q| at most this, in the units plotted (full scale is about 1 for
-// IQ, |H| about 1 for H). 0, the default, leaves out exact zeros only. Clamped
-// to [0, IQ_CONSTELLATION_SKIP_TOLERANCE_MAX].
+// How close to 0+0j a value has to be for Skip empty to leave it out: its
+// magnitude |z| = sqrt(I^2 + Q^2) at most this, so the blanked area is a disc
+// around the origin. In the units plotted: full scale is about 1 for IQ, |H|
+// about 1 for H. 0, the default, leaves out exact zeros only. Clamped to
+// [0, IQ_CONSTELLATION_SKIP_TOLERANCE_MAX].
 #define IQ_CONSTELLATION_SKIP_TOLERANCE_MAX 1.0f
 void iq_constellation_set_skip_tolerance(iq_constellation_t* c, float tolerance);
 float iq_constellation_get_skip_tolerance(const iq_constellation_t* c);
